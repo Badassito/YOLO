@@ -1015,7 +1015,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             )
             voxel = json.loads(voxel_path.read_text())
 
-        self.assertEqual(manifest["pipeline_version"], "19.0.3")
+        self.assertEqual(manifest["pipeline_version"], "19.0.4")
         self.assertEqual(manifest["mode"], "pta")
         self.assertEqual(
             manifest["determinism_contract"],

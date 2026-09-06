@@ -19,9 +19,9 @@ GIB = 1024 ** 3
 
 NRRD_SPACE = "left-posterior-superior"
 
-SCRIPT_VERSION = '19.0.3'
+SCRIPT_VERSION = '19.0.4'
 
-SCRIPT_VERSION_COMPACT = '1903'
+SCRIPT_VERSION_COMPACT = '1904'
 
 SCRIPT_BASENAME = f'GPT-6-Astra-Ultra_v{SCRIPT_VERSION}_SLURM.py'
 
@@ -1040,5 +1040,11 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Reject a candidate connection if the bridge radius is equal to, or smaller than, this value. 0 disables the check")
     p.add_argument("--interpolation_search_angle", default=15.0, type=float,
                    help="Projection growth angle in degrees. Must be greater than -90 and less than 90")
+    p.add_argument("--capture_component_replay", default=None, type=str, metavar="PERSISTENT_DIR",
+                   help="Copy a bounded sample of view-native Radial bridge components for isolated projection replay; must survive job completion")
+    p.add_argument("--capture_component_views", nargs='+', default=None, metavar="VIEW_GLOB",
+                   help="Replay capture view names/globs; default selects vertical +30 degree tilted Radial transverse, sagittal and coronal")
+    p.add_argument("--capture_component_limit", default=3, type=int, metavar="N",
+                   help="Maximum component replay captures (one per selected view, 4 GiB total); default 3")
 
     return p

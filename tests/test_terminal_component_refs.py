@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+from concurrent.futures import Future
 import io
 import tempfile
 import unittest
@@ -15,6 +16,7 @@ import numpy as np
 from XTA import assembly, finalization, pipeline
 from XTA.geometry import ViewInfo
 from XTA.interpolation import NrrdLayerRef
+from XTA.projection_queue import settle_prepared_view_components
 
 
 def _function(source: str, name: str, namespace: dict) -> object:
@@ -38,7 +40,7 @@ class TerminalReferenceTests(unittest.TestCase):
 
     def run_prepare(self, *, physical='transverse', passes=2,
                     interpolate=3, walk=2, candidates=2, malformed=None,
-                    stop_on_alloc=False, empty=False, **overrides):
+                    stop_on_alloc=False, empty=False, defer_components=False, **overrides):
         volume = np.zeros((4, 5, 6), dtype=np.uint8)
         volume[0, 1, 1] = 1
         initial = volume.copy()
@@ -49,7 +51,7 @@ class TerminalReferenceTests(unittest.TestCase):
         if 'angle' in overrides:
             view = ViewInfo(**{**view.__dict__, 'tta_angle_deg': overrides.pop('angle')})
         ns = dict(vars(assembly))
-        captures = SimpleNamespace(allocations=[], calls=[], layers=[], closed=[], telemetry={}, component_volumes={})
+        captures = SimpleNamespace(allocations=[], calls=[], layers=[], closed=[], telemetry={}, component_volumes={}, pending=[])
         telemetry = SimpleNamespace(add=lambda key, value: captures.telemetry.__setitem__(key, captures.telemetry.get(key, 0) + value))
 
         def allocate(**kw):
@@ -103,6 +105,11 @@ class TerminalReferenceTests(unittest.TestCase):
             captures.layers.append(ref)
             return ref
 
+        def defer_component(path, **kw):
+            future = Future()
+            captures.pending.append((future, materialize_component(path, **kw)))
+            return future
+
         ns.update({
             'allocate_workspace_array': allocate,
             'cleanup_view_volume_after_prediction_inplace': lambda *a, **kw: None,
@@ -130,6 +137,8 @@ class TerminalReferenceTests(unittest.TestCase):
                         keep_temp=False, slice_workers=1, interpolation_task_workers=1,
                         nrrd_layers_enabled=True, precleaned_slice_cleanup=True,
                         hole_fill_done_on_device=True, preinterpolation_layer_already_published=True)
+            if defer_components:
+                args['submit_component_projection'] = defer_component
             args.update(overrides)
             result = prepare(**args)
             captures.original_path_exists = union_path.exists()
@@ -188,12 +197,38 @@ class TerminalReferenceTests(unittest.TestCase):
     def test_unqualified_or_debug_modes_keep_dense_fallback(self):
         for overrides in (
             {'walk': 0}, {'candidates': 0}, {'nrrd_layers_enabled': False},
-            {'keep_temp': True}, {'dense_tiling_active': True}, {'family': 'radial'},
-            {'family': 'tilted'},
-            {'angle': 45.0},
+            {'keep_temp': True}, {'dense_tiling_active': True},
         ):
             with self.subTest(overrides=overrides), self.assertRaises(DenseAllocationSelected):
                 self.run_prepare(stop_on_alloc=True, **overrides)
+
+    def test_other_geometries_retire_dense_continuation_when_components_are_complete(self):
+        for overrides in ({'family': 'radial'}, {'family': 'tilted'}, {'angle': 45.0}):
+            with self.subTest(overrides=overrides):
+                result, seen, initial, mutated = self.run_prepare(**overrides)
+                self.assertFalse(seen.allocations)
+                self.assertIsNone(result.final_view_volume_mm)
+                fused = initial.copy()
+                for ref in result.nrrd_layers:
+                    fused |= ref.live_array
+                np.testing.assert_array_equal(fused, mutated)
+
+    def test_parent_retires_shadow_before_detached_component_publication_finishes(self):
+        result, seen, initial, mutated = self.run_prepare(family='radial', defer_components=True)
+        self.assertFalse(seen.original_path_exists)
+        self.assertFalse(seen.allocations)
+        self.assertIsNone(result.final_view_volume_mm)
+        self.assertEqual(result.nrrd_layers, [])
+        self.assertEqual(len(result.pending_component_layers), 8)
+        self.assertFalse(settle_prepared_view_components(result))
+        for future, ref in reversed(seen.pending):
+            future.set_result(ref)
+        self.assertTrue(settle_prepared_view_components(result))
+        fused = initial.copy()
+        for ref in result.nrrd_layers:
+            fused |= ref.live_array
+        np.testing.assert_array_equal(fused, mutated)
+        self.assertEqual(result.nrrd_layers, seen.layers)
 
     def test_non_d1_prepare_does_not_claim_source_base_was_published(self):
         result, seen, _, mutated = self.run_prepare(preinterpolation_layer_already_published=False)

@@ -8,9 +8,9 @@ from XTA import cli, config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRENT_VERSION = "19.0.3"
-CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v19.0.3_SLURM.py"
-PREVIOUS_LAUNCHER = "GPT-5.6-Sol-Ultra_v19.0.2_SLURM.py"
+CURRENT_VERSION = "19.0.4"
+CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v19.0.4_SLURM.py"
+PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v19.0.3_SLURM.py"
 
 
 def _toml_section(source: str, name: str) -> str:
@@ -25,7 +25,7 @@ class PackageMetadataTests(unittest.TestCase):
     def test_runtime_version_constants_are_aligned(self) -> None:
         self.assertEqual(XTA.__version__, CURRENT_VERSION)
         self.assertEqual(config.SCRIPT_VERSION, CURRENT_VERSION)
-        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "1903")
+        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "1904")
         self.assertEqual(config.SCRIPT_BASENAME, CURRENT_LAUNCHER)
         self.assertEqual(cli.SCRIPT_VERSION, CURRENT_VERSION)
         self.assertEqual(cli.SCRIPT_BASENAME, CURRENT_LAUNCHER)
@@ -47,6 +47,7 @@ class PackageMetadataTests(unittest.TestCase):
         )
         self.assertIn(f'"{CURRENT_LAUNCHER}"', data_files)
         self.assertIn('"tools/hgx_selftest.py"', data_files)
+        self.assertIn('"tools/replay_component_projection.py"', data_files)
         self.assertIn('"tools/d1_ipc_selftest.py"', data_files)
         self.assertIn('"tools/lta_gpu_smoke.py"', data_files)
         self.assertIn('"tools/lta_point_smoke.py"', data_files)
@@ -73,6 +74,7 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertIn("recursive-include XTA/examples *.py *.md", manifest_lines)
         self.assertIn("recursive-include tools *.py", manifest_lines)
         self.assertTrue((ROOT / "tools" / "hgx_selftest.py").is_file())
+        self.assertTrue((ROOT / "tools" / "replay_component_projection.py").is_file())
         self.assertTrue((ROOT / "tools" / "d1_ipc_selftest.py").is_file())
         self.assertTrue((ROOT / "tools" / "lta_gpu_smoke.py").is_file())
         self.assertTrue((ROOT / "tools" / "lta_point_smoke.py").is_file())

@@ -495,6 +495,7 @@ class _MainProcessGpuStageCoordinator:
         self._inference_inflight: Counter[int] = Counter()
         self._stage_leases: Dict[int, str] = {}
         self._inference_priority_active = False
+        self._inference_asset_retirement_pending = False
         self._pending_inference_backlog = False
         self._wake_callback: Optional[Callable[[], None]] = None
 
@@ -504,6 +505,7 @@ class _MainProcessGpuStageCoordinator:
             self._inference_inflight.clear()
             self._stage_leases.clear()
             self._pending_inference_backlog = False
+            self._inference_asset_retirement_pending = False
             self._inference_priority_active = bool(
                 self._worker_devices and main_process_gpu_stage_inference_priority_enabled()
             )
@@ -534,12 +536,31 @@ class _MainProcessGpuStageCoordinator:
             except Exception:
                 pass
 
+    def set_inference_asset_retirement_pending(self, active: bool) -> None:
+        """Fence new stages on selected GPUs until their terminal release ACKs.
+
+        This is independent of inference-priority/overlap policy. Existing stage
+        owners may finish; the flag prevents a new residency decision while the
+        workers are still releasing their allocations.
+        """
+        callback: Optional[Callable[[], None]] = None
+        with self._lock:
+            changed = self._inference_asset_retirement_pending != bool(active)
+            self._inference_asset_retirement_pending = bool(active)
+            callback = self._wake_callback if changed else None
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
+
     def _priority_blocks_stage_locked(self, device_index: int, purpose: str) -> bool:
+        if self._inference_asset_retirement_pending and int(device_index) in self._worker_devices:
+            return True
         purpose_l = str(purpose).strip().lower()
-        # D1 is view-granular in v16.1.3: a completed view may run its Radial/Tilted
-        # backprojection on a worker GPU whose compute credit is currently idle, while
-        # other devices continue rendering/inference. Other main-process GPU stages retain
-        # inference-first ownership until the global queue drains.
+        # In the non-D1 fast-bundle fallback, a completed view may borrow an idle
+        # worker GPU for backprojection while other devices still infer. Terminal
+        # asset retirement above takes precedence over that overlap permission.
         if (
             v1613_d1_backprojection_overlap_enabled()
             and 'backprojection' in purpose_l
@@ -562,6 +583,7 @@ class _MainProcessGpuStageCoordinator:
             self._inference_inflight.clear()
             self._stage_leases.clear()
             self._inference_priority_active = False
+            self._inference_asset_retirement_pending = False
             self._pending_inference_backlog = False
             self._wake_callback = None
 
@@ -691,6 +713,7 @@ class _MainProcessGpuStageCoordinator:
                 'inference_inflight': dict(self._inference_inflight),
                 'stage_leases': dict(self._stage_leases),
                 'inference_priority_active': bool(self._inference_priority_active),
+                'inference_asset_retirement_pending': bool(self._inference_asset_retirement_pending),
                 'pending_inference_backlog': bool(self._pending_inference_backlog),
             }
 
@@ -708,6 +731,9 @@ def _reset_main_process_gpu_stage_coordinator() -> None:
 
 def _set_main_process_gpu_inference_priority_active(active: bool) -> None:
     _MAIN_PROCESS_GPU_STAGE_COORDINATOR.set_inference_priority_active(bool(active))
+
+def _set_main_process_gpu_asset_retirement_pending(active: bool) -> None:
+    _MAIN_PROCESS_GPU_STAGE_COORDINATOR.set_inference_asset_retirement_pending(bool(active))
 
 def _set_main_process_gpu_pending_inference(active: bool) -> None:
     _MAIN_PROCESS_GPU_STAGE_COORDINATOR.set_pending_inference_backlog(bool(active))
@@ -1959,6 +1985,35 @@ def _shutdown_resident_trt_pipeline_cache() -> None:
                 close()
         except Exception as exc:
             print(f'Warning: resident TensorRT executor shutdown failed ({exc}).')
+
+
+def _resident_trt_pipeline_retirement_ready() -> int:
+    """Reject active inference leases before terminal GPU ownership is changed."""
+    with _RESIDENT_TRT_PIPELINE_CACHE_LOCK:
+        if any(bool(entry.get('in_use', False)) for entry in _RESIDENT_TRT_PIPELINE_CACHE.values()):
+            raise RuntimeError('Cannot retire inference assets while a TensorRT ring is in use')
+        return len(_RESIDENT_TRT_PIPELINE_CACHE)
+
+
+def _release_resident_trt_pipeline_cache() -> int:
+    """Strict terminal teardown, unlike best-effort process-exit cleanup.
+
+    Busy rings are rejected before mutation. Close restores borrowed backend
+    addresses and drops render/inference/post graphs and their static owners.
+    Errors propagate so a scheduler never mistakes incomplete teardown for free HBM.
+    """
+    with _RESIDENT_TRT_PIPELINE_CACHE_LOCK:
+        _resident_trt_pipeline_retirement_ready()
+        entries = list(_RESIDENT_TRT_PIPELINE_CACHE.items())
+    for key, entry in entries:
+        close = getattr(entry.get('executor'), 'close', None)
+        if callable(close):
+            close()
+        with _RESIDENT_TRT_PIPELINE_CACHE_LOCK:
+            if _RESIDENT_TRT_PIPELINE_CACHE.get(key) is not entry:
+                raise RuntimeError('TensorRT cache ownership changed during terminal retirement')
+            del _RESIDENT_TRT_PIPELINE_CACHE[key]
+    return len(entries)
 
 def _try_resident_trt_ring_accumulate(
     predictor: object,

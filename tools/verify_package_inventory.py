@@ -29,6 +29,7 @@ INTENTIONALLY_CHANGED = {
     ("inference", "fill_view_volume_holes_2d_inplace"),
     ("inference", "fused_slice_cleanup_inplace"),
     ("interpolation", "IncrementalRawBBoxMaskStoreWriter"),
+    ("interpolation", "PreparedViewResult"),
     ("interpolation", "_build_linear_slice_bridge_plan"),
     ("interpolation", "_component_record_mirrored_u"),
     ("interpolation", "_drain_volume_to_mmap"),
@@ -222,8 +223,8 @@ LOCAL_IMPORT_SEAM_MARKER = "# Local import keeps the package dependency graph ac
 # already-existing local import without review.
 REVIEWED_LOCAL_IMPORT_SEAMS = {
     ("assembly", "prepare_view_volume_after_fullframe"): (
-        "522ac34c3728f76e0f762fd8142c699f519b8d3f6d3820563c0d18a5267eb53b",
-        "ef76a565816d431f18d15e145b7a2c42ffd316df45905e9daee00b8b5fd26477",
+        "daf1c3a23c95665867ec79f21ff3c41562330bdde9671a3237a90258c365e6ad",
+        "322145486bb7f21b5f9ea590068bd323184072c7c7e9b2968473349950200ebe",
     ),
     ("assembly", "finalize_consolidated_tile_volume_for_parent"): (
         "bc3ecd1d7d9f2d9e9f158a290d0e075bae85565b2b299cfe84f08b08ec7491a4",
@@ -234,8 +235,8 @@ REVIEWED_LOCAL_IMPORT_SEAMS = {
         "101a6fb2b4446cf0d71be4e025f1224cfecb863185f21e3482bfcfc9cf3a3231",
     ),
     ("cuda_backend", "_GpuWorkerRenderEngine"): (
-        "ed4f3a7861ffb749b2cfcfc71f9f868ace173a1e8ef53b6a59dfc409754f1e55",
-        "297c8c8888f5e6a6fdf91c8811c99f7bb75288b71ca8fd5b91cf44c50c01d910",
+        "71d5808d4eace2b408d5983eaf082db7283433313f5920bd6650c49fafef13f4",
+        "ce39e44112e767b3cf804cf2f03ef9f687b475f5ec845105291193cd5554efd5",
     ),
     ("geometry", "GpuPrefetchingYoloSource"): (
         "d34ae87abc324d9aa32dd8906bad4d1ccb3cbab27bad863c4b1979404bfb5bc8",
@@ -290,7 +291,7 @@ REVIEWED_LOCAL_IMPORT_SEAMS = {
         "126545d0d25722c4df5918428643130e3c6a1eb639a0c61476fd7a259ad57cdf",
     ),
     ("interpolation", "interpolate_view_volume_pass_inplace"): (
-        "9525852063bb43270d246291586dc3f1b62a20ede847518854a6df6fd9fb0d47",
+        "0c91e9acd48ec2d9b7470e9b8143b0a77329ac59ecb01428288055595934e2b6",
         "0a585dbad86412327820dccb21e479e86057fa65bb0ae01a016b198238a3f661",
     ),
     ("interpolation", "RawBBoxMaskStore"): (

@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from collections import deque
+from concurrent.futures import Future
 from dataclasses import (
     dataclass,
     field,
@@ -3142,8 +3143,9 @@ def interpolate_view_volume_pass_inplace(
             )
             for membership_path in component_membership_paths
         ]
-        # Extract each logical bit-plane directly into a bbox-cropped cvol. Empty
-        # combinations retain the already-published no-scan cvol from initialization.
+        # Merge finalized these counts and conservative render bounds. Export reads
+        # only nonempty component crops; untouched slices/pages need no scan.
+        # Empty combinations retain their already-published no-scan cvol.
         for walk_back_index, candidate_index, component_path in component_specs:
             component_key = (int(walk_back_index), int(candidate_index))
             component_voxel_count = int(component_added_counts.get(component_key, 0))
@@ -3151,12 +3153,15 @@ def interpolate_view_volume_pass_inplace(
                 continue
             word_index, bit_value = component_bit_layout[component_key]
             membership_reader = membership_readers[int(word_index)]
-            bit_scalar = np.asarray(int(bit_value), dtype=component_word_dtype)
+            component_slice_counts = component_added_by_slice[component_key]
 
             def _encode_component_slice(idx: int) -> RawBBoxSlicePayload:
-                return _encode_bool_mask_slice_payload(
+                return _encode_component_membership_slice_payload(
                     int(idx),
-                    np.bitwise_and(membership_reader[int(idx)], bit_scalar) != 0,
+                    membership_reader,
+                    int(bit_value),
+                    added_by_slice=component_slice_counts,
+                    rendered_paste_bboxes=rendered_paste_bboxes,
                 )
 
             _write_raw_bbox_payload_store(
@@ -3458,6 +3463,8 @@ class PreparedViewResult:
     nrrd_layers: List[NrrdLayerRef] = field(default_factory=list)
     parent_mask_support_mm: Optional[object] = None
     parent_bridge_support_mm: Optional[object] = None
+    # Thread-local publication futures: never send these across process boundaries.
+    pending_component_layers: List[Future[NrrdLayerRef]] = field(default_factory=list)
 
 @dataclass
 class TilePostprocessTask:
@@ -4681,6 +4688,78 @@ def _encode_bool_mask_slice_payload(
         payload=payload,
         foreground_voxels=int(np.count_nonzero(crop)),
     )
+
+
+def _encode_component_membership_slice_payload(
+    idx: int,
+    membership_reader: np.ndarray,
+    bit_value: int,
+    *,
+    added_by_slice: Optional[np.ndarray],
+    rendered_paste_bboxes: Optional[np.ndarray],
+    packbits_payload: bool = False,
+) -> RawBBoxSlicePayload:
+    """Extract one finalized component delta without scanning untouched pixels.
+
+    Counts come from the completed merge, after every component bit is differenced
+    against the same pre-pass foreground. A validated zero count is authoritative
+    and needs no membership read. Nonempty counts validate the rendered crop's
+    completeness before its coordinates are translated back to the view grid.
+    Missing/malformed metadata or a count mismatch retain full-slice extraction.
+    The membership words and pre-pass mask are never modified here.
+    """
+    depth, height, width = (int(value) for value in membership_reader.shape)
+    idx_i = int(idx)
+    if not 0 <= idx_i < depth:
+        raise IndexError(idx_i)
+    bit_scalar = np.asarray(int(bit_value), dtype=membership_reader.dtype)
+
+    def _full_slice() -> RawBBoxSlicePayload:
+        return _encode_bool_mask_slice_payload(
+            idx_i,
+            np.bitwise_and(membership_reader[idx_i], bit_scalar) != 0,
+            packbits_payload=bool(packbits_payload),
+        )
+
+    expected_count: Optional[int] = None
+    if added_by_slice is not None:
+        counts = np.asarray(added_by_slice)
+        if counts.shape == (depth,) and counts.dtype.kind in 'iu':
+            count = int(counts[idx_i])
+            if 0 <= count <= height * width:
+                expected_count = count
+    if expected_count == 0:
+        return RawBBoxSlicePayload(idx=idx_i, is_empty=True)
+    if expected_count is None or rendered_paste_bboxes is None:
+        return _full_slice()
+
+    boxes = np.asarray(rendered_paste_bboxes)
+    if boxes.shape != (depth, 4) or boxes.dtype.kind not in 'iu':
+        return _full_slice()
+    y0, x0, y1, x1 = (int(value) for value in boxes[idx_i])
+    if (
+        not (0 <= y0 < y1 <= height and 0 <= x0 < x1 <= width)
+        or expected_count > (y1 - y0) * (x1 - x0)
+    ):
+        return _full_slice()
+
+    component_crop = np.bitwise_and(
+        membership_reader[idx_i, y0:y1, x0:x1], bit_scalar,
+    ) != 0
+    payload = _encode_bool_mask_slice_payload(
+        idx_i, component_crop, packbits_payload=bool(packbits_payload),
+    )
+    if int(payload.foreground_voxels) != expected_count:
+        del component_crop, payload
+        return _full_slice()
+    return dataclasses_replace(
+        payload,
+        y0=int(payload.y0) + y0,
+        x0=int(payload.x0) + x0,
+        y1=int(payload.y1) + y0,
+        x1=int(payload.x1) + x0,
+    )
+
 
 def _encode_ctile_slice(idx: int, tile_mask_mm: np.ndarray) -> RawBBoxSlicePayload:
     return _encode_bool_mask_slice_payload(int(idx), tile_mask_mm[int(idx)])

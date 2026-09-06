@@ -1,6 +1,6 @@
 # XTA architecture
 
-`GPT-6-Astra-Ultra_v19.0.3_SLURM.py` is the sole versioned launcher. It, the
+`GPT-6-Astra-Ultra_v19.0.4_SLURM.py` is the sole versioned launcher. It, the
 installed `xta` console script, and `python -m XTA` all dispatch
 through `XTA.cli.run()`.
 The implementation lives in the importable `XTA` package so spawned processes
@@ -11,10 +11,33 @@ resolve worker functions and data types through canonical module paths.
 Full-frame, zero-angle Cartesian interpolation components retain sparse storage
 through publication. Transverse components reuse their immutable store;
 sagittal and coronal components transpose directly into packed orthogonal stores.
-Eligible D1 continuations publish component references without constructing a
-dense additions volume; their independently published source-space base remains
-part of the final union. Tiles, other geometries and consumers requiring dense
-arrays retain the ordinary continuation path.
+Radial and tilted-Radial components invert the reference projector's discrete
+ownership map and visit foreground crops directly, producing packed source-space
+stores without dense view reconstruction. Compiled kernels use the existing
+optional Numba dependency; ordinary tilted Cartesian components retain the
+dense projection backend.
+
+Eligible D1 continuations publish complete component references across view
+families and angles without constructing a dense additions volume. Their
+independently published source-space base remains part of the final union.
+Tiles, retained debug workspaces, no-NRRD runs, and configurations without complete
+component coverage retain the ordinary continuation path. Membership export uses
+validated paste bounds and foreground counts to encode cropped slices, with a
+full-slice fallback when the bounds cannot establish the same component payload.
+
+Immutable components pass to a separate projection executor, freeing parent
+preparation slots before publication completes. Admission bounds pending input
+bytes and estimated active scratch independently; one oversized job may run alone.
+The parent remains a scheduler dependency until every component future has settled,
+and failures wake blocked producers before executor teardown. The handoff preserves
+layer identities and every requested NRRD and downsampled overlay.
+
+After inference results and D1 ownership drain, each CUDA worker fences and releases
+its rendering source, texture, model, graph, and allocator assets. An acknowledged
+barrier precedes post-inference GPU admission. A validation refusal retains the
+worker's assets and existing memory admission; a failure after release begins is
+fatal. Successful release permanently closes that worker to further inference
+while leaving it available for auxiliary mask work.
 
 Sparse interpolation labels use validated foreground bounds to select cropped
 CPU labeling at low coverage. Touching component pairs use bounded compiled
@@ -50,6 +73,9 @@ not imply persistence: cluster `/tmp` remains disposable after the job ends.
 | `workers` | module-level OpenVINO and CUDA worker entry points |
 | `topology` | slice labeling, union-find and component metadata |
 | `backprojection` | radial/tilted projection plans and source-space accumulation |
+| `sparse_projection` | exact crop-driven Radial/tilted-Radial inverse ownership maps and packed source-space publication |
+| `projection_queue` | bounded immutable-component handoff, active scratch admission and projection-future lifetime |
+| `component_replay` | bounded persistent component capture, checksummed geometry descriptors and replay loading |
 | `finalization` | source-volume fusion, object filtering and centerline processing |
 | `interpolation` | interpolation planning, execution and sparse continuation |
 | `cuda_d1` | D1 owner-GPU backprojection and packed source-space storage |
@@ -387,7 +413,7 @@ one-versus-four-device scheduling and final bytes are covered by deterministic s
 representative H100 execution remains a hardware qualification step:
 
 ```bash
-python -u GPT-6-Astra-Ultra_v19.0.3_SLURM.py \
+python -u GPT-6-Astra-Ultra_v19.0.4_SLURM.py \
   --mode lta \
   --input <target-video> \
   --exemplar <aligned-image-yolo-directory> \
@@ -514,7 +540,7 @@ GPU/CPU `keep_objects` result. ``--plan-only`` exercises partitioning and row pa
 host without CUDA. ``python tools/d1_ipc_selftest.py --gpus 4`` verifies that
 single-visible-device spawned ranks can export, import, NVLink-OR, and acknowledge the
 same dedicated CUDA allocations used by D1 groups; repeat with eight allocated GPUs.
-Wheels retain the hardware and LTA diagnostic scripts under
+Wheels retain the hardware, LTA, and component-projection diagnostic scripts under
 ``share/xta/tools``.
 Four-GPU representative TTA
 qualification completed the full D1 lifetime across model workers, partial publication,
@@ -602,6 +628,25 @@ execution time, transfer categories, crop/patch pixels, cache eviction, fallback
 worker-visible physical CUDA token.
 
 ## Streaming inference completion and terminal fusion
+
+### Component projection replay
+
+`--capture_component_replay PERSISTENT_DIR` copies a bounded sample of immutable
+view-native Radial components, output geometry and checksums during TTA. The default
+selects three vertical +30-degree tilted-Radial views, one component each, within a
+4 GiB total input budget. `--capture_component_views` and
+`--capture_component_limit` change the selection and count. The capture directory
+must survive the job; cluster `/tmp` is unsuitable. Capture is disabled by default.
+
+`python tools/replay_component_projection.py CAPTURE_DIR --output RESULT_DIR`
+compares the reference and sparse projectors in fresh CPU processes and checks
+decoded output slices without repeating inference. Its local temporary workspaces
+are removed after completion; logs and metrics remain in the output directory.
+`--cuda-reference` explicitly enables a CUDA reference attempt and records whether
+an eligible GPU path actually ran. Installed wheels place this tool under
+`share/xta/tools`.
+
+### Completion ownership
 
 OpenVINO request callbacks publish indexed completions into a bounded queue. A bounded
 consumer pool, sized to the useful infer-request count, performs output decoding and

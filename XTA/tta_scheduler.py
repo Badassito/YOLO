@@ -229,6 +229,9 @@ class TtaSchedulerState:
 
     gpu_inference_drained_at: Optional[float] = None
     gpu_inference_drain_announced: bool = False
+    gpu_inference_asset_release_requested: bool = False
+    gpu_inference_asset_release_pending_by_worker: Dict[int, int] = field(default_factory=dict)
+    gpu_inference_asset_release_results_by_worker: Dict[int, Dict[str, object]] = field(default_factory=dict)
     d1_owner_by_parent: Dict[Tuple[str, str], int] = field(default_factory=dict)
     d1_active_parent_by_worker: Dict[int, Tuple[str, str]] = field(default_factory=dict)
     d1_layer_ref_by_parent: Dict[Tuple[str, str], object] = field(default_factory=dict)
@@ -1908,7 +1911,7 @@ class TtaScheduler:
         )
 
     def refresh_gpu_aux_interpolation_leases(self) -> None:
-        """Lease warm CUDA worker interpreters only after global inference drain."""
+        """Lease worker interpreters after inference drain and their asset-release ACK."""
         aux_pool = self.operations.gpu_worker_aux_interpolation_pool()
         worker_ids = sorted(int(worker_id) for worker_id in self.state.gpu_task_queues)
         if aux_pool is None or not worker_ids:
@@ -1924,6 +1927,7 @@ class TtaScheduler:
         for worker_id in worker_ids:
             if (
                 self.gpu_worker_inflight(worker_id) == 0
+                and worker_id in self.state.gpu_inference_asset_release_results_by_worker
                 and self.operations._main_process_gpu_stage_can_dispatch_inference(worker_id)
             ):
                 # Feeder exclusivity ends at global drain; post-inference interpolation may
@@ -1932,11 +1936,128 @@ class TtaScheduler:
             else:
                 aux_pool.revoke_worker(worker_id)
 
+    def gpu_inference_asset_release_complete(self) -> bool:
+        """Whether every selected GPU answered the post-inference release control."""
+        worker_ids = tuple(int(worker) for worker in self.state.gpu_task_queues)
+        if not worker_ids:
+            return True
+        if self.state.gpu_inference_asset_release_pending_by_worker:
+            return False
+        if not self.state.gpu_inference_asset_release_requested:
+            # Do not permanently retire a worker while tasks may still be registered.
+            # A genuinely empty run has no release transaction to wait for.
+            return int(self.state.gpu_worker_total_tasks) <= 0
+        return all(worker in self.state.gpu_inference_asset_release_results_by_worker for worker in worker_ids)
+
+    def request_gpu_inference_asset_release(self) -> bool:
+        """Request release once authoritative inference and owner state are drained.
+
+        Controls do not count as inference tasks. A validation refusal leaves that
+        worker's assets intact and satisfies this handshake; fence/hardware failures abort.
+        The pipeline may release main-process GPU priority only after this returns
+        True. The final ACK re-enters its existing inference-drain callback.
+        """
+        state = self.state
+        worker_ids = sorted(int(worker) for worker in state.gpu_task_queues)
+        if not worker_ids or int(state.gpu_worker_total_tasks) <= 0:
+            return not bool(state.gpu_inference_asset_release_pending_by_worker)
+        if int(state.gpu_worker_results_collected) > int(state.gpu_worker_total_tasks):
+            raise RuntimeError('Inference result count exceeded the task count before asset release')
+        if (
+            int(state.gpu_worker_results_collected) != int(state.gpu_worker_total_tasks)
+            or state.gpu_worker_pending_task_ids
+            or state.d1_owner_by_parent
+            or state.d1_active_parent_by_worker
+            or state.d1_groups_by_parent
+            or state.d1_group_parent_by_id
+            or any(self.gpu_worker_inflight(worker) for worker in worker_ids)
+            or any(int(state.cpu_worker_dispatched_by_id.get(worker, 0))
+                   > int(state.cpu_worker_results_by_id.get(worker, 0))
+                   for worker in state.cpu_task_queues)
+        ):
+            return False
+        if state.gpu_inference_asset_release_requested:
+            return self.gpu_inference_asset_release_complete()
+
+        aux_pool = self.operations.gpu_worker_aux_interpolation_pool()
+        if aux_pool is not None:
+            for worker in worker_ids:
+                aux_pool.revoke_worker(worker)
+        controls = {
+            worker: {
+                'task_id': self._next_d1_group_control_task_id(),
+                'task_type': 'control',
+                'op': 'release_inference_assets',
+                'inference_drained': True,
+            }
+            for worker in worker_ids
+        }
+        # Register the complete barrier before dispatch. A queue failure is fatal
+        # and cannot make an unacknowledged worker appear released.
+        state.gpu_inference_asset_release_requested = True
+        state.gpu_inference_asset_release_pending_by_worker.update(
+            (worker, int(command['task_id'])) for worker, command in controls.items()
+        )
+        for worker, command in controls.items():
+            self.operations.preflight_multiprocessing_payload(command)
+            state.gpu_task_queues[worker].put(command)
+        self.operations.runtime_telemetry().gauge('inference.asset_release.pending_workers', worker_ids)
+        return False
+
+    def _process_inference_asset_release_result(self, msg: Dict[str, object]) -> None:
+        state = self.state
+        worker = int(msg.get('gpu_index', -1))
+        task_id = int(msg.get('task_id', 0))
+        if (
+            str(msg.get('worker_kind', 'gpu')).lower() != 'gpu'
+            or str(msg.get('op', '')) != 'release_inference_assets'
+            or worker not in state.gpu_task_queues
+            or task_id >= 0
+        ):
+            raise RuntimeError(f'Invalid inference-asset release acknowledgement: worker={worker}, task={task_id}')
+        completed = state.gpu_inference_asset_release_results_by_worker.get(worker)
+        if completed is not None:
+            if task_id == int(completed['task_id']) and bool(msg.get('ok')) == bool(completed['ok']):
+                return
+            raise RuntimeError(f'Conflicting inference-asset release acknowledgement from worker {worker}')
+        expected = state.gpu_inference_asset_release_pending_by_worker.get(worker)
+        if expected is None or int(expected) != task_id:
+            raise RuntimeError(f'Unrequested inference-asset release acknowledgement: worker={worker}, task={task_id}')
+        stats = dict(msg.get('stats') or {})
+        ok = bool(msg.get('ok'))
+        safe_refusal = bool(
+            stats.get('assets_intact', False)
+            and str(stats.get('phase', '')) == 'validate_drain'
+        )
+        if not ok and not safe_refusal:
+            raise RuntimeError(
+                f'GPU worker {worker} failed during inference-asset release '
+                f'(task {task_id}): {msg.get("error")}\n{msg.get("traceback")}'
+            )
+        record = {'task_id': task_id, 'ok': ok, 'stats': stats, 'error': str(msg.get('error') or '')}
+        state.gpu_inference_asset_release_results_by_worker[worker] = record
+        del state.gpu_inference_asset_release_pending_by_worker[worker]
+        telemetry = self.operations.runtime_telemetry()
+        telemetry.add('inference.asset_release.acknowledgements', 1)
+        telemetry.gauge(f'inference.asset_release.worker.{worker}', record)
+        telemetry.gauge('inference.asset_release.pending_workers', sorted(state.gpu_inference_asset_release_pending_by_worker))
+        if not ok:
+            telemetry.add('inference.asset_release.safe_refusals', 1)
+            print(f'GPU worker {worker} retained inference assets: {record["error"]}; continuing with existing memory admission.')
+        if self.gpu_inference_asset_release_complete():
+            self._result_callbacks().announce_process_inference_drain_if_complete()
+        self.refresh_gpu_aux_interpolation_leases()
+
     def dispatch_gpu_worker_inference_window(self,
         preferred_parent: Optional[Tuple[str, str]] = None,
     ) -> None:
         """Issue bounded, targeted worker leases with D1 owner affinity."""
         worker_ids = sorted(int(worker_id) for worker_id in self.state.gpu_task_queues)
+        if self.state.gpu_inference_asset_release_requested:
+            if self.state.gpu_worker_pending_task_ids:
+                raise RuntimeError('New inference was queued after GPU inference-asset release began')
+            self.operations._set_main_process_gpu_pending_inference(False)
+            return
         if not worker_ids:
             self.operations._set_main_process_gpu_pending_inference(False)
             return
@@ -2721,6 +2842,9 @@ class TtaScheduler:
         }:
             self._process_d1_group_control_result(msg)
             return
+        if mtype == 'inference_assets_released':
+            self._process_inference_asset_release_result(msg)
+            return
         if worker_kind == 'cpu':
             worker_id = int(msg.get('cpu_index', -1))
             task_id = int(msg.get('task_id', -1))
@@ -2971,8 +3095,10 @@ class TtaScheduler:
     def process_inference_outstanding(self) -> bool:
         return bool(
             self.inputs.inference_worker_process_active
-            and self.state.gpu_worker_results_collected
-            < self.state.gpu_worker_total_tasks
+            and (
+                self.state.gpu_worker_results_collected < self.state.gpu_worker_total_tasks
+                or self.state.gpu_inference_asset_release_pending_by_worker
+            )
         )
 
     def check_inference_workers_alive(self) -> None:
@@ -2994,6 +3120,8 @@ class TtaScheduler:
             ("GPU", self.state.gpu_worker_processes),
             ("OpenVINO CPU", self.state.cpu_worker_processes),
         ):
+            if backend_label == 'OpenVINO CPU' and remaining <= 0:
+                continue
             for process in processes:
                 if process.is_alive():
                     continue
@@ -3001,7 +3129,9 @@ class TtaScheduler:
                     f"{backend_label} worker {getattr(process, 'name', '?')} exited "
                     f"unexpectedly (exitcode={getattr(process, 'exitcode', None)}) with "
                     f"{remaining} inference result(s) and {aux_outstanding} GPU-worker "
-                    "auxiliary interpolation pass(es) still outstanding."
+                    'auxiliary interpolation pass(es), plus '
+                    f'{len(self.state.gpu_inference_asset_release_pending_by_worker)} '
+                    'inference-asset release acknowledgement(s) still outstanding.'
                 )
                 if aux_pool is not None:
                     aux_pool.mark_failed(reason)
@@ -3074,6 +3204,8 @@ class TtaScheduler:
         )
         if remaining_results:
             issues["remaining_results"] = int(remaining_results)
+        if state.gpu_inference_asset_release_pending_by_worker:
+            issues['gpu_inference_asset_release_pending'] = dict(state.gpu_inference_asset_release_pending_by_worker)
         gpu_inflight = sum(
             max(
                 0,

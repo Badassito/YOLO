@@ -1114,6 +1114,7 @@ class _GpuWorkerRenderEngine:
         self._native_plane_cache: 'OrderedDict[Tuple[str, int], object]' = OrderedDict()
         self._native_u8_plane_cache: 'OrderedDict[Tuple[str, int], object]' = OrderedDict()
         self._tilted_plan_cache_floor = 0
+        self._inference_assets_released = False
 
     # volume residency ----
 
@@ -1129,6 +1130,8 @@ class _GpuWorkerRenderEngine:
         """Resolve resident or streaming GPU source-volume mode.
         
         Eligible runs retain native T and defer host-cube construction until a CPU, tile, or nonresident fallback requests it."""
+        if bool(getattr(self, '_inference_assets_released', False)):
+            raise RuntimeError('GPU renderer was retired after inference drain')
         torch = self.torch
         shape_t = tuple(int(x) for x in shape)
         if len(shape_t) != 3:
@@ -1248,6 +1251,8 @@ class _GpuWorkerRenderEngine:
         while uploading directly from the caller-owned array.
         """
 
+        if bool(getattr(self, '_inference_assets_released', False)):
+            raise RuntimeError('GPU renderer was retired after inference drain')
         torch = self.torch
         source = np.asarray(volume)
         if source.ndim != 3 or source.dtype != np.uint8:
@@ -1359,6 +1364,53 @@ class _GpuWorkerRenderEngine:
                 f"({nbytes / GIB:.1f} GiB); TTA CUDA projection kernels active."
             )
         return self._mode
+
+    def release_inference_assets(self) -> Dict[str, object]:
+        """Drop GPU source/texture/cache ownership after an authoritative drain.
+
+        The caller retires TensorRT rings first and guarantees there will be no
+        further inference. This object keeps its host-source mapping/descriptor;
+        neither the input file nor any parent's overlay source is closed/deleted.
+        A failed stream fence leaves all renderer owners intact.
+        """
+        with self._radial_texture_lock:
+            if bool(getattr(self, '_inference_assets_released', False)):
+                return {'already_released': True, 'source_bytes': 0, 'texture_bytes': 0}
+            self._stream.synchronize()
+            volume = self._volume_gpu
+            source_bytes = int(getattr(volume, 'nbytes', 0)) if volume is not None else 0
+            texture = self._radial_texture_ref
+            texture_bytes = int(getattr(texture, 'nbytes', 0)) if texture is not None else 0
+            cache_names = (
+                '_native_t_map_cache', '_native_plane_cache', '_native_u8_plane_cache',
+                '_fold_cache', '_tilted_plans', '_fused_radial_taps',
+            )
+            cache_entries = sum(len(getattr(self, name)) for name in cache_names)
+            # A texture namespace retains both its CUDAarray and the original
+            # linear source via source_ref. Clear every owning reference, including
+            # ones a now-retired source object may still hold to this namespace.
+            if texture is not None:
+                for name in ('texture', 'descriptor', 'resource', 'cuda_array', 'source_ref', 'channel'):
+                    setattr(texture, name, None)
+            self._radial_texture_ref = None
+            self._fused_volume_ref = None
+            self._volume_flat = None
+            self._volume_gpu = None
+            for name in cache_names:
+                getattr(self, name).clear()
+            self._standalone_render_meta = None
+            self._standalone_render_meta_ref = None
+            self._fused_preflight_volume_key = None
+            self._fused_preflight_validated_families.clear()
+            self._fused_graph_rejected_keys.clear()
+            self._fused_validated_keys.clear()
+            self._radial_texture_admitted = False
+            self._resident_runtime_disabled = True
+            self._mode = 'inference_assets_released'
+            self._inference_assets_released = True
+            return {'already_released': False, 'source_bytes': source_bytes,
+                    'texture_bytes': texture_bytes, 'cache_entries': cache_entries,
+                    'host_source_preserved': self._volume_mm is not None}
 
     def disable_resident_after_runtime_failure(self) -> None:
         """Release residency and keep this worker on completed-cube fallbacks.

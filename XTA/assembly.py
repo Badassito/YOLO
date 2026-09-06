@@ -9,6 +9,7 @@ import shutil
 import threading
 import tempfile
 import time
+from concurrent.futures import Future
 from dataclasses import replace as dataclasses_replace
 from pathlib import Path
 from typing import (
@@ -883,6 +884,60 @@ def _materialize_sparse_cartesian_component(
     return ref
 
 
+def _materialize_sparse_radial_component(
+    component_store_path: Path, *, added_voxels: int, model_name: str, view: ViewInfo,
+    source: str, pass_index: int, interpolation_walk_back_index: int,
+    interpolation_candidate_index: int, tile_config_id: str, tile_acceptance: str,
+    stage: str, description: str, temp_dir: Path, workers: int, keep_temp: bool,
+) -> NrrdLayerRef:
+    """Keep Radial bridge deltas sparse through source-space publication."""
+    from .sparse_projection import project_radial_sparse_store
+
+    shape = final_source_output_shape() or (int(view.full_t), int(view.full_h), int(view.full_w))
+    stage = (f'{stage}_walkback{int(interpolation_walk_back_index):02d}_'
+             f'candidate{int(interpolation_candidate_index):02d}')
+    common = dict(view_name=str(view.name), source=str(source), mask_kind='bridge',
+                  pass_index=int(pass_index), tile_config_id=str(tile_config_id),
+                  tile_acceptance=str(tile_acceptance), stage=stage)
+    key = _nrrd_layer_key(**common)
+    path = Path(temp_dir) / 'nrrd_layers' / str(view.name) / f'{key}.orthogonal.cvol'
+    with runtime_telemetry().span('projection.sparse_radial_component.materialize'):
+        stats = project_radial_sparse_store(
+            Path(component_store_path), view, path, out_shape_tyx=shape, workers=int(workers),
+        )
+    ref = NrrdLayerRef(
+        key=key, name=_nrrd_layer_name(view=view, **{k: v for k, v in common.items() if k != 'view_name'}),
+        path=path, shape=tuple(shape), dtype='uint8', storage_format=INTERNAL_PACKED_CVOL_FORMAT,
+        model_name=str(model_name), physical_view_name=physical_view_name(view),
+        aug_id=str(view.tta_aug_id), angle_deg=float(view.tta_angle_deg), view_family=str(view.family),
+        interpolation_walk_back_index=int(interpolation_walk_back_index),
+        interpolation_candidate_index=int(interpolation_candidate_index), description=str(description),
+        segment_extent_ijk=tuple(stats['segment_extent_ijk']), segment_extent_shape_tyx=tuple(shape),
+        segment_extent_source='sparse_radial_component', **common,
+    )
+    sink = nrrd_layer_sink()
+    if sink is not None:
+        sink.submit_layer(ref, nrrd_layer_output_suffix(
+            view_token=view_output_token(view),
+            interpolation_walk_back_index=int(interpolation_walk_back_index),
+            interpolation_candidate_index=int(interpolation_candidate_index),
+            **{k: v for k, v in common.items() if k != 'view_name'},
+        ))
+    if not bool(keep_temp):
+        # The replacement has closed and the sink owns its independent pathname.
+        shutil.rmtree(component_store_path, ignore_errors=True)
+    telemetry = runtime_telemetry()
+    telemetry.add('projection.sparse_radial_component.layers', 1)
+    for field in ('input_payload_bytes', 'input_foreground_samples', 'projected_contributions',
+                  'raw_payload_bytes'):
+        telemetry.add(f'projection.sparse_radial_component.{field}', stats[field])
+    telemetry.gauge('projection.sparse_radial_component.last_map_bytes', stats['map_bytes'])
+    telemetry.gauge(f'projection.sparse_radial_component.{view.name}.last', stats)
+    print(f'Sparse Radial component {view.name}: input={stats["input_payload_bytes"]} bytes, '
+          f'output={stats["raw_payload_bytes"]} bytes, seconds={stats["seconds"]:.6f}', flush=True)
+    return ref
+
+
 def materialize_interpolation_component_nrrd_view_layer(
     component_store_path: Path,
     *,
@@ -903,10 +958,22 @@ def materialize_interpolation_component_nrrd_view_layer(
 ) -> NrrdLayerRef:
     """Project one sparse interpolation component and submit its deterministic NRRD.
 
-    Qualified Cartesian components retain sparse backing through publication. Other
-    geometries, or unavailable compiled transpose kernels, use a reusable dense
+    Cartesian and Radial components retain sparse backing through publication.
+    Other geometries, or unavailable compiled kernels, use a reusable dense
     workspace; empty combinations bypass that fallback decode.
     """
+    if str(view.family) == 'radial':
+        from .component_replay import capture_component_projection
+        with runtime_telemetry().span('projection.component_replay_capture'):
+            capture_component_projection(
+                Path(component_store_path), view=view,
+                out_shape_tyx=final_source_output_shape() or (int(view.full_t), int(view.full_h), int(view.full_w)),
+                added_voxels=int(added_voxels),
+                layer_metadata=dict(model_name=str(model_name), source=str(source),
+                    pass_index=int(pass_index), interpolation_walk_back_index=int(interpolation_walk_back_index),
+                    interpolation_candidate_index=int(interpolation_candidate_index), stage=str(stage),
+                    tile_config_id=str(tile_config_id), tile_acceptance=str(tile_acceptance)),
+            )
     sparse_cartesian = bool(
         str(view.family) == 'orthogonal'
         and not is_tilted_view(view)
@@ -938,6 +1005,17 @@ def materialize_interpolation_component_nrrd_view_layer(
         except _SparseComponentKernelUnavailable:
             # Failed transpose staging was discarded; the input store is intact.
             pass
+
+    if str(view.family) == 'radial' and str(source) == 'fullframe' and _numba is not None:
+        return _materialize_sparse_radial_component(
+            Path(component_store_path), added_voxels=int(added_voxels),
+            model_name=str(model_name), view=view, source=str(source), pass_index=int(pass_index),
+            interpolation_walk_back_index=int(interpolation_walk_back_index),
+            interpolation_candidate_index=int(interpolation_candidate_index),
+            tile_config_id=str(tile_config_id), tile_acceptance=str(tile_acceptance),
+            stage=str(stage), description=str(description), temp_dir=Path(temp_dir),
+            workers=int(workers), keep_temp=bool(keep_temp),
+        )
 
     component_store_path = Path(component_store_path)
     store = RawBBoxMaskStore.open(component_store_path, mmap_payload=True)
@@ -1328,6 +1406,7 @@ def prepare_view_volume_after_fullframe(
     parent_mask_ready_callback: Optional[Callable[[str, str, object], None]] = None,
     internal_final_layer_enabled: bool = False,
     preinterpolation_layer_already_published: bool = False,
+    submit_component_projection: Optional[Callable[..., Future[NrrdLayerRef]]] = None,
 ) -> PreparedViewResult:
     # Local import keeps the package dependency graph acyclic.
     from .finalization import union_volume_into_volume
@@ -1337,6 +1416,7 @@ def prepare_view_volume_after_fullframe(
     d1_additions_mm: Optional[np.ndarray] = None
     d1_additions_path: Optional[Path] = None
     nrrd_layers: List[NrrdLayerRef] = []
+    pending_component_layers: List[Future[NrrdLayerRef]] = []
     parent_mask_support_mm: Optional[object] = None
     parent_bridge_support_mm: Optional[object] = None
     parent_mask_support_path: Optional[Path] = None
@@ -1355,7 +1435,7 @@ def prepare_view_volume_after_fullframe(
     )
 
     # The source-space D1 base is independently registered by the scheduler.
-    # Complete Cartesian component refs carry every addition directly
+    # Complete source-space component refs carry every addition directly
     # into final fusion; a second dense continuation would be created only to discard it.
     # Zero component axes may still produce default bridges, so retain their dense path.
     # keep_temp retains its historical dense debug artifacts, and no-NRRD runs retain
@@ -1365,9 +1445,6 @@ def prepare_view_volume_after_fullframe(
         and not bool(dense_tiling_active)
         and bool(nrrd_layers_enabled)
         and not bool(keep_temp)
-        and str(view.family) == 'orthogonal'
-        and physical_view_name(view) in ('transverse', 'sagittal', 'coronal')
-        and float(view.tta_angle_deg) == 0.0
         and (
             not _view_uses_interpolation(view, int(interpolate))
             or (int(interpolation_walk_back) > 0 and int(interpolation_candidates) > 0)
@@ -1495,352 +1572,373 @@ def prepare_view_volume_after_fullframe(
             parent_mask_ready_callback(str(model_name), str(view.name), parent_mask_support_mm)
 
 
-    interpolation_stats: List[Dict[str, object]] = []
-    processing_plane_shape = tuple(int(v) for v in np.asarray(baseline_native_volume).shape[-2:])
-    effective_interpolate_min_radius = view_processing_min_radius(
-        view, float(interpolate_min_radius), processing_plane_shape,
-    )
-    effective_interpolation_search_angle = view_processing_search_angle(
-        view, float(interpolation_search_angle), processing_plane_shape,
-    )
-    if _view_uses_interpolation(view, int(interpolate)):
-        total_passes = int(interpolate_passes)
-        for pass_idx in range(1, total_passes + 1):
-            # the pass itself writes the exact added-voxel delta
-            # (bridge AND NOT pre-merge mask) to this path during its merge step, replacing
-            # the old full-volume before-copy + subtract bookkeeping.
-            pass_delta_path: Optional[Path] = None
-            if (
-                bool(d1_delta_only)
-                and not bool(fused_radial_components)
-                and not bool(d1_component_refs_only)
-            ):
-                pass_delta_path = temp_dir / 'nrrd_work' / view.name / f'fullframe_bridge_pass{int(pass_idx):02d}.u8.dat'
-            pass_component_dir: Optional[Path] = None
-            if (
-                bool(nrrd_layers_enabled)
-                and not bool(fused_radial_components)
-                and int(interpolation_walk_back) > 0
-                and int(interpolation_candidates) > 0
-            ):
-                pass_component_dir = (
-                    temp_dir / 'nrrd_work' / view.name
-                    / f'fullframe_bridge_pass{int(pass_idx):02d}_components'
+    try:
+        interpolation_stats: List[Dict[str, object]] = []
+        processing_plane_shape = tuple(int(v) for v in np.asarray(baseline_native_volume).shape[-2:])
+        effective_interpolate_min_radius = view_processing_min_radius(
+            view, float(interpolate_min_radius), processing_plane_shape,
+        )
+        effective_interpolation_search_angle = view_processing_search_angle(
+            view, float(interpolation_search_angle), processing_plane_shape,
+        )
+        if _view_uses_interpolation(view, int(interpolate)):
+            total_passes = int(interpolate_passes)
+            for pass_idx in range(1, total_passes + 1):
+                # the pass itself writes the exact added-voxel delta
+                # (bridge AND NOT pre-merge mask) to this path during its merge step, replacing
+                # the old full-volume before-copy + subtract bookkeeping.
+                pass_delta_path: Optional[Path] = None
+                if (
+                    bool(d1_delta_only)
+                    and not bool(fused_radial_components)
+                    and not bool(d1_component_refs_only)
+                ):
+                    pass_delta_path = temp_dir / 'nrrd_work' / view.name / f'fullframe_bridge_pass{int(pass_idx):02d}.u8.dat'
+                pass_component_dir: Optional[Path] = None
+                if (
+                    bool(nrrd_layers_enabled)
+                    and not bool(fused_radial_components)
+                    and int(interpolation_walk_back) > 0
+                    and int(interpolation_candidates) > 0
+                ):
+                    pass_component_dir = (
+                        temp_dir / 'nrrd_work' / view.name
+                        / f'fullframe_bridge_pass{int(pass_idx):02d}_components'
+                    )
+
+                baseline_native_volume, stats_local = interpolate_view_volume_pass_maybe_process(
+                    mask_mm=baseline_native_volume,
+                    view=view,
+                    work_dir=temp_dir / 'interpolation' / model_name / view.name,
+                    pass_tag=f'pass{pass_idx}',
+                    max_slice_distance=int(interpolate),
+                    search_angle_deg=float(effective_interpolation_search_angle),
+                    interpolation_walk_back=int(interpolation_walk_back),
+                    interpolation_candidates=int(interpolation_candidates),
+                    interpolate_min_radius=float(effective_interpolate_min_radius),
+                    keep_temp=bool(keep_temp),
+                    prefer_memory=True,
+                    workers=int(interpolation_task_workers),
+                    bridge_delta_path=pass_delta_path,
+                    bridge_component_dir=pass_component_dir,
+                    # pass 1 labels exactly the flushed volume; later passes see
+                    # bridge-mutated content, so the metadata is only forwarded for pass 1.
+                    known_slice_any=(meta_slice_any if (meta_valid and int(pass_idx) == 1) else None),
+                    known_slice_bboxes=(meta_slice_bboxes if (meta_valid and int(pass_idx) == 1) else None),
+                )
+                stats_local = dict(stats_local)
+                stats_local['component_refs_only'] = bool(d1_component_refs_only)
+                stats_local.update({
+                    'pass_index': int(pass_idx),
+                    'model': str(model_name),
+                    'view': str(view.name),
+                    'source': 'fullframe',
+                    'max_slice_distance': int(interpolate),
+                    'interpolation_walk_back': int(interpolation_walk_back),
+                    'interpolation_candidates': int(interpolation_candidates),
+                    'interpolation_search_angle': float(interpolation_search_angle),
+                    'processing_interpolation_search_angle': float(effective_interpolation_search_angle),
+                    'processing_interpolate_min_radius': float(effective_interpolate_min_radius),
+                })
+                interpolation_stats.append(stats_local)
+
+                if pass_delta_path is not None:
+                    delta_reported = str(stats_local.get('bridge_delta_path', '') or '')
+                    if delta_reported and Path(delta_reported).exists():
+                        bridge_delta_mm = np.memmap(
+                            Path(delta_reported),
+                            dtype=np.uint8,
+                            mode='r',
+                            shape=tuple(int(v) for v in np.asarray(baseline_native_volume).shape),
+                        )
+                        if d1_additions_mm is not None:
+                            union_volume_into_volume(
+                                d1_additions_mm,
+                                bridge_delta_mm,
+                                workers=int(slice_workers),
+                                desc=(
+                                    f'D1 delta-only full-frame bridge pass {int(pass_idx)} '
+                                    f'{model_name}/{view.name}'
+                                ),
+                            )
+                        close_memmap_array(bridge_delta_mm)
+                    if not bool(keep_temp):
+                        try:
+                            pass_delta_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
+                if pass_component_dir is not None:
+                    component_entries = [
+                        dict(entry)
+                        for entry in stats_local.get('bridge_component_deltas', [])
+                    ]
+                    expected_components = int(interpolation_walk_back) * int(interpolation_candidates)
+                    if len(component_entries) != int(expected_components):
+                        raise RuntimeError(
+                            f'{model_name}/{view.name} interpolation pass {int(pass_idx)} returned '
+                            f'{len(component_entries)} component delta(s); expected '
+                            f'{int(interpolation_walk_back)} x {int(interpolation_candidates)} = '
+                            f'{int(expected_components)}'
+                        )
+                    if bool(d1_component_refs_only):
+                        # Counts can overlap between combinations, but their OR is exactly
+                        # the pass delta: every membership bit excludes the same pre-pass
+                        # foreground before merge. Reject malformed coverage instead of
+                        # retiring the only dense continuation with missing components.
+                        component_keys = {
+                            (int(entry['walk_back_index']), int(entry['candidate_index']))
+                            for entry in component_entries
+                        }
+                        expected_keys = {
+                            (walk, candidate)
+                            for walk in range(1, int(interpolation_walk_back) + 1)
+                            for candidate in range(1, int(interpolation_candidates) + 1)
+                        }
+                        component_counts = [int(entry.get('added_voxels', 0)) for entry in component_entries]
+                        if (
+                            component_keys != expected_keys
+                            or any(count < 0 for count in component_counts)
+                            or sum(component_counts) < int(stats_local.get('added_voxels', 0))
+                        ):
+                            raise RuntimeError(
+                                f'{model_name}/{view.name}: incomplete D1 component-ref coverage '
+                                f'for interpolation pass {int(pass_idx)}'
+                            )
+                    component_entries.sort(key=lambda entry: (
+                        int(entry.get('walk_back_index', 0)),
+                        int(entry.get('candidate_index', 0)),
+                    ))
+                    for component_entry in component_entries:
+                        walk_back_index = int(component_entry['walk_back_index'])
+                        candidate_index = int(component_entry['candidate_index'])
+                        # Immutable component stores no longer depend on the mutable
+                        # parent canvas. Only refs-only parents can detach publication;
+                        # tile support and retained debug canvases keep the synchronous path.
+                        materialize_component = (
+                            submit_component_projection
+                            if d1_component_refs_only and submit_component_projection is not None
+                            else materialize_interpolation_component_nrrd_view_layer
+                        )
+                        layer_ref = materialize_component(
+                            Path(str(component_entry['path'])),
+                            added_voxels=int(component_entry.get('added_voxels', 0)),
+                            model_name=str(model_name),
+                            view=view,
+                            source='fullframe',
+                            pass_index=int(pass_idx),
+                            interpolation_walk_back_index=int(walk_back_index),
+                            interpolation_candidate_index=int(candidate_index),
+                            stage='interpolation',
+                            description=(
+                                'Voxels added by this full-frame interpolation pass for '
+                                f'walk-back origin {int(walk_back_index)} and candidate '
+                                f'{int(candidate_index)} only.'
+                            ),
+                            temp_dir=temp_dir,
+                            workers=int(slice_workers),
+                            keep_temp=bool(keep_temp),
+                        )
+                        if isinstance(layer_ref, Future):
+                            pending_component_layers.append(layer_ref)
+                        else:
+                            nrrd_layers.append(layer_ref)
+
+
+                if int(stats_local.get('added_voxels', 0)) <= 0:
+                    break
+        elif not bool(d1_component_refs_only):
+            # Direct-union CUDA workers already wrote this completed view into a root file-backed
+            # memmap. Re-copying it to a second *.noninterpolated_native file read and rewrote the
+            # entire multi-GiB view after inference, often as a low-CPU disk/page-cache tail. Retain
+            # the existing backing in place; only anonymous/fallback arrays need a drain copy.
+            old_volume = baseline_native_volume
+            existing_backing = _interpolation_array_backing_path(old_volume)
+            if existing_backing is not None:
+                print(
+                    f'{model_name}/{view.name} non-interpolated native retention (v16.1.3): '
+                    f'reusing {existing_backing}; no full-volume drain copy.'
+                )
+            else:
+                drained_path = (
+                    temp_dir / 'view_volumes' / model_name
+                    / f'{view.name}.noninterpolated_native.u8.dat'
+                )
+                baseline_native_volume = _drain_volume_to_mmap(
+                    old_volume,
+                    drained_path,
+                    desc=f'{model_name}/{view.name} non-interpolated native drain',
+                    workers=int(slice_workers),
+                )
+                if old_volume is not baseline_native_volume:
+                    close_memmap_array(old_volume)
+                    if not keep_temp:
+                        try:
+                            union_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
+        if bool(fused_radial_components):
+            # projection and positive-support restore distribute over binary OR, so the
+            # cleaned YOLO mask and every accepted bridge can be kept in the already-mutated
+            # baseline and projected once. This removes one source-store write and one complete
+            # Radial backprojection per bridge pass on the prioritized angle-variant path.
+            fused_added_voxels = sum(
+                max(0, int(item.get('added_voxels', 0) or 0))
+                for item in interpolation_stats
+            )
+            has_fused_bridges = int(fused_added_voxels) > 0
+            layer_ref = materialize_nrrd_view_layer(
+                baseline_native_volume,
+                model_name=str(model_name),
+                view=view,
+                source='fullframe',
+                mask_kind=('union' if has_fused_bridges else 'yolo'),
+                pass_index=0,
+                stage=('post_interpolation' if has_fused_bridges else 'pre_interpolation'),
+                description=(
+                    'Cleaned full-frame YOLO mask fused with all interpolation bridges.'
+                    if has_fused_bridges
+                    else 'Cleaned full-frame YOLO mask; interpolation added no bridge voxels.'
+                ),
+                temp_dir=temp_dir,
+                workers=int(slice_workers),
+                known_has_foreground=(
+                    bool(meta_slice_any.any())
+                    if meta_valid and meta_slice_any is not None else None
+                ),
+                known_row_occupancy=(
+                    np.ascontiguousarray(meta_row_occupancy.any(axis=0))
+                    if (
+                        meta_valid and meta_row_occupancy is not None
+                        and not _view_uses_interpolation(view, int(interpolate))
+                    ) else None
+                ),
+            )
+            if layer_ref is not None:
+                nrrd_layers.append(layer_ref)
+                print(
+                    f'v13.3.18 (C12): {model_name}/{view.name} emitted one Radial '
+                    f'{"YOLO+bridge union" if has_fused_bridges else "YOLO"} layer for one '
+                    f'projection pass ({int(fused_added_voxels)} bridge voxel(s)).'
                 )
 
-            baseline_native_volume, stats_local = interpolate_view_volume_pass_maybe_process(
-                mask_mm=baseline_native_volume,
-                view=view,
-                work_dir=temp_dir / 'interpolation' / model_name / view.name,
-                pass_tag=f'pass{pass_idx}',
-                max_slice_distance=int(interpolate),
-                search_angle_deg=float(effective_interpolation_search_angle),
-                interpolation_walk_back=int(interpolation_walk_back),
-                interpolation_candidates=int(interpolation_candidates),
-                interpolate_min_radius=float(effective_interpolate_min_radius),
-                keep_temp=bool(keep_temp),
-                prefer_memory=True,
-                workers=int(interpolation_task_workers),
-                bridge_delta_path=pass_delta_path,
-                bridge_component_dir=pass_component_dir,
-                # pass 1 labels exactly the flushed volume; later passes see
-                # bridge-mutated content, so the metadata is only forwarded for pass 1.
-                known_slice_any=(meta_slice_any if (meta_valid and int(pass_idx) == 1) else None),
-                known_slice_bboxes=(meta_slice_bboxes if (meta_valid and int(pass_idx) == 1) else None),
+        if bool(dense_tiling_active) and parent_mask_support_mm is not None:
+            parent_bridge_support_path = temp_dir / 'tile_support' / model_name / view.name / 'fullframe_bridge_support.cvol'
+            bridge_stats = subtract_volume_to_raw_bbox_store(
+                baseline_native_volume,
+                parent_mask_support_mm,
+                parent_bridge_support_path,
+                desc=f'NRRD support fullframe bridges {model_name}/{view.name}',
+                workers=int(slice_workers),
+                format_name=CVOL_FORMAT,
             )
-            stats_local = dict(stats_local)
-            stats_local['component_refs_only'] = bool(d1_component_refs_only)
-            stats_local.update({
-                'pass_index': int(pass_idx),
-                'model': str(model_name),
-                'view': str(view.name),
-                'source': 'fullframe',
-                'max_slice_distance': int(interpolate),
-                'interpolation_walk_back': int(interpolation_walk_back),
-                'interpolation_candidates': int(interpolation_candidates),
-                'interpolation_search_angle': float(interpolation_search_angle),
-                'processing_interpolation_search_angle': float(effective_interpolation_search_angle),
-                'processing_interpolate_min_radius': float(effective_interpolate_min_radius),
-            })
-            interpolation_stats.append(stats_local)
-
-            if pass_delta_path is not None:
-                delta_reported = str(stats_local.get('bridge_delta_path', '') or '')
-                if delta_reported and Path(delta_reported).exists():
-                    bridge_delta_mm = np.memmap(
-                        Path(delta_reported),
-                        dtype=np.uint8,
-                        mode='r',
-                        shape=tuple(int(v) for v in np.asarray(baseline_native_volume).shape),
-                    )
-                    if d1_additions_mm is not None:
-                        union_volume_into_volume(
-                            d1_additions_mm,
-                            bridge_delta_mm,
-                            workers=int(slice_workers),
-                            desc=(
-                                f'D1 delta-only full-frame bridge pass {int(pass_idx)} '
-                                f'{model_name}/{view.name}'
-                            ),
-                        )
-                    close_memmap_array(bridge_delta_mm)
-                if not bool(keep_temp):
+            if int(bridge_stats.get('foreground_voxels', 0)) <= 0:
+                parent_bridge_support_mm = None
+                if parent_bridge_support_path is not None:
                     try:
-                        pass_delta_path.unlink(missing_ok=True)
+                        shutil.rmtree(parent_bridge_support_path, ignore_errors=True)
                     except Exception:
                         pass
+            else:
+                parent_bridge_support_mm = RawBBoxMaskStore.open(parent_bridge_support_path, mmap_payload=True)
 
-            if pass_component_dir is not None:
-                component_entries = [
-                    dict(entry)
-                    for entry in stats_local.get('bridge_component_deltas', [])
-                ]
-                expected_components = int(interpolation_walk_back) * int(interpolation_candidates)
-                if len(component_entries) != int(expected_components):
-                    raise RuntimeError(
-                        f'{model_name}/{view.name} interpolation pass {int(pass_idx)} returned '
-                        f'{len(component_entries)} component delta(s); expected '
-                        f'{int(interpolation_walk_back)} x {int(interpolation_candidates)} = '
-                        f'{int(expected_components)}'
-                    )
-                if bool(d1_component_refs_only):
-                    # Counts can overlap between combinations, but their OR is exactly
-                    # the pass delta: every membership bit excludes the same pre-pass
-                    # foreground before merge. Reject malformed coverage instead of
-                    # retiring the only dense continuation with missing components.
-                    component_keys = {
-                        (int(entry['walk_back_index']), int(entry['candidate_index']))
-                        for entry in component_entries
-                    }
-                    expected_keys = {
-                        (walk, candidate)
-                        for walk in range(1, int(interpolation_walk_back) + 1)
-                        for candidate in range(1, int(interpolation_candidates) + 1)
-                    }
-                    component_counts = [int(entry.get('added_voxels', 0)) for entry in component_entries]
-                    if (
-                        component_keys != expected_keys
-                        or any(count < 0 for count in component_counts)
-                        or sum(component_counts) < int(stats_local.get('added_voxels', 0))
-                    ):
-                        raise RuntimeError(
-                            f'{model_name}/{view.name}: incomplete D1 component-ref coverage '
-                            f'for interpolation pass {int(pass_idx)}'
-                        )
-                component_entries.sort(key=lambda entry: (
-                    int(entry.get('walk_back_index', 0)),
-                    int(entry.get('candidate_index', 0)),
-                ))
-                for component_entry in component_entries:
-                    walk_back_index = int(component_entry['walk_back_index'])
-                    candidate_index = int(component_entry['candidate_index'])
-                    layer_ref = materialize_interpolation_component_nrrd_view_layer(
-                        Path(str(component_entry['path'])),
-                        added_voxels=int(component_entry.get('added_voxels', 0)),
-                        model_name=str(model_name),
-                        view=view,
-                        source='fullframe',
-                        pass_index=int(pass_idx),
-                        interpolation_walk_back_index=int(walk_back_index),
-                        interpolation_candidate_index=int(candidate_index),
-                        stage='interpolation',
-                        description=(
-                            'Voxels added by this full-frame interpolation pass for '
-                            f'walk-back origin {int(walk_back_index)} and candidate '
-                            f'{int(candidate_index)} only.'
-                        ),
-                        temp_dir=temp_dir,
-                        workers=int(slice_workers),
-                        keep_temp=bool(keep_temp),
-                    )
-                    nrrd_layers.append(layer_ref)
-
-
-            if int(stats_local.get('added_voxels', 0)) <= 0:
-                break
-    elif not bool(d1_component_refs_only):
-        # Direct-union CUDA workers already wrote this completed view into a root file-backed
-        # memmap. Re-copying it to a second *.noninterpolated_native file read and rewrote the
-        # entire multi-GiB view after inference, often as a low-CPU disk/page-cache tail. Retain
-        # the existing backing in place; only anonymous/fallback arrays need a drain copy.
-        old_volume = baseline_native_volume
-        existing_backing = _interpolation_array_backing_path(old_volume)
-        if existing_backing is not None:
-            print(
-                f'{model_name}/{view.name} non-interpolated native retention (v16.1.3): '
-                f'reusing {existing_backing}; no full-volume drain copy.'
-            )
-        else:
-            drained_path = (
-                temp_dir / 'view_volumes' / model_name
-                / f'{view.name}.noninterpolated_native.u8.dat'
-            )
-            baseline_native_volume = _drain_volume_to_mmap(
-                old_volume,
-                drained_path,
-                desc=f'{model_name}/{view.name} non-interpolated native drain',
+        if (
+            bool(internal_final_layer_enabled)
+            and not bool(dense_tiling_active)
+            and not bool(d1_component_refs_only)
+        ):
+            internal_ref = materialize_internal_final_view_layer(
+                (d1_additions_mm if d1_additions_mm is not None else baseline_native_volume),
+                model_name=str(model_name),
+                view=view,
+                temp_dir=temp_dir,
                 workers=int(slice_workers),
             )
-            if old_volume is not baseline_native_volume:
-                close_memmap_array(old_volume)
-                if not keep_temp:
+            if internal_ref is not None:
+                nrrd_layers.append(internal_ref)
+
+        if bool(d1_component_refs_only):
+            base_bytes = int(np.asarray(baseline_native_volume).nbytes)
+            base_backing_path = _interpolation_array_backing_path(baseline_native_volume)
+            close_memmap_array_without_flush(baseline_native_volume)
+            baseline_native_volume = None
+            # The interpolation process can return a different final-pass backing. Retire
+            # both that mapping and the original shadow, preserving immutable cvol stores.
+            for retired_path in {base_backing_path, union_path}:
+                if retired_path is not None and not str(retired_path).startswith('/proc/'):
                     try:
-                        union_path.unlink(missing_ok=True)
+                        Path(retired_path).unlink(missing_ok=True)
                     except Exception:
                         pass
-
-    if bool(fused_radial_components):
-        # projection and positive-support restore distribute over binary OR, so the
-        # cleaned YOLO mask and every accepted bridge can be kept in the already-mutated
-        # baseline and projected once. This removes one source-store write and one complete
-        # Radial backprojection per bridge pass on the prioritized angle-variant path.
-        fused_added_voxels = sum(
-            max(0, int(item.get('added_voxels', 0) or 0))
-            for item in interpolation_stats
-        )
-        has_fused_bridges = int(fused_added_voxels) > 0
-        layer_ref = materialize_nrrd_view_layer(
-            baseline_native_volume,
-            model_name=str(model_name),
-            view=view,
-            source='fullframe',
-            mask_kind=('union' if has_fused_bridges else 'yolo'),
-            pass_index=0,
-            stage=('post_interpolation' if has_fused_bridges else 'pre_interpolation'),
-            description=(
-                'Cleaned full-frame YOLO mask fused with all interpolation bridges.'
-                if has_fused_bridges
-                else 'Cleaned full-frame YOLO mask; interpolation added no bridge voxels.'
-            ),
-            temp_dir=temp_dir,
-            workers=int(slice_workers),
-            known_has_foreground=(
-                bool(meta_slice_any.any())
-                if meta_valid and meta_slice_any is not None else None
-            ),
-            known_row_occupancy=(
-                np.ascontiguousarray(meta_row_occupancy.any(axis=0))
-                if (
-                    meta_valid and meta_row_occupancy is not None
-                    and not _view_uses_interpolation(view, int(interpolate))
-                ) else None
-            ),
-        )
-        if layer_ref is not None:
-            nrrd_layers.append(layer_ref)
+            runtime_telemetry().add('d1.component_refs_only_views', 1)
+            runtime_telemetry().add('d1.additions_allocation_avoided_bytes', base_bytes)
+            runtime_telemetry().add('d1.aggregate_bridge_delta_requests_avoided', len(interpolation_stats))
             print(
-                f'v13.3.18 (C12): {model_name}/{view.name} emitted one Radial '
-                f'{"YOLO+bridge union" if has_fused_bridges else "YOLO"} layer for one '
-                f'projection pass ({int(fused_added_voxels)} bridge voxel(s)).'
+                f'D1 terminal component refs {model_name}/{view.name}: '
+                f'{len(nrrd_layers)} ready and {len(pending_component_layers)} pending addition ref(s); '
+                f'avoided {base_bytes / GIB:.2f} GiB dense additions allocation and '
+                f'{len(interpolation_stats)} aggregate bridge-delta request(s); '
+                'source-space D1 base remains independently registered for final fusion.'
             )
-
-    if bool(dense_tiling_active) and parent_mask_support_mm is not None:
-        parent_bridge_support_path = temp_dir / 'tile_support' / model_name / view.name / 'fullframe_bridge_support.cvol'
-        bridge_stats = subtract_volume_to_raw_bbox_store(
-            baseline_native_volume,
-            parent_mask_support_mm,
-            parent_bridge_support_path,
-            desc=f'NRRD support fullframe bridges {model_name}/{view.name}',
-            workers=int(slice_workers),
-            format_name=CVOL_FORMAT,
-        )
-        if int(bridge_stats.get('foreground_voxels', 0)) <= 0:
-            parent_bridge_support_mm = None
-            if parent_bridge_support_path is not None:
+        elif bool(d1_delta_only):
+            if d1_additions_mm is None:
+                raise RuntimeError(
+                    f'{model_name}/{view.name}: D1 continuation did not allocate its additions volume'
+                )
+            base_bytes = int(np.asarray(baseline_native_volume).nbytes)
+            close_memmap_array_without_flush(baseline_native_volume)
+            if (
+                not bool(keep_temp)
+                and union_path is not None
+                and not str(union_path).startswith('/proc/')
+            ):
                 try:
-                    shutil.rmtree(parent_bridge_support_path, ignore_errors=True)
+                    Path(union_path).unlink(missing_ok=True)
                 except Exception:
                     pass
-        else:
-            parent_bridge_support_mm = RawBBoxMaskStore.open(parent_bridge_support_path, mmap_payload=True)
+            baseline_native_volume = d1_additions_mm
+            print(
+                f'D1 delta-only continuation ready for {model_name}/{view.name}: '
+                f'released {base_bytes / GIB:.2f} GiB materialized base; final dense view now '
+                'contains only interpolation/tile additions because the source-space D1 base '
+                'was already published.'
+            )
 
-    if (
-        bool(internal_final_layer_enabled)
-        and not bool(dense_tiling_active)
-        and not bool(d1_component_refs_only)
-    ):
-        internal_ref = materialize_internal_final_view_layer(
-            (d1_additions_mm if d1_additions_mm is not None else baseline_native_volume),
+        # A refs-only result carries no mutable destination. PreparedViewResult already
+        # permits None here, and the scheduler publishes these refs before marking the
+        # variant terminal. Its physical-view reducer then selects refs as authoritative.
+        # Every other configuration retains the established dense continuation.
+        final_view_volume: Optional[np.ndarray] = baseline_native_volume
+
+        returned_parent_mask_support = parent_mask_support_mm if bool(dense_tiling_active) else None
+        returned_parent_bridge_support = parent_bridge_support_mm if bool(dense_tiling_active) else None
+        if parent_mask_support_mm is not None and returned_parent_mask_support is None:
+            close_raw_store_or_memmap_volume(parent_mask_support_mm, keep_temp=bool(keep_temp))
+        if parent_bridge_support_mm is not None and returned_parent_bridge_support is None:
+            close_raw_store_or_memmap_volume(parent_bridge_support_mm, keep_temp=bool(keep_temp))
+
+        return PreparedViewResult(
             model_name=str(model_name),
-            view=view,
-            temp_dir=temp_dir,
-            workers=int(slice_workers),
+            view_name=str(view.name),
+            aug_id=str(view.tta_aug_id),
+            angle_deg=float(view.tta_angle_deg),
+            native_support_mm=baseline_native_volume,
+            final_view_volume_mm=final_view_volume,
+            interpolation_stats=interpolation_stats,
+            nrrd_layers=nrrd_layers,
+            pending_component_layers=pending_component_layers,
+            parent_mask_support_mm=returned_parent_mask_support,
+            parent_bridge_support_mm=returned_parent_bridge_support,
         )
-        if internal_ref is not None:
-            nrrd_layers.append(internal_ref)
-
-    if bool(d1_component_refs_only):
-        base_bytes = int(np.asarray(baseline_native_volume).nbytes)
-        base_backing_path = _interpolation_array_backing_path(baseline_native_volume)
-        close_memmap_array_without_flush(baseline_native_volume)
-        baseline_native_volume = None
-        # The interpolation process can return a different final-pass backing. Retire
-        # both that mapping and the original shadow, preserving immutable cvol stores.
-        for retired_path in {base_backing_path, union_path}:
-            if retired_path is not None and not str(retired_path).startswith('/proc/'):
-                try:
-                    Path(retired_path).unlink(missing_ok=True)
-                except Exception:
-                    pass
-        runtime_telemetry().add('d1.component_refs_only_views', 1)
-        runtime_telemetry().add('d1.additions_allocation_avoided_bytes', base_bytes)
-        runtime_telemetry().add('d1.aggregate_bridge_delta_requests_avoided', len(interpolation_stats))
-        print(
-            f'D1 terminal component refs {model_name}/{view.name}: '
-            f'{len(nrrd_layers)} immutable addition ref(s); '
-            f'avoided {base_bytes / GIB:.2f} GiB dense additions allocation and '
-            f'{len(interpolation_stats)} aggregate bridge-delta request(s); '
-            'source-space D1 base remains independently registered for final fusion.'
-        )
-    elif bool(d1_delta_only):
-        if d1_additions_mm is None:
-            raise RuntimeError(
-                f'{model_name}/{view.name}: D1 continuation did not allocate its additions volume'
-            )
-        base_bytes = int(np.asarray(baseline_native_volume).nbytes)
-        close_memmap_array_without_flush(baseline_native_volume)
-        if (
-            not bool(keep_temp)
-            and union_path is not None
-            and not str(union_path).startswith('/proc/')
-        ):
-            try:
-                Path(union_path).unlink(missing_ok=True)
-            except Exception:
-                pass
-        baseline_native_volume = d1_additions_mm
-        print(
-            f'D1 delta-only continuation ready for {model_name}/{view.name}: '
-            f'released {base_bytes / GIB:.2f} GiB materialized base; final dense view now '
-            'contains only interpolation/tile additions because the source-space D1 base '
-            'was already published.'
-        )
-
-    # A refs-only result carries no mutable destination. PreparedViewResult already
-    # permits None here, and the scheduler publishes these refs before marking the
-    # variant terminal. Its physical-view reducer then selects refs as authoritative.
-    # Every other configuration retains the established dense continuation.
-    final_view_volume: Optional[np.ndarray] = baseline_native_volume
-
-    returned_parent_mask_support = parent_mask_support_mm if bool(dense_tiling_active) else None
-    returned_parent_bridge_support = parent_bridge_support_mm if bool(dense_tiling_active) else None
-    if parent_mask_support_mm is not None and returned_parent_mask_support is None:
-        close_raw_store_or_memmap_volume(parent_mask_support_mm, keep_temp=bool(keep_temp))
-    if parent_bridge_support_mm is not None and returned_parent_bridge_support is None:
-        close_raw_store_or_memmap_volume(parent_bridge_support_mm, keep_temp=bool(keep_temp))
-
-    return PreparedViewResult(
-        model_name=str(model_name),
-        view_name=str(view.name),
-        aug_id=str(view.tta_aug_id),
-        angle_deg=float(view.tta_angle_deg),
-        native_support_mm=baseline_native_volume,
-        final_view_volume_mm=final_view_volume,
-        interpolation_stats=interpolation_stats,
-        nrrd_layers=nrrd_layers,
-        parent_mask_support_mm=returned_parent_mask_support,
-        parent_bridge_support_mm=returned_parent_bridge_support,
-    )
+    except BaseException:
+        if d1_component_refs_only:
+            # A pass may reopen the parent in a new mapping. Its failure traceback
+            # must not retain that dense canvas after the admission credit returns.
+            # Component CVOLs and submitted publications own independent backings.
+            close_memmap_array_without_flush(baseline_native_volume)
+            baseline_native_volume = None
+        raise
 
 def gate_tile_components_against_support_inplace(
     tile_mask_mm: np.ndarray,

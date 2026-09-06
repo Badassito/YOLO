@@ -36,7 +36,7 @@ from typing import (
     Tuple,
 )
 import numpy as np
-from ._deps import cv2
+from ._deps import _numba, cv2
 
 # Explicit lower-layer dependencies keep imports one-way.
 from .config import (
@@ -286,6 +286,7 @@ from .backprojection import (
     _main_process_gpu_stage_finish_inference,
     _reset_main_process_gpu_stage_coordinator,
     _set_main_process_gpu_inference_priority_active,
+    _set_main_process_gpu_asset_retirement_pending,
     _set_main_process_gpu_pending_inference,
     _set_main_process_gpu_stage_wake_callback,
     fused_angle_variant_radial_component_layer_enabled,
@@ -316,10 +317,20 @@ from .assembly import (
     gate_tile_residual_against_parent_bridge,
     gate_tile_result_against_parent_mask,
     materialize_nrrd_global_layer,
+    materialize_interpolation_component_nrrd_view_layer,
     postprocess_tile_volume_after_inference,
     prepare_view_volume_after_fullframe,
     set_final_source_output_shape,
     spill_waiting_tile_result_to_raw_store,
+)
+from .projection_queue import (
+    ComponentProjectionQueue,
+    prepared_view_waitables,
+    settle_prepared_view_components,
+)
+from .component_replay import (
+    component_replay_capture_status,
+    configure_component_replay_capture,
 )
 from .finalization import (
     apply_keep_largest_objects_inplace,
@@ -596,10 +607,12 @@ def main() -> None:
             _set_main_process_gpu_stage_wake_callback(None)
             _set_main_process_gpu_pending_inference(False)
             _set_main_process_gpu_inference_priority_active(False)
+            _set_main_process_gpu_asset_retirement_pending(False)
             _reset_main_process_gpu_stage_coordinator()
         except Exception:
             pass
         _ACTIVE_PIPELINE_RUN_RESOURCES = None
+        configure_component_replay_capture(None)
         configure_pipeline_modes(fast_bundle_active=False, d1_pipeline_active=False)
         _PIPELINE_RUN_LOCK.release()
 
@@ -608,6 +621,15 @@ def _main_impl() -> None:
     initialize_runtime_observability()
     parser = build_argparser()
     args = parser.parse_args()
+    configure_component_replay_capture(
+        args.capture_component_replay,
+        view_names=args.capture_component_views or (
+            'radial_tilted_transverse_vertical_p30*',
+            'radial_tilted_sagittal_vertical_p30*',
+            'radial_tilted_coronal_vertical_p30*',
+        ),
+        max_captures=int(args.capture_component_limit),
+    )
     try:
         save_request = resolve_save_request(args.save)
         postprocessing_request = resolve_postprocessing_options(args.postprocessing)
@@ -2313,6 +2335,16 @@ def _main_impl() -> None:
         max_workers=int(parent_postprocess_workers),
         thread_name_prefix='parent-postprocess',
     )
+    # These workers consume immutable component stores. Their admission is
+    # independent of parent preparation: sharing its reservation pool would
+    # deadlock a parent waiting for queue credit behind its own reservation.
+    _projection_headroom = max(GIB, int(available_anon_work_bytes()))
+    component_projection_queue = ComponentProjectionQueue(
+        workers=2, max_pending=8,
+        max_source_bytes=min(16 * GIB, max(GIB, _projection_headroom // 32)),
+        max_working_bytes=min(64 * GIB, max(4 * GIB, _projection_headroom // 8)),
+    )
+    _run_resources().track_executor(component_projection_queue)
     tile_dense_retirement_executor = _create_tracked_thread_pool(
         max_workers=int(tile_dense_retirement_workers),
         thread_name_prefix='tile-dense-retire',
@@ -2553,6 +2585,39 @@ def _main_impl() -> None:
             pass
 
 
+    def _submit_component_projection(component_path: Path, **kwargs) -> Future[NrrdLayerRef]:
+        component_path = Path(component_path)
+        metadata = json.loads((component_path / 'meta.json').read_text(encoding='utf-8'))
+        shape = tuple(int(v) for v in metadata['shape'])
+        source_bytes = sum(path.stat().st_size for path in component_path.iterdir() if path.is_file())
+        view = kwargs['view']
+        source_shape = (int(input_T), int(input_H), int(input_W))
+        source_volume_bytes = math.prod(source_shape)
+        if int(kwargs.get('added_voxels', 0)) <= 0:
+            working_bytes = 64 * 1024 * 1024
+        elif (str(view.family) == 'radial' and str(kwargs.get('source')) == 'fullframe'
+              and _numba is not None):
+            # Source bitset plus inverse-map construction, packed output crops,
+            # and bounded input slabs. No view-sized uint8 decode is retained.
+            packed_source_bytes = source_shape[0] * source_shape[1] * ((source_shape[2] + 7) // 8)
+            map_bound = 16 * max(
+                int(view.full_t) * int(view.full_h), int(view.full_t) * int(view.full_w),
+                int(view.full_h) * int(view.full_w), int(view.num_slices) * shape[2],
+                source_shape[0] * source_shape[1], source_shape[0] * source_shape[2],
+                source_shape[1] * source_shape[2],
+            )
+            working_bytes = packed_source_bytes + map_bound + GIB
+        elif physical_view_name(view) == 'transverse' and float(view.tta_angle_deg) == 0.0:
+            working_bytes = 256 * 1024 * 1024
+        else:
+            # The legacy tilted/rotated fallback may hold a dense view decode
+            # and projection buffers; it must not inherit the sparse estimate.
+            working_bytes = 2 * math.prod(shape) + 2 * source_volume_bytes + 4 * GIB
+        return component_projection_queue.submit(
+            materialize_interpolation_component_nrrd_view_layer, component_path,
+            source_bytes=int(source_bytes), working_bytes=int(working_bytes), **kwargs,
+        )
+
     def _submit_view_prepare(model_name: str, view: ViewInfo) -> None:
         key = (str(model_name), str(view.name))
         if key in view_processing_submitted:
@@ -2602,59 +2667,68 @@ def _main_impl() -> None:
                 int(transient_bytes), f'{model_name}/{view.name}',
             ):
                 local_union_mm = union_mm
-                if local_union_mm is None:
-                    if d1_shadow_path is None:
-                        raise RuntimeError(f'{model_name}/{view.name}: missing D1 view shadow')
-                    local_union_mm = materialize_raw_bbox_mask_store_workspace(
-                        d1_shadow_path,
-                        union_path,
-                        desc=f'D1 view-native shadow materialization {model_name}/{view.name}',
-                        workers=int(parent_slice_postprocess_workers),
+                try:
+                    if local_union_mm is None:
+                        if d1_shadow_path is None:
+                            raise RuntimeError(f'{model_name}/{view.name}: missing D1 view shadow')
+                        local_union_mm = materialize_raw_bbox_mask_store_workspace(
+                            d1_shadow_path,
+                            union_path,
+                            desc=f'D1 view-native shadow materialization {model_name}/{view.name}',
+                            workers=int(parent_slice_postprocess_workers),
+                        )
+                        if not bool(keep_temp_artifacts):
+                            try:
+                                shutil.rmtree(d1_shadow_path, ignore_errors=True)
+                            except Exception:
+                                pass
+                    return prepare_view_volume_after_fullframe(
+                        model_name=str(model_name),
+                        view=view,
+                        union_mm=local_union_mm,
+                        confmap_mm=confmap_mm,
+                        union_path=union_path,
+                        confmap_path=confmap_path,
+                        temp_dir=temp_dir,
+                        dense_tiling_active=bool(dense_tiling_active),
+                        min_conf=float(args.min_conf),
+                        min_radius=float(args.min_radius),
+                        interpolate=int(args.interpolation_distance),
+                        interpolation_walk_back=int(args.interpolation_walk_back),
+                        interpolation_candidates=int(args.interpolation_candidates),
+                        interpolate_passes=int(args.interpolation_passes),
+                        interpolate_min_radius=float(args.interpolation_min_radius),
+                        interpolation_search_angle=float(args.interpolation_search_angle),
+                        keep_temp=bool(keep_temp_artifacts),
+                        slice_workers=int(parent_slice_postprocess_workers),
+                        interpolation_task_workers=int(parent_interpolation_task_workers),
+                        nrrd_layers_enabled=bool(nrrd_layers_needed),
+                        precleaned_slice_cleanup=bool(angle_variant_streaming_cleanup_active),
+                        hole_fill_done_on_device=bool(hole_fill_done_on_device),
+                        slice_meta=slice_meta_holder,
+                        fuse_radial_component_layers=bool(
+                            angle_variant_gpu_fastpath_active
+                            and fused_angle_variant_radial_component_layer_enabled()
+                        ),
+                        parent_mask_ready_callback=(
+                            _publish_parent_mask_ready if bool(dense_tiling_active) else None
+                        ),
+                        internal_final_layer_enabled=bool(
+                            component_ref_dense_retirement_active
+                            and not nrrd_layers_needed
+                        ),
+                        preinterpolation_layer_already_published=bool(
+                            preinterpolation_layer_already_published
+                        ),
+                        submit_component_projection=_submit_component_projection,
                     )
-                    if not bool(keep_temp_artifacts):
-                        try:
-                            shutil.rmtree(d1_shadow_path, ignore_errors=True)
-                        except Exception:
-                            pass
-                return prepare_view_volume_after_fullframe(
-                    model_name=str(model_name),
-                    view=view,
-                    union_mm=local_union_mm,
-                    confmap_mm=confmap_mm,
-                    union_path=union_path,
-                    confmap_path=confmap_path,
-                    temp_dir=temp_dir,
-                    dense_tiling_active=bool(dense_tiling_active),
-                    min_conf=float(args.min_conf),
-                    min_radius=float(args.min_radius),
-                    interpolate=int(args.interpolation_distance),
-                    interpolation_walk_back=int(args.interpolation_walk_back),
-                    interpolation_candidates=int(args.interpolation_candidates),
-                    interpolate_passes=int(args.interpolation_passes),
-                    interpolate_min_radius=float(args.interpolation_min_radius),
-                    interpolation_search_angle=float(args.interpolation_search_angle),
-                    keep_temp=bool(keep_temp_artifacts),
-                    slice_workers=int(parent_slice_postprocess_workers),
-                    interpolation_task_workers=int(parent_interpolation_task_workers),
-                    nrrd_layers_enabled=bool(nrrd_layers_needed),
-                    precleaned_slice_cleanup=bool(angle_variant_streaming_cleanup_active),
-                    hole_fill_done_on_device=bool(hole_fill_done_on_device),
-                    slice_meta=slice_meta_holder,
-                    fuse_radial_component_layers=bool(
-                        angle_variant_gpu_fastpath_active
-                        and fused_angle_variant_radial_component_layer_enabled()
-                    ),
-                    parent_mask_ready_callback=(
-                        _publish_parent_mask_ready if bool(dense_tiling_active) else None
-                    ),
-                    internal_final_layer_enabled=bool(
-                        component_ref_dense_retirement_active
-                        and not nrrd_layers_needed
-                    ),
-                    preinterpolation_layer_already_published=bool(
-                        preinterpolation_layer_already_published
-                    ),
-                )
+                except BaseException:
+                    # Release the original/local dense mapping before returning its
+                    # reservation, even when preparation rebound to another canvas.
+                    # Immutable component and tile support stores have other owners.
+                    close_memmap_array_without_flush(local_union_mm)
+                    local_union_mm = None
+                    raise
 
         lease = direct_union_backing_leases.get(key)
         transitioned = False
@@ -3853,6 +3927,8 @@ def _main_impl() -> None:
             if not fut.done():
                 continue
             result = fut.result()
+            if not settle_prepared_view_components(result):
+                continue
             del view_processing_futures[fut]
             completed_view_key = (str(result.model_name), str(result.view_name))
             retire_completed_non_tiled_view = bool(
@@ -5468,8 +5544,16 @@ def _main_impl() -> None:
             scheduler_state.gpu_worker_total_tasks
         ):
             return
+        inference_assets_ready = True
         if gpu_worker_process_active:
-            _set_main_process_gpu_inference_priority_active(False)
+            _set_main_process_gpu_asset_retirement_pending(True)
+            inference_assets_ready = scheduler.request_gpu_inference_asset_release()
+            if inference_assets_ready:
+                # Result drain and HBM retirement are separate boundaries. A
+                # projector must not make its residency decision against buffers
+                # the worker has merely promised to release.
+                _set_main_process_gpu_inference_priority_active(False)
+                _set_main_process_gpu_asset_retirement_pending(False)
         _restore_parent_post_inference_affinity()
         if bool(scheduler_state.gpu_inference_drain_announced):
             return
@@ -5518,7 +5602,9 @@ def _main_impl() -> None:
         drained_backend_notes: List[str] = []
         if gpu_worker_process_active:
             drained_backend_notes.append(
-                'CUDA devices are released for eligible output/backprojection stages'
+                'CUDA devices are available for eligible output/backprojection stages'
+                if inference_assets_ready else
+                'CUDA inference assets are retiring before output/backprojection admission'
             )
         if cpu_worker_process_active:
             drained_backend_notes.append('OpenVINO workers are idle until shutdown')
@@ -5997,7 +6083,7 @@ def _main_impl() -> None:
 
             waitables: List[Future] = list(pending_prediction_volume_futures)
             waitables.extend(list(prediction_accumulation_futures.keys()))
-            waitables.extend(list(view_processing_futures.keys()))
+            waitables.extend(prepared_view_waitables(view_processing_futures))
             waitables.extend(list(physical_view_finalization_futures.keys()))
             waitables.extend(list(physical_view_union_futures.keys()))
             waitables.extend(list(tile_cleanup_futures.keys()))
@@ -6100,6 +6186,7 @@ def _main_impl() -> None:
     finally:
         physical_view_finalization_stop.set()
         if sys.exc_info()[0] is not None:
+            component_projection_queue.abort()
             # (completion): the wait=True shutdowns below block on render
             # tasks parked in wait_for_volume_ready for still-running streaming
             # producers. Abort the producers FIRST on the error path, or a failure during
@@ -6118,12 +6205,16 @@ def _main_impl() -> None:
             ready_tile_infer.clear()
         push_drain_stop.set()  # the transport thread exits within one 0.5 s tick
         _set_main_process_gpu_inference_priority_active(False)
+        _set_main_process_gpu_asset_retirement_pending(False)
         if inference_worker_process_active:
             _shutdown_inference_worker_processes()
         prediction_volume_executor.shutdown(wait=True)
         prediction_join_executor.shutdown(wait=True)
         prediction_result_executor.shutdown(wait=True)
         parent_postprocess_executor.shutdown(wait=True)
+        component_projection_queue.shutdown(cancel_futures=sys.exc_info()[0] is not None)
+        runtime_telemetry().gauge('projection.component_queue', component_projection_queue.snapshot())
+        runtime_telemetry().gauge('projection.component_replay_capture', component_replay_capture_status())
         tile_dense_retirement_executor.shutdown(wait=True)
         tile_postprocess_executor.shutdown(wait=True)
         view_finalization_executor.shutdown(wait=True)

@@ -7,12 +7,14 @@ import json
 import os
 import queue
 import re
+import sys
 import threading
 import time
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
+    Callable,
     Dict,
     List,
     Optional,
@@ -115,6 +117,8 @@ from .cuda_d1 import (
 )
 from .backprojection import (
     _ResidentTensorRTRingFatalError,
+    _release_resident_trt_pipeline_cache,
+    _resident_trt_pipeline_retirement_ready,
     _shutdown_resident_trt_pipeline_cache,
 )
 
@@ -1785,6 +1789,155 @@ def _pin_cuda_visible_device_token(logical_index: int) -> str:
         )
     return tokens[idx]
 
+
+@dataclass
+class _GpuWorkerInferenceAssets:
+    """The model owner for the inference phase; auxiliary work does not need it."""
+    model: Optional[object]
+    released: bool = False
+    release_started: bool = False
+    release_stats: Optional[Dict[str, object]] = None
+
+
+def _worker_initialized_torch() -> Optional[object]:
+    """Do not initialize/probe a GPU merely to report a retirement statistic."""
+    torch_mod = sys.modules.get('torch')
+    cuda = getattr(torch_mod, 'cuda', None)
+    initialized = getattr(cuda, 'is_initialized', None)
+    return torch_mod if callable(initialized) and bool(initialized()) else None
+
+
+def _worker_cuda_memory_snapshot(torch_mod: Optional[object]) -> Dict[str, object]:
+    if torch_mod is None:
+        return {'available': False, 'reason': 'CUDA context was not initialized'}
+    try:
+        free, total = torch_mod.cuda.mem_get_info(0)  # type: ignore[attr-defined]
+        return {
+            'available': True, 'device': 'cuda:0', 'free_bytes': int(free),
+            'total_bytes': int(total),
+            'torch_allocated_bytes': int(torch_mod.cuda.memory_allocated(0)),  # type: ignore[attr-defined]
+            'torch_reserved_bytes': int(torch_mod.cuda.memory_reserved(0)),  # type: ignore[attr-defined]
+        }
+    except Exception as exc:
+        return {'available': False, 'error': f'{type(exc).__name__}: {exc}'}
+
+
+def _drop_worker_model_owners(model: Optional[object]) -> None:
+    """Release the completed model without making an unnecessary host-weight copy."""
+    if model is None:
+        return
+    predictor = getattr(model, 'predictor', None)
+    if predictor is not None:
+        source = getattr(predictor, 'dataset', None)
+        close_source = getattr(source, 'close', None)
+        if callable(close_source):
+            close_source()
+        if isinstance(source, (GpuRenderedYoloSource, GpuTileRenderedYoloSource)):
+            source.reset_direct_ring()
+        # AutoBackend owns TensorRT contexts, engine bindings and output tensors.
+        # Ring teardown restored any borrowed bindings before this point.
+        for name in ('dataset', 'results', 'batch', 'model'):
+            if hasattr(predictor, name):
+                setattr(predictor, name, None)
+        setattr(model, 'predictor', None)
+    if hasattr(model, '_tta_predict_state'):
+        setattr(model, '_tta_predict_state', None)
+    if hasattr(model, 'model'):
+        setattr(model, 'model', None)
+
+
+def _release_gpu_worker_inference_assets(
+    assets: _GpuWorkerInferenceAssets,
+    *,
+    inference_drained: bool,
+    wait_for_publications: Callable[[], None],
+) -> Dict[str, object]:
+    """Make a drained inference worker available to memory-intensive auxiliary work.
+
+    Admission failures leave all owners intact. Once teardown starts, an error is
+    reported as a partial release, never as evidence that the device has free HBM.
+    Source files/memfd descriptors remain available for overlays and CPU fallbacks.
+    """
+    if assets.released:
+        return {**dict(assets.release_stats or {}), 'already_released': True}
+    if assets.release_started:
+        raise RuntimeError('A prior inference-asset retirement failed after teardown began')
+    stats: Dict[str, object] = {
+        'released': False, 'assets_intact': True, 'already_released': False, 'phase': 'validate_drain',
+    }
+    assets.release_stats = stats
+    if not bool(inference_drained):
+        raise RuntimeError('Inference-asset release requires authoritative global inference drain')
+    before_wait = time.perf_counter()
+    wait_for_publications()
+    stats['publication_drain_seconds'] = time.perf_counter() - before_wait
+    from . import cuda_d1, inference as inference_module
+    with cuda_d1._D1_WORKER_VIEW_LOCK:
+        active = tuple(cuda_d1._D1_WORKER_VIEW_STATES)
+    if active:
+        raise RuntimeError(f'Cannot retire inference assets with active D1 views/group leases: {active}')
+    ring_count = _resident_trt_pipeline_retirement_ready()
+    retirement = _gpu_union_retirement_manager()
+    if retirement is not None and any(bool(getattr(lane, '_active', False)) for lane in retirement.lanes):
+        raise RuntimeError('Cannot retire inference assets while a GPU union retirement lane is active')
+    stats['retirement_lanes'] = int(retirement.capacity) if retirement is not None else 0
+    retirement = None
+    engine = _worker_gpu_render_engine()
+    torch_mod = _worker_initialized_torch()
+    stats['memory_before'] = _worker_cuda_memory_snapshot(torch_mod)
+    # These fences precede every destructive operation. Captured render graphs,
+    # TRT contexts and D2H lanes may otherwise keep using the same source buffers.
+    stats['phase'] = 'fence_inference_streams'
+    if torch_mod is not None:
+        torch_mod.cuda.synchronize(0)  # type: ignore[attr-defined]
+    if engine is not None:
+        engine._stream.synchronize()
+    assets.release_started = True
+    stats['assets_intact'] = False
+    started = time.perf_counter()
+    stats['phase'] = 'release_rings_and_retirement_lanes'
+    stats['resident_trt_rings'] = int(_release_resident_trt_pipeline_cache())
+    if stats['resident_trt_rings'] != ring_count:
+        raise RuntimeError('TensorRT cache changed across the inference retirement fence')
+    _shutdown_gpu_union_retirement_manager()
+    _shutdown_d1_worker_pipeline()
+    stats['phase'] = 'release_renderer'
+    if engine is not None:
+        stats['renderer'] = engine.release_inference_assets()
+    else:
+        stats['renderer'] = {'already_released': False, 'source_bytes': 0, 'texture_bytes': 0}
+    with inference_module._AFFINE_GRID_CACHE_LOCK:
+        stats['affine_grid_entries'] = len(inference_module._AFFINE_GRID_CACHE)
+        inference_module._AFFINE_GRID_CACHE.clear()
+        inference_module._AFFINE_GRID_CACHE_MIN_ENTRIES = 0
+    stats['phase'] = 'release_model'
+    _drop_worker_model_owners(assets.model)
+    assets.model = None
+    gc.collect()
+    stats['phase'] = 'trim_allocators'
+    if torch_mod is not None:
+        # Do not import CuPy and create a new context just for allocator cleanup.
+        cp = sys.modules.get('cupy')
+        if cp is not None:
+            with cp.cuda.Device(0):
+                cp.get_default_memory_pool().free_all_blocks()
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+        torch_mod.cuda.empty_cache()  # type: ignore[attr-defined]
+        ipc_collect = getattr(torch_mod.cuda, 'ipc_collect', None)  # type: ignore[attr-defined]
+        if callable(ipc_collect):
+            ipc_collect()
+        torch_mod.cuda.synchronize(0)  # type: ignore[attr-defined]
+    stats['memory_after'] = _worker_cuda_memory_snapshot(torch_mod)
+    before = stats['memory_before']
+    after = stats['memory_after']
+    if isinstance(before, dict) and isinstance(after, dict) and before.get('available') and after.get('available'):
+        stats['driver_free_delta_bytes'] = int(after['free_bytes']) - int(before['free_bytes'])
+    stats['release_seconds'] = time.perf_counter() - started
+    stats['released'] = True
+    stats['phase'] = 'released'
+    assets.released = True
+    return dict(stats)
+
 def _gpu_inference_worker_main(
     gpu_index: int,
     model_path: str,
@@ -1894,6 +2047,10 @@ def _gpu_inference_worker_main(
     publication_condition = threading.Condition()
     overlap_announced = False
     persistent_source_memfds: Dict[str, int] = {}
+    inference_assets = _GpuWorkerInferenceAssets(model=model)
+    model = None  # The phase owner above is the only long-lived model reference.
+    completed = None
+    manager = None
 
     def _publish_deferred(finished_task_id: int, deferred: _DeferredGpuWorkerTaskResult) -> None:
         try:
@@ -1985,6 +2142,32 @@ def _gpu_inference_worker_main(
             break
         task_id = int(task['task_id'])
         task_type = str(task.get('task_type', 'inference'))
+        if str(task.get('op', '')) == 'release_inference_assets':
+            try:
+                # These last-task locals can retain completed Future callbacks or
+                # the retired lane manager after its global owner is cleared.
+                completed = None
+                manager = None
+                release_stats = _release_gpu_worker_inference_assets(
+                    inference_assets,
+                    inference_drained=bool(task.get('inference_drained', False)),
+                    wait_for_publications=_wait_for_deferred_publications,
+                )
+                release_stats['source_memfds_preserved'] = len(persistent_source_memfds)
+                result_queue.put({
+                    'type': 'inference_assets_released', 'op': 'release_inference_assets',
+                    'task_id': task_id, 'gpu_index': int(gpu_index), 'ok': True,
+                    'stats': release_stats,
+                })
+            except Exception as exc:
+                import traceback
+                result_queue.put({
+                    'type': 'inference_assets_released', 'op': 'release_inference_assets',
+                    'task_id': task_id, 'gpu_index': int(gpu_index), 'ok': False,
+                    'error': repr(exc), 'traceback': traceback.format_exc(),
+                    'stats': dict(inference_assets.release_stats or {}),
+                })
+            continue
         if task_type == 'd1_group_reduce':
             try:
                 reduction_future = _d1_reduce_group_partials(task)
@@ -2089,6 +2272,8 @@ def _gpu_inference_worker_main(
             continue
         transferred_task_fds: List[int] = []
         try:
+            if inference_assets.release_started or inference_assets.released:
+                raise RuntimeError('Inference task arrived after the terminal inference-asset release command')
             # The parent affinity plan can be uneven across NUMA nodes. Size this worker's
             # pools from its own whole-core allocation instead of a logical-CPU global average.
             task_local = dict(task)
@@ -2101,7 +2286,7 @@ def _gpu_inference_worker_main(
             )
             task_local['postprocess_workers'] = int(local_cpu_workers)
             compute_started = time.perf_counter()
-            completed = run_prediction_volume_in_worker(model, cfg, task_local)
+            completed = run_prediction_volume_in_worker(inference_assets.model, cfg, task_local)
             compute_seconds = max(0.0, time.perf_counter() - compute_started)
             if isinstance(completed, _DeferredGpuWorkerTaskResult):
                 completed.stats['worker_compute_seconds'] = float(compute_seconds)
