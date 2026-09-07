@@ -73,8 +73,8 @@ class TtaSchedulerOperations:
     hybrid_gpu_stealback_min_lead_seconds: Callable[[], float]
     memfd_workspace_enabled: Callable[[], bool]
     preflight_multiprocessing_payload: Callable[[object], object]
-    radial_batch_padding_count: Callable[..., int]
-    radial_batch_padding_mirror_groups: Callable[..., Sequence[object]]
+    azimuthal_batch_padding_count: Callable[..., int]
+    azimuthal_batch_padding_mirror_groups: Callable[..., Sequence[object]]
     runtime_telemetry: Callable[[], object]
     tile_dense_worker_result_warn_seconds: Callable[[], float]
     view_processing_volume_shape: Callable[..., Sequence[int]]
@@ -352,13 +352,13 @@ class TtaScheduler:
 
     # Dispatch methods are defined below.
 
-    def tile_task_radial_padding_count(self, task: Dict[str, object]) -> int:
+    def tile_task_azimuthal_padding_count(self, task: Dict[str, object]) -> int:
         if str(task.get('kind', '')) != 'tile':
             return 0
         view_obj = task.get('view')
         if not isinstance(view_obj, ViewInfo):
             return 0
-        return self.operations.radial_batch_padding_count(
+        return self.operations.azimuthal_batch_padding_count(
             view_obj,
             int(task.get('slice_count', view_obj.num_slices)),
             max(1, int(task.get('prediction_batch', self.inputs.batch))),
@@ -373,12 +373,12 @@ class TtaScheduler:
             return 0
         planes = 2 if task.get('result_conf_path') else 1
         main_bytes = int(self.operations.array_nbytes(shape, np.uint8)) * int(planes)
-        padding_count = int(self.tile_task_radial_padding_count(task))
+        padding_count = int(self.tile_task_azimuthal_padding_count(task))
         if padding_count <= 0:
             return int(main_bytes)
         view_obj = task.get('view')
         assert isinstance(view_obj, ViewInfo)
-        group_count = len(self.operations.radial_batch_padding_mirror_groups(
+        group_count = len(self.operations.azimuthal_batch_padding_mirror_groups(
             view_obj,
             int(task.get('slice_count', view_obj.num_slices)),
             max(1, int(task.get('prediction_batch', self.inputs.batch))),

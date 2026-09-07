@@ -80,8 +80,8 @@ class CategoricalForwardGeometryTests(unittest.TestCase):
             6,
             7,
             cartesian_views=('transverse', 'sagittal', 'coronal'),
-            radial_views=(),
-            radial_azimuth_angles=(),
+            azimuthal_views=(),
+            azimuthal_azimuth_angles=(),
         )
         by_name = {view.name: view for view in views}
 
@@ -98,22 +98,22 @@ class CategoricalForwardGeometryTests(unittest.TestCase):
                 np.testing.assert_array_equal(actual, np.asarray(expected > 0, dtype=np.uint8))
                 self.assert_binary(actual)
 
-    def test_upright_radial_views_use_sampler_nearest_taps_and_nearest_row_fold(self) -> None:
+    def test_upright_azimuthal_views_use_sampler_nearest_taps_and_nearest_row_fold(self) -> None:
         views = geometry.get_view_infos(
             5,
             6,
             7,
             cartesian_views=(),
-            radial_views=('transverse', 'sagittal', 'coronal'),
-            radial_azimuth_angles=(45.0, 45.0, 45.0),
-            radial_native_raster=3,
+            azimuthal_views=('transverse', 'sagittal', 'coronal'),
+            azimuthal_azimuth_angles=(45.0, 45.0, 45.0),
+            azimuthal_native_raster=3,
         )
 
         for view in views:
-            with self.subTest(base=geometry.radial_base_view_name(view)):
+            with self.subTest(base=geometry.azimuthal_base_view_name(view)):
                 frame_idx = 1
-                sampler = geometry.get_radial_sampler(view, view.azimuths_deg[frame_idx])
-                oriented = geometry.radial_oriented_stack_view(self.mask, view)
+                sampler = geometry.get_azimuthal_sampler(view, view.azimuths_deg[frame_idx])
+                oriented = geometry.azimuthal_oriented_stack_view(self.mask, view)
                 rows = geometry._center_aligned_nearest_fold_indices(
                     int(oriented.shape[0]), int(view.src_h),
                 )
@@ -140,8 +140,8 @@ class CategoricalForwardGeometryTests(unittest.TestCase):
             6,
             7,
             cartesian_views=(),
-            radial_views=(),
-            radial_azimuth_angles=(),
+            azimuthal_views=(),
+            azimuthal_azimuth_angles=(),
             tilt_groups=(group,),
         )
         positive_views = [view for view in views if float(view.tilt_angle_deg) > 0.0]
@@ -198,7 +198,7 @@ class CategoricalForwardGeometryTests(unittest.TestCase):
         self.assertTrue(all(call['mask_mode'] is True for call in calls))
         self.assertTrue(all(call['volume'] is self.mask for call in calls))
 
-    def test_tilted_radial_all_bases_use_nearest_inplane_and_established_stack_blend(self) -> None:
+    def test_tilted_azimuthal_all_bases_use_nearest_inplane_and_established_stack_blend(self) -> None:
         group = TiltedViewGroup(
             views=('transverse', 'sagittal', 'coronal'),
             tilt_angles=(25.0,),
@@ -209,29 +209,29 @@ class CategoricalForwardGeometryTests(unittest.TestCase):
             6,
             7,
             cartesian_views=(),
-            radial_views=('tilted_transverse', 'tilted_sagittal', 'tilted_coronal'),
-            radial_azimuth_angles=(60.0, 60.0, 60.0),
+            azimuthal_views=('tilted_transverse', 'tilted_sagittal', 'tilted_coronal'),
+            azimuthal_azimuth_angles=(60.0, 60.0, 60.0),
             tilt_groups=(group,),
-            radial_native_raster=4,
+            azimuthal_native_raster=4,
         )
         positive_views = [
             view
             for view in views
-            if geometry.is_tilted_radial_view(view) and float(view.tilt_angle_deg) > 0.0
+            if geometry.is_tilted_azimuthal_view(view) and float(view.tilt_angle_deg) > 0.0
         ]
         self.assertEqual(
-            {geometry.radial_base_view_name(view) for view in positive_views},
+            {geometry.azimuthal_base_view_name(view) for view in positive_views},
             {'transverse', 'sagittal', 'coronal'},
         )
 
         for view in positive_views:
-            with self.subTest(base=geometry.radial_base_view_name(view)):
+            with self.subTest(base=geometry.azimuthal_base_view_name(view)):
                 frame_idx = 1
-                sampler = geometry.get_radial_sampler(view, view.azimuths_deg[frame_idx])
+                sampler = geometry.get_azimuthal_sampler(view, view.azimuths_deg[frame_idx])
                 px = sampler.nn_x.astype(np.intp, copy=False)
                 py = sampler.nn_y.astype(np.intp, copy=False)
-                stack_len = geometry.radial_stack_length(view)
-                row_centers = geometry._tilted_radial_row_centers(stack_len, view.src_h)
+                stack_len = geometry.azimuthal_stack_length(view)
+                row_centers = geometry._tilted_azimuthal_row_centers(stack_len, view.src_h)
                 offsets = px.astype(np.float32) - np.float32(view.center_x)
                 stack_src = row_centers[:, None] + np.float32(
                     np.tan(np.radians(view.tilt_angle_deg))
@@ -241,7 +241,7 @@ class CategoricalForwardGeometryTests(unittest.TestCase):
                 s1 = np.minimum(s0 + 1, stack_len - 1)
                 alpha = (stack_src - s0).astype(np.float32)
 
-                base = geometry.radial_base_view_name(view)
+                base = geometry.azimuthal_base_view_name(view)
                 if base == 'transverse':
                     f0 = self.mask[s0, py[None, :], px[None, :]] > 0
                     f1 = self.mask[s1, py[None, :], px[None, :]] > 0
@@ -262,14 +262,14 @@ class CategoricalForwardGeometryTests(unittest.TestCase):
                 np.testing.assert_array_equal(actual, expected)
                 self.assert_binary(actual)
 
-    def test_tilted_radial_stack_blend_includes_exact_half_foreground(self) -> None:
+    def test_tilted_azimuthal_stack_blend_includes_exact_half_foreground(self) -> None:
         view = geometry.ViewInfo(
-            name='radial_tilted_transverse_vertical_p30',
+            name='azimuthal_tilted_transverse_vertical_p30',
             num_slices=1,
             src_h=1,
             src_w=1,
             pad_mode='pad',
-            family=geometry.RADIAL_VIEW_FAMILY,
+            family=geometry.AZIMUTHAL_VIEW_FAMILY,
             azimuths_deg=(0.0,),
             diameter=1,
             center_x=0.0,
@@ -281,13 +281,13 @@ class CategoricalForwardGeometryTests(unittest.TestCase):
             tilt_angle_deg=30.0,
             tilt_direction='vertical',
             tilt_base_view='transverse',
-            radial_base_view='transverse',
-            radial_tilted_source=True,
+            azimuthal_base_view='transverse',
+            azimuthal_tilted_source=True,
         )
-        sampler = geometry.get_radial_sampler(view, 0.0)
+        sampler = geometry.get_azimuthal_sampler(view, 0.0)
         mask = np.asarray([[[0]], [[1]]], dtype=np.uint8)
 
-        actual = geometry.extract_tilted_radial_categorical_slice_frame(
+        actual = geometry.extract_tilted_azimuthal_categorical_slice_frame(
             mask, view, sampler, out_rows=1,
         )
         np.testing.assert_array_equal(actual, np.ones((1, 1), dtype=np.uint8))
@@ -298,8 +298,8 @@ class CategoricalForwardGeometryTests(unittest.TestCase):
             3,
             3,
             cartesian_views=('transverse',),
-            radial_views=(),
-            radial_azimuth_angles=(),
+            azimuthal_views=(),
+            azimuthal_azimuth_angles=(),
         )[0]
         mask = np.asarray([[[0, 4, 0], [9, 0, 0], [0, 0, 5]]], dtype=np.uint8)
         calls: list[dict[str, object]] = []

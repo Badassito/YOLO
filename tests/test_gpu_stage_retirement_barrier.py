@@ -29,7 +29,7 @@ class GpuStageRetirementBarrierTests(unittest.TestCase):
 
     def test_non_d1_overlap_remains_available_before_the_retirement_boundary(self):
         self.assertTrue(self.coordinator.snapshot()['inference_priority_active'])
-        lease = self.coordinator.try_acquire_specific_stage(self.torch, 0, 'Radial backprojection')
+        lease = self.coordinator.try_acquire_specific_stage(self.torch, 0, 'Azimuthal backprojection')
         self.assertIsNotNone(lease)
         lease.release()
 
@@ -41,7 +41,7 @@ class GpuStageRetirementBarrierTests(unittest.TestCase):
                         mock.patch.object(backprojection, 'main_process_gpu_stage_inference_overlap_enabled', return_value=overlap):
                     self.coordinator.configure_workers([0, 2])
                     self.coordinator.set_inference_asset_retirement_pending(True)
-                    for purpose in ('Radial backprojection', 'NRRD mirror downbin', 'other output'):
+                    for purpose in ('Azimuthal backprojection', 'NRRD mirror downbin', 'other output'):
                         for device in (0, 2):
                             self.assertIsNone(self.coordinator.try_acquire_specific_stage(self.torch, device, purpose))
                         self.assertIsNone(self.coordinator.try_acquire_stage(self.torch, purpose))
@@ -50,15 +50,15 @@ class GpuStageRetirementBarrierTests(unittest.TestCase):
         self.torch.cuda.mem_get_info.assert_not_called()
 
     def test_pending_flag_does_not_block_other_devices_or_revoke_existing_leases(self):
-        prior = self.coordinator.try_acquire_specific_stage(self.torch, 0, 'Radial backprojection')
+        prior = self.coordinator.try_acquire_specific_stage(self.torch, 0, 'Azimuthal backprojection')
         self.coordinator.set_inference_asset_retirement_pending(True)
-        self.assertEqual(self.coordinator.snapshot()['stage_leases'], {0: 'Radial backprojection'})
+        self.assertEqual(self.coordinator.snapshot()['stage_leases'], {0: 'Azimuthal backprojection'})
         unrelated = self.coordinator.try_acquire_specific_stage(self.torch, 1, 'NRRD output')
         self.assertIsNotNone(unrelated)
         unrelated.release()
         prior.release()
         self.assertEqual(self.coordinator.snapshot()['stage_leases'], {})
-        self.assertIsNone(self.coordinator.try_acquire_specific_stage(self.torch, 0, 'Radial backprojection'))
+        self.assertIsNone(self.coordinator.try_acquire_specific_stage(self.torch, 0, 'Azimuthal backprojection'))
 
     def test_ack_clear_wakes_waiters_and_configure_reset_remove_stale_state(self):
         wake = mock.Mock()
@@ -108,7 +108,7 @@ class GpuStageRetirementBarrierTests(unittest.TestCase):
         callback = self.callback(request)
         callback()
         self.assertTrue(self.coordinator.snapshot()['inference_asset_retirement_pending'])
-        self.assertIsNone(self.coordinator.try_acquire_specific_stage(self.torch, 0, 'Radial backprojection'))
+        self.assertIsNone(self.coordinator.try_acquire_specific_stage(self.torch, 0, 'Azimuthal backprojection'))
         priority_before_clear = []
         original_clear = self.coordinator.set_inference_asset_retirement_pending
 
@@ -122,7 +122,7 @@ class GpuStageRetirementBarrierTests(unittest.TestCase):
             callback()
         self.assertEqual(priority_before_clear, [False])
         self.assertFalse(self.coordinator.snapshot()['inference_asset_retirement_pending'])
-        lease = self.coordinator.try_acquire_specific_stage(self.torch, 0, 'Radial backprojection')
+        lease = self.coordinator.try_acquire_specific_stage(self.torch, 0, 'Azimuthal backprojection')
         self.assertIsNotNone(lease)
         lease.release()
 
@@ -134,7 +134,7 @@ class GpuStageRetirementBarrierTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'queue failed'):
             self.callback(mock.Mock(side_effect=RuntimeError('queue failed')))()
         self.assertTrue(self.coordinator.snapshot()['inference_asset_retirement_pending'])
-        self.assertIsNone(self.coordinator.try_acquire_specific_stage(self.torch, 0, 'Radial backprojection'))
+        self.assertIsNone(self.coordinator.try_acquire_specific_stage(self.torch, 0, 'Azimuthal backprojection'))
 
 
 if __name__ == '__main__':

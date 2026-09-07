@@ -78,18 +78,18 @@ class FusedRendererOptimizationTests(unittest.TestCase):
 
     def test_preflight_specs_cover_each_distinct_family_affine(self) -> None:
         views = [
-            SimpleNamespace(name='radial_a0', num_slices=9, preflight_family='radial'),
-            SimpleNamespace(name='radial_a120', num_slices=9, preflight_family='radial'),
-            SimpleNamespace(name='radial_a240', num_slices=9, preflight_family='radial'),
-            SimpleNamespace(name='radial_a120_duplicate', num_slices=9, preflight_family='radial'),
+            SimpleNamespace(name='azimuthal_a0', num_slices=9, preflight_family='azimuthal'),
+            SimpleNamespace(name='azimuthal_a120', num_slices=9, preflight_family='azimuthal'),
+            SimpleNamespace(name='azimuthal_a240', num_slices=9, preflight_family='azimuthal'),
+            SimpleNamespace(name='azimuthal_a120_duplicate', num_slices=9, preflight_family='azimuthal'),
             SimpleNamespace(name='tilted_a120', num_slices=7, preflight_family='tilted'),
         ]
         jobs = {
-            'radial_a0': [make_job('radial_a0', 0.0, self.identity)],
-            'radial_a120': [make_job('radial_a120', 120.0, self.rotate_120)],
-            'radial_a240': [make_job('radial_a240', 240.0, self.rotate_240)],
-            'radial_a120_duplicate': [
-                make_job('radial_a120_duplicate', 120.0, self.rotate_120),
+            'azimuthal_a0': [make_job('azimuthal_a0', 0.0, self.identity)],
+            'azimuthal_a120': [make_job('azimuthal_a120', 120.0, self.rotate_120)],
+            'azimuthal_a240': [make_job('azimuthal_a240', 240.0, self.rotate_240)],
+            'azimuthal_a120_duplicate': [
+                make_job('azimuthal_a120_duplicate', 120.0, self.rotate_120),
             ],
             'tilted_a120': [make_job('tilted_a120', 120.0, self.rotate_120)],
         }
@@ -104,9 +104,9 @@ class FusedRendererOptimizationTests(unittest.TestCase):
         self.assertEqual(
             [(spec['view'].preflight_family, spec['job'].angle_deg) for spec in specs],
             [
-                ('radial', 0.0),
-                ('radial', 120.0),
-                ('radial', 240.0),
+                ('azimuthal', 0.0),
+                ('azimuthal', 120.0),
+                ('azimuthal', 240.0),
                 ('tilted', 120.0),
             ],
         )
@@ -116,12 +116,12 @@ class FusedRendererOptimizationTests(unittest.TestCase):
         class FakeView:
             def __init__(self, name: str) -> None:
                 self.name = name
-                self.preflight_family = 'radial'
+                self.preflight_family = 'azimuthal'
 
-        views = [FakeView('radial_a0'), FakeView('radial_a120')]
+        views = [FakeView('azimuthal_a0'), FakeView('azimuthal_a120')]
         jobs = [
-            make_job('radial_a0', 0.0, self.identity),
-            make_job('radial_a120', 120.0, self.rotate_120),
+            make_job('azimuthal_a0', 0.0, self.identity),
+            make_job('azimuthal_a120', 120.0, self.rotate_120),
         ]
         specs = [
             {'view': view, 'job': job, 'frame_index': 3}
@@ -163,8 +163,8 @@ class FusedRendererOptimizationTests(unittest.TestCase):
         self.assertEqual(engine._fused_preflight_volume_key, engine._volume_key)
 
     def test_nonzero_angle_renders_directly_into_single_channel_ring(self) -> None:
-        job = make_job('radial_a120', 120.0, self.rotate_120)
-        view = SimpleNamespace(name='radial_a120')
+        job = make_job('azimuthal_a120', 120.0, self.rotate_120)
+        view = SimpleNamespace(name='azimuthal_a120')
         render_done = mock.Mock()
         slot = SimpleNamespace(
             input=SimpleNamespace(shape=(1, 1, 8, 8)),
@@ -224,8 +224,8 @@ class FusedRendererOptimizationTests(unittest.TestCase):
         )
         source = object.__new__(cuda_backend.GpuRenderedYoloSource)
         source.engine = engine
-        source.view = SimpleNamespace(name='radial_a120', family='radial')
-        source.job = make_job('radial_a120', 120.0, self.rotate_120)
+        source.view = SimpleNamespace(name='azimuthal_a120', family='azimuthal')
+        source.job = make_job('azimuthal_a120', 120.0, self.rotate_120)
         source.slice_offset = 0
         source.bs = 1
         source.nf = 4
@@ -241,7 +241,7 @@ class FusedRendererOptimizationTests(unittest.TestCase):
         self.assertEqual(engine.capture_fused_ring_renderer.call_count, 2)
         self.assertTrue(all(slot.render_expected_key is not None for slot in slots))
 
-    def test_direct_radial_and_tilted_pixel_kernels_use_2d_coordinates(self) -> None:
+    def test_direct_azimuthal_and_tilted_pixel_kernels_use_2d_coordinates(self) -> None:
         kernel_source = inspect.getsource(cuda_backend._fused_direct_render_kernels)
         self.assertNotIn('int oy = q / ow', kernel_source)
         self.assertIn(
@@ -249,7 +249,7 @@ class FusedRendererOptimizationTests(unittest.TestCase):
             kernel_source,
         )
         launch_source = inspect.getsource(
-            cuda_backend._GpuWorkerRenderEngine._try_fused_radial_into_slot,
+            cuda_backend._GpuWorkerRenderEngine._try_fused_azimuthal_into_slot,
         )
         self.assertIn('render_block = (32, 8)', launch_source)
         self.assertIn('render_grid, render_block', launch_source)
@@ -315,7 +315,7 @@ class FusedRendererOptimizationTests(unittest.TestCase):
         engine._resident_runtime_disabled = False
         for name in (
             "_native_t_map_cache", "_native_plane_cache", "_native_u8_plane_cache", "_fold_cache",
-            "_tilted_plans", "_fused_radial_taps",
+            "_tilted_plans", "_fused_azimuthal_taps",
         ):
             setattr(engine, name, {})
         for name in (
@@ -324,7 +324,7 @@ class FusedRendererOptimizationTests(unittest.TestCase):
         ):
             setattr(engine, name, set())
         engine._fused_volume_ref = None
-        engine._radial_texture_ref = None
+        engine._azimuthal_texture_ref = None
         engine._fused_preflight_volume_key = None
         engine._native_t_indices = mock.Mock(return_value=(object(), object(), object()))
         volume = np.arange(4 * 5 * 6, dtype=np.uint8).reshape(4, 5, 6)
@@ -372,10 +372,10 @@ class FusedRendererOptimizationTests(unittest.TestCase):
         )
         expected = object()
         engine.warp_native_uint8_frame = mock.Mock(return_value=expected)
-        view = SimpleNamespace(name="sagittal", num_slices=5)
+        view = SimpleNamespace(name="sagittal", num_slices=5, family='orthogonal')
 
         with (
-            mock.patch.object(cuda_backend, "is_radial_view", return_value=False),
+            mock.patch.object(cuda_backend, "is_azimuthal_view", return_value=False),
             mock.patch.object(cuda_backend, "is_tilted_view", return_value=False),
             mock.patch.object(cuda_backend, "physical_view_name", return_value="sagittal"),
         ):
@@ -413,8 +413,8 @@ class FusedRendererOptimizationTests(unittest.TestCase):
             13,
             15,
             cartesian_views=("transverse", "sagittal", "coronal"),
-            radial_views=(),
-            radial_azimuth_angles=(),
+            azimuthal_views=(),
+            azimuthal_azimuth_angles=(),
         )
         engine = cuda_backend._GpuWorkerRenderEngine("cuda:0")
         with mock.patch.dict(
@@ -425,7 +425,7 @@ class FusedRendererOptimizationTests(unittest.TestCase):
                 engine.ensure_volume_array(
                     volume,
                     identity="test:cartesian-cuda-parity",
-                    require_radial_texture=False,
+                    require_azimuthal_texture=False,
                 ),
                 "resident",
             )

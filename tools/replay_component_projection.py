@@ -33,7 +33,7 @@ def _gpu_reference_tracking(enabled):
     os.environ['YOLO_TTA_GPU_BACKPROJECT'] = '1' if enabled else '0'
     selected = []
     originals = {}
-    for name in ('_radial_backproject_gpu_resident', '_radial_backproject_gpu_streaming'):
+    for name in ('_azimuthal_backproject_gpu_resident', '_azimuthal_backproject_gpu_streaming'):
         original = getattr(backprojection, name)
         originals[name] = original
 
@@ -68,8 +68,8 @@ def execute_backend(capture, work_dir, backend, workers):
     if backend not in ('legacy', 'sparse', 'legacy_cuda'):
         raise ValueError(f'Unknown replay backend: {backend}')
     replay = load_component_replay(capture)
-    if replay.view.family != 'radial':
-        raise ValueError('This replay tool currently compares Radial and tilted-Radial components')
+    if replay.view.family != 'azimuthal':
+        raise ValueError('This replay tool currently compares Azimuthal and tilted-Azimuthal components')
     work_dir = Path(work_dir).resolve()
     if work_dir.exists():
         raise FileExistsError(f'Replay workspace already exists: {work_dir}')
@@ -98,7 +98,7 @@ def execute_backend(capture, work_dir, backend, workers):
     started = time.perf_counter()
     try:
         if backend == 'sparse':
-            stats = sparse_projection.project_radial_sparse_store(replay.source_path, replay.view, destination,
+            stats = sparse_projection.project_azimuthal_sparse_store(replay.source_path, replay.view, destination,
                 out_shape_tyx=replay.output_shape, workers=int(workers))
             decode_seconds = 0.0
         else:
@@ -129,7 +129,7 @@ def execute_backend(capture, work_dir, backend, workers):
                                   format_name=CVOL_FORMAT, desc='Legacy component replay')
             try:
                 with _gpu_reference_tracking(backend == 'legacy_cuda') as selected:
-                    backprojection.backproject_radial_volume_to_volume(
+                    backprojection.backproject_azimuthal_volume_to_volume(
                         decoded, replay.view, work_dir/'projected-work.u8', 'Legacy component replay',
                         prefer_memory=True, reserve_bytes=32*1024**3, workers=int(workers),
                         out_shape_tyx=replay.output_shape, projection_block_callback=writer, sink_only=True)

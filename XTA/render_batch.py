@@ -23,7 +23,7 @@ class RenderBatchItem:
     result_index: int
     center_index: Optional[int]
     synthetic_padding: bool
-    radial_padding: bool
+    azimuthal_padding: bool
     frame: np.ndarray
     request: Optional[RenderItem] = None
 

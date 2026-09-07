@@ -27,8 +27,8 @@ class ComponentReplayTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.capture_root = self.root/'captures'
-        self.view = geometry._build_radial_view_info(5, 7, 9, base_view='transverse',
-            azimuth_angle=45, radial_native_raster=0, request_token='transverse')
+        self.view = geometry._build_azimuthal_view_info(5, 7, 9, base_view='transverse',
+            azimuth_angle=45, azimuthal_native_raster=0, request_token='transverse')
         self.data = np.zeros((self.view.num_slices, self.view.src_h, self.view.src_w), np.uint8)
         self.data[0, 1:4, 1:5] = 1
         self.data[-1, 2, 3:6] = 1
@@ -94,17 +94,17 @@ class ComponentReplayTests(unittest.TestCase):
     def test_disabled_filter_empty_and_quotas_do_not_copy_unselected_inputs(self):
         component_replay.configure_component_replay_capture(None)
         self.assertIsNone(self.capture(self.root/'missing'))
-        self.configure(view_names=['radial_sagittal*'])
+        self.configure(view_names=['azimuthal_sagittal*'])
         self.assertIsNone(self.capture(self.root/'missing'))
         source = self.source()
         count = sum((source/name).stat().st_size for name in ('meta.json', 'index.bin', 'chunks.bin'))
         self.configure(max_total_bytes=count-1)
         self.assertIsNone(self.capture(source))
         self.assertEqual(component_replay.component_replay_capture_status()['count'], 0)
-        self.configure(view_names=['radial_transverse*'], max_captures=1)
+        self.configure(view_names=['azimuthal_transverse*'], max_captures=1)
         captured = self.capture(source)
         self.assertIsNotNone(captured)
-        self.assertIsNone(self.capture(source, replace(self.view, name='radial_transverse_other')))
+        self.assertIsNone(self.capture(source, replace(self.view, name='azimuthal_transverse_other')))
         # Restarting capture in the same directory does not silently exceed quota.
         self.configure(max_captures=1)
         self.assertIsNone(self.capture(source, replace(self.view, name='another')))
@@ -124,8 +124,8 @@ class ComponentReplayTests(unittest.TestCase):
         captured = self.capture(self.source(fmt=INTERNAL_PACKED_CVOL_FORMAT))
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
                 mock.patch.dict(os.environ, {'YOLO_TTA_GPU_BACKPROJECT': '1'}), \
-                mock.patch.object(backprojection, '_radial_backproject_gpu_resident', side_effect=AssertionError('unexpected GPU query')), \
-                mock.patch.object(backprojection, '_radial_backproject_gpu_streaming', side_effect=AssertionError('unexpected GPU query')):
+                mock.patch.object(backprojection, '_azimuthal_backproject_gpu_resident', side_effect=AssertionError('unexpected GPU query')), \
+                mock.patch.object(backprojection, '_azimuthal_backproject_gpu_streaming', side_effect=AssertionError('unexpected GPU query')):
             legacy = replay_component_projection.execute_backend(captured, self.root/'legacy', 'legacy', 2)
             sparse = replay_component_projection.execute_backend(captured, self.root/'sparse', 'sparse', 2)
         comparison = replay_component_projection.compare_projected_stores(legacy['result_store'], sparse['result_store'])

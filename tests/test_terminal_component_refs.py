@@ -203,7 +203,7 @@ class TerminalReferenceTests(unittest.TestCase):
                 self.run_prepare(stop_on_alloc=True, **overrides)
 
     def test_other_geometries_retire_dense_continuation_when_components_are_complete(self):
-        for overrides in ({'family': 'radial'}, {'family': 'tilted'}, {'angle': 45.0}):
+        for overrides in ({'family': 'azimuthal'}, {'family': 'tilted'}, {'angle': 45.0}):
             with self.subTest(overrides=overrides):
                 result, seen, initial, mutated = self.run_prepare(**overrides)
                 self.assertFalse(seen.allocations)
@@ -214,7 +214,7 @@ class TerminalReferenceTests(unittest.TestCase):
                 np.testing.assert_array_equal(fused, mutated)
 
     def test_parent_retires_shadow_before_detached_component_publication_finishes(self):
-        result, seen, initial, mutated = self.run_prepare(family='radial', defer_components=True)
+        result, seen, initial, mutated = self.run_prepare(family='azimuthal', defer_components=True)
         self.assertFalse(seen.original_path_exists)
         self.assertFalse(seen.allocations)
         self.assertIsNone(result.final_view_volume_mm)
@@ -250,7 +250,7 @@ class TerminalReferenceTests(unittest.TestCase):
             'nrrd_layer_refs': [base, *prepared.nrrd_layers, base],
             'native_view_support_by_model': {'model': {}},
             'view_volumes_by_model': {'model': {}},
-            'radial_native_output_by_model': {'model': {}},
+            'azimuthal_native_output_by_model': {'model': {}},
             'tilted_native_output_by_model': {'model': {}},
             'd1_layer_ref_by_parent': {('model', view.name): base},
             'close_memmap_array_without_flush': mock.Mock(),

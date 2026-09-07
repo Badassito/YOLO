@@ -114,9 +114,9 @@ class UnificationContractTests(unittest.TestCase):
     def test_pta_internal_identity_is_not_a_physical_view(self) -> None:
         self.assertEqual(resolve_in_plane_variants("pta"), (InPlaneVariant(0.0),))
         self.assertEqual(expand_view_variants("pta", []), ())
-        variants = expand_view_variants("pta", ["transverse", "radial"])
+        variants = expand_view_variants("pta", ["transverse", "azimuthal"])
         self.assertEqual(len(variants), 2)
-        self.assertEqual([variant.physical_view for variant in variants], ["transverse", "radial"])
+        self.assertEqual([variant.physical_view for variant in variants], ["transverse", "azimuthal"])
         self.assertTrue(all(variant.runtime_view == variant.physical_view for variant in variants))
         with self.assertRaisesRegex(ValueError, "invalid in PTA"):
             resolve_in_plane_variants("pta", [0])
@@ -173,7 +173,7 @@ class UnificationContractTests(unittest.TestCase):
 
         plan = build_forward_raster_plan(
             mode="pta",
-            physical_view_id="radial_transverse",
+            physical_view_id="azimuthal_transverse",
             angle_deg=0,
             channel_token="C3S1",
             channel_kind="custom",

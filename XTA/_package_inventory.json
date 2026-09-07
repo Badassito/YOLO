@@ -7932,5 +7932,620 @@
       "name": "main",
       "sha256": "a2c4a36ea39c43fb451b6667bdb8aa0507d56f849d4d7b3768dd46476af98fc2"
     }
-  ]
+  ],
+  "v20_azimuthal_rename": {
+    "source_git_commit": "d6e49f45839104b0768e4c8f28ae8b9dc6e5fc71",
+    "transform": [
+      [
+        "radial",
+        "azimuthal"
+      ],
+      [
+        "Radial",
+        "Azimuthal"
+      ],
+      [
+        "RADIAL",
+        "AZIMUTHAL"
+      ]
+    ],
+    "scope": "Exact immutable-baseline statements whose AST changes only by the documented source-text rename; arithmetic and control-flow edits require separate review.",
+    "statements": [
+      {
+        "module": "assembly",
+        "baseline_sha256": "45617d502181400013cf3589645fcc1f9814d533cad217f7ed9d58939559c256",
+        "renamed_sha256": "1a463c63facec581ff29cd11abd975e60479c98770aa746c3f819550d458ec91",
+        "baseline_name": "view_interpolation_wrap_axis",
+        "current_name": "view_interpolation_wrap_axis"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "cf5e2898326ce6cd64fed0b2495f980ebfe3728dbf500845e88ab72af8a5421c",
+        "renamed_sha256": "b220ee70b1f734552fa017a77ceee774ee48432c74e9691a9e4df66ff287f905",
+        "baseline_name": "RadialBackprojectionSample",
+        "current_name": "AzimuthalBackprojectionSample"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "5bb18290a1290fa2172855caf1233e3046c85d012c8ec6191dfbcdc89a3cc6bd",
+        "renamed_sha256": "59a63aa1f513c22907af5ecc512c89e094f5df13472bfcc8154c9b2175b74312",
+        "baseline_name": "DenseRadialBackprojectionMap",
+        "current_name": "DenseAzimuthalBackprojectionMap"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "98f41104372b66bbef7060e3d761942c02a47f0c63ec267e4c6f4bad2f8cc19d",
+        "renamed_sha256": "86c4879fece6361292f2e2a4ab1f08e89b319da787b43ffc82e79520cf9ce940",
+        "baseline_name": "RadialProcessingGrid",
+        "current_name": "AzimuthalProcessingGrid"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "1acac6084a58b3333761da5121d33a286a5ce990a21e6114e49bad9f3d133813",
+        "renamed_sha256": "2ce156e3967cff7ca2279022537a1cfd13f1baa6d163fe0ee53ac2f4a573667e",
+        "baseline_name": "resolve_radial_processing_grid",
+        "current_name": "resolve_azimuthal_processing_grid"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "560f4a1322424daa2fd8d1ad0cafda4cb6117b66a1f8f07f662ce8aa354c414d",
+        "renamed_sha256": "5bcbc5bbe83c7f06a55d8aa8674a824faa087f61147a280d78d08f59b7773c22",
+        "baseline_name": "_radial_processing_rows_for_output",
+        "current_name": "_azimuthal_processing_rows_for_output"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "9efd9458fb824a09424a6759bbf0d0db479413696de1cb5b0e2fd35cfbdf48de",
+        "renamed_sha256": "386a9a343b91e6c9ddb181de0cc23cfc9056a991584894de0b82082d16c8645f",
+        "baseline_name": "_radial_dense_map_for_processing",
+        "current_name": "_azimuthal_dense_map_for_processing"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "dba9a0a04561867b00401108885f7d21a4fae9ddf51d77ec3d79c79d4249f7d0",
+        "renamed_sha256": "7ecd8053001db0138952205a551ce7081e87fad9ef3c45633e9ae84987fcd0e4",
+        "baseline_name": null,
+        "current_name": null
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "fca03d43431118b5ab71e2861664b36a086ae3a50aeb02c27716e7d243e8586f",
+        "renamed_sha256": "62ef5c7780a874c5ac6e3d141c8389672d988e1801002087bbc0928c6d97fde8",
+        "baseline_name": "radial_full_coverage_angle_deg",
+        "current_name": "azimuthal_full_coverage_angle_deg"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "7e12b3d142a114fccf5a281343025bdc623949fe82927f1bd11938926b3a0bfd",
+        "renamed_sha256": "6f6aac29f4614ef9851a3277aa1c129a4109d3cea5077df8d665c0a3560abec4",
+        "baseline_name": "_radial_view_nominal_spacing_deg",
+        "current_name": "_azimuthal_view_nominal_spacing_deg"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "005226463ae21e2a7e3edc5b5a8dfc3204ed0602d285b032c836b06501ad2d06",
+        "renamed_sha256": "689647d4271c1e4aa6d6fdaf8b7b344bc682381e9708d42f582f1dbd3cdf8c39",
+        "baseline_name": "_nearest_radial_source_for_backprojection",
+        "current_name": "_nearest_azimuthal_source_for_backprojection"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "fa6983caa8617f3003a319a749a15973ef33d2c6e179b1a697bd44f95245ae36",
+        "renamed_sha256": "27b20d3ab0ac6c89071878df0eae2864fd2c056d48758ac07c01dbb701a669b7",
+        "baseline_name": "build_radial_backprojection_plan",
+        "current_name": "build_azimuthal_backprojection_plan"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "05689038d71a0d6bbfc729958ddeabdc0fa7f9db13e514a9f006d210f69afc32",
+        "renamed_sha256": "6e2e889de9e4062feb84b7da113aa9485702d0e2eb8fff6c54bd2da62f78ad25",
+        "baseline_name": "_radial_plan_signature",
+        "current_name": "_azimuthal_plan_signature"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "361823e61b69043f61cf1addbba9416069f67961fced830f70432d2f8012e166",
+        "renamed_sha256": "73c3d290a98fddf7c2ea69af32a6c9a0fcb9bc2d39f536693890dfc90730ea22",
+        "baseline_name": "build_dense_radial_backprojection_map",
+        "current_name": "build_dense_azimuthal_backprojection_map"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "f7d9e6a57a1370cba3a3058c18e06ee4361c695a4dd8fbfc033848651e319cec",
+        "renamed_sha256": "0158dced219dc1f2ec3fdc02f41d2046000ee82a72846124eebdb7abe901fd77",
+        "baseline_name": "_radial_row_occupancy",
+        "current_name": "_azimuthal_row_occupancy"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "f8c867f868408b8f77c7f94608ddad0b9fa710ab26ef97812a8ff3f6857f2454",
+        "renamed_sha256": "14c3533babd2016a94386ef068033eff5a530d0a9a6c8d8639d929c35530badb",
+        "baseline_name": "gpu_backproject_enabled",
+        "current_name": "gpu_backproject_enabled"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "13da43ef1072f75e68bba4a6e337091623360e60f6c943e42527730f671f382e",
+        "renamed_sha256": "5d5b69b032838d19637a4a4c00f7028f2f8f61ead702f68f51e78a564ad7c254",
+        "baseline_name": "_validated_radial_slice_bboxes",
+        "current_name": "_validated_azimuthal_slice_bboxes"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "d5f6e8fb54520c9fe2ed0c3923bab356a7af92a32b7036efd74e1099c6842c81",
+        "renamed_sha256": "5c5675bca906d821d1d42793fd31baf8350b06fbfade1e9691b3c9e9468571a8",
+        "baseline_name": "_stage_radial_t_major_block",
+        "current_name": "_stage_azimuthal_t_major_block"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "5dde7ec6185cd20884ce77a6e9651d1620b3199b446a175e17203896ccd07247",
+        "renamed_sha256": "ab9686f7580daf5b8a5d1547c1bc53174a51fdb18a7e6bc772a2d737d433c683",
+        "baseline_name": null,
+        "current_name": null
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "783a9953177d24a1ae2f372dfb90f10329f42a8e1bff4d32890376abc95fb366",
+        "renamed_sha256": "c541c41bf9fc5bae823cc0c7f8e4c16341e4c5221dcbe074aa28af716b76a106",
+        "baseline_name": null,
+        "current_name": null
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "9c00f36f72be14b7a78b2db89b3ac537b3e61e376e652b6bd162e941b92b725e",
+        "renamed_sha256": "b01cdbbc562bde254c6768b043d560bb648993002ea9d2c065b5a338a98fb087",
+        "baseline_name": null,
+        "current_name": null
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "1e1827c7ffb32f0d09130d3109f210d015f536eeebda8fd74ccf47fa78ce4a07",
+        "renamed_sha256": "554be831cbcaa3b4adf71009d95050801c025ccdb177af9e3e354c26ab397e6d",
+        "baseline_name": "gpu_resident_radial_backproject_enabled",
+        "current_name": "gpu_resident_azimuthal_backproject_enabled"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "8ec0bbfc951e63b94a979a8d70143b0b3ba1f47c932e23aed8196024e592bb49",
+        "renamed_sha256": "421c8d3a27064936f6f8bbd3e33c6e8b4c71743d388b2bb83d9f2155956bb2d6",
+        "baseline_name": "fused_angle_variant_radial_component_layer_enabled",
+        "current_name": "fused_angle_variant_azimuthal_component_layer_enabled"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "35c2b81684d969b4a31c5dad991da69c56fbb8d21d5ec06175620c02202750ac",
+        "renamed_sha256": "2b592d7ee915617f3a138fe03445544e0388082b310682a0faf02460ad00561a",
+        "baseline_name": "_radial_backproject_gpu_resident",
+        "current_name": "_azimuthal_backproject_gpu_resident"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "d70ef9090ca874bccf90c61448ed82f5294ff04a9edfe3858d6cb2259f44e7c6",
+        "renamed_sha256": "48fc3dde8d2121c42cbd666607455f991170add383fe718cf921ed10564ed1ce",
+        "baseline_name": "_radial_backproject_gpu_resident_on_device",
+        "current_name": "_azimuthal_backproject_gpu_resident_on_device"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "f160a25d0b63f43b0c2055f5a8848d5ad762f8d620e4e5dfd7439300d5db954c",
+        "renamed_sha256": "e2ed7d67fbfa12e0b0149031ad8e67a5cbc3dc9653169493e0be041eb7d3e94f",
+        "baseline_name": "_radial_backproject_gpu_streaming",
+        "current_name": "_azimuthal_backproject_gpu_streaming"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "cbdc13a894c9e68587d12102a374d45d1dca0a7bf10deeae15fd7011c4a3daf9",
+        "renamed_sha256": "a612da8a5836b9fd5ed479de9944138071f8d0dbb1770ca3b206c387f92ab779",
+        "baseline_name": "_radial_backproject_gpu_streaming_on_device",
+        "current_name": "_azimuthal_backproject_gpu_streaming_on_device"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "bdafbe9b77e0a70b0eb52542e14c8a83d30db6ff2cbf8b810d74eed53f16134f",
+        "renamed_sha256": "4352532e2323e2608684ba6c718ea8d76ae0cfc3fcced6e7030c072694b17f76",
+        "baseline_name": "_log_radial_backprojection_densification",
+        "current_name": "_log_azimuthal_backprojection_densification"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "a7af1c1c4489e0f4688206fb1653815f634588003bc1b7a57533a0c4caac1760",
+        "renamed_sha256": "7377839b4aded8ff1643f28cfe66abae003a47d73b855a4daa3e0f76d8c05c3a",
+        "baseline_name": "_radial_output_stack_and_plane_shape",
+        "current_name": "_azimuthal_output_stack_and_plane_shape"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "8882728321eda6fd2b76a4880ecf6ad43363e44642972010e5f4c1ff18ac994c",
+        "renamed_sha256": "abd3f39726a0fb3d86f084115f550f0605c6b24261d382bb81b59faf7b98fccd",
+        "baseline_name": "_radial_source_rows_for_output",
+        "current_name": "_azimuthal_source_rows_for_output"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "6957952d53c58b8bc76bc8a25ed03b2d34460fcd4f87fa7d38217a39e9727be8",
+        "renamed_sha256": "c1961aca862ea7bf364e7cd1429331bdaa616e3db412e226095db104c0af2e4d",
+        "baseline_name": "_radial_backproject_plane",
+        "current_name": "_azimuthal_backproject_plane"
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "461642d56a575e31754066f1c410f45c3b5063f472d93605ca536b036ec97e5e",
+        "renamed_sha256": "138fa3acc84bf3ba73c42ed3853ad547e780d51cf25c6107fef73e51a9266351",
+        "baseline_name": null,
+        "current_name": null
+      },
+      {
+        "module": "backprojection",
+        "baseline_sha256": "428319388e131fb01981ecb7122d836240f511ddb218111107cbea01333f5a17",
+        "renamed_sha256": "39740f76af7c89595934138e13319a6c458c518bda18f7a481b43108dc15937c",
+        "baseline_name": "_or_tilted_radial_coordinates_into_packed",
+        "current_name": "_or_tilted_azimuthal_coordinates_into_packed"
+      },
+      {
+        "module": "config",
+        "baseline_sha256": "a82e27dba454ccb877eded484bb82da078efc725ded23e879a0721f73bb7f242",
+        "renamed_sha256": "b81649a65b64c7bc833633f31cd4d0c33417c4c8fceb1e4b5651467ef6a0882a",
+        "baseline_name": null,
+        "current_name": null
+      },
+      {
+        "module": "config",
+        "baseline_sha256": "055e18072c23ee4654d0682fc381cb1889207332e3e6ac63de1814c9a578eabd",
+        "renamed_sha256": "fc7fcd1b3bd858bb339f4f56e79019d3459d31a6a86ae531f32cc66e6b979e25",
+        "baseline_name": "RadialViewRequest",
+        "current_name": "AzimuthalViewRequest"
+      },
+      {
+        "module": "config",
+        "baseline_sha256": "d665a924c33a9680c654d06c7881437ac92ec9671d5be3268e1539d511977690",
+        "renamed_sha256": "65ad021cfc81292c5254076e96991ba778d4b0be18444c43845851717648317c",
+        "baseline_name": "resolve_radial_view_requests",
+        "current_name": "resolve_azimuthal_view_requests"
+      },
+      {
+        "module": "cuda_backend",
+        "baseline_sha256": "2ef46c50151ac17bd75b6cbb737e71155f61334a7e57cef803cdc512b53b7313",
+        "renamed_sha256": "6efd17321d87cb934baf9db4a63eb11d904bfcb2ece45d87751fcfbacde32b6e",
+        "baseline_name": "gpu_render_tblock_slices",
+        "current_name": "gpu_render_tblock_slices"
+      },
+      {
+        "module": "cuda_backend",
+        "baseline_sha256": "bd9d6697bd99da7ba15f96553c9948bf5f7381f424d881da6b5b33c89fa78a43",
+        "renamed_sha256": "55103a1587cfe450922e2a22900756aa82dfba9f1b8913cfc2e7bbec9124bc1c",
+        "baseline_name": "fused_radial_render_enabled",
+        "current_name": "fused_azimuthal_render_enabled"
+      },
+      {
+        "module": "cuda_backend",
+        "baseline_sha256": "a90d43abc8a86e055abfb9f5a333917f94dd4faa94caafba1d0aac8818a884c1",
+        "renamed_sha256": "3d2cb15f2d22981e10267c42f0778888827ac671b9c479bb75ba9654a3504ce1",
+        "baseline_name": "radial_texture_source_copy_reserve_enabled",
+        "current_name": "azimuthal_texture_source_copy_reserve_enabled"
+      },
+      {
+        "module": "cuda_backend",
+        "baseline_sha256": "1076c94e6c8a67c3277ee6cae70b26a62073bfcb0e8515314cf53b420aee0945",
+        "renamed_sha256": "e73828955e13301c95bbf40405593b5e5fe13e61a8537b5865cc05119c518a7e",
+        "baseline_name": "fused_renderer_preflight_enabled",
+        "current_name": "fused_renderer_preflight_enabled"
+      },
+      {
+        "module": "cuda_backend",
+        "baseline_sha256": "ae12654fa34fc9768672b8d9cc9b30b7949a8c66e33e7e9ba3be8bee948b0065",
+        "renamed_sha256": "dc2701a36ae73adc887a5fbb141da9c29104987c07ff84610aeec1a5d40bbd03",
+        "baseline_name": "fused_renderer_preflight_tolerances",
+        "current_name": "fused_renderer_preflight_tolerances"
+      },
+      {
+        "module": "cuda_backend",
+        "baseline_sha256": "c8972e4acbdde22a8fe221daae7d343900a8d4862710528e4643374ca19093b7",
+        "renamed_sha256": "cda4ceee5f706bc49930a074b6056df750924605eacbda5a13fafac42d0a9a9e",
+        "baseline_name": "_fused_preflight_family",
+        "current_name": "_fused_preflight_family"
+      },
+      {
+        "module": "cuda_backend",
+        "baseline_sha256": "c9522bbd7173224233207adea5f568c8c166a0dd8cd2c0e0f9022b873156446b",
+        "renamed_sha256": "370b67c0d12e6562f87224a74e54f68d5dbeb69c01924e90c574168a7bfc2fbb",
+        "baseline_name": "_single_pixel_closed_seam_fraction",
+        "current_name": "_single_pixel_closed_seam_fraction"
+      },
+      {
+        "module": "cuda_backend",
+        "baseline_sha256": "2c223557e0a1138abb5509b06635a0740fa0d4af0fcc0d5562c59dc508e5236f",
+        "renamed_sha256": "df98f03809231be0935cfc7570457dc1c30bafa35b4091fa11e2db732bee9a88",
+        "baseline_name": "fused_renderer_effective_max_fraction_tolerance",
+        "current_name": "fused_renderer_effective_max_fraction_tolerance"
+      },
+      {
+        "module": "cuda_backend",
+        "baseline_sha256": "79272995886f095454c10f70a81b0e30f78650a8f0e8c4bc5b23db4d252bbd0e",
+        "renamed_sha256": "bf56ebca983769dc080bb4be3bd8d7e30628de5d9ce9ee3f1d3291b935114eb8",
+        "baseline_name": null,
+        "current_name": null
+      },
+      {
+        "module": "cuda_d1",
+        "baseline_sha256": "c476ceeb33c77a59a0833f212f1a773eaf632c11819693121f46eb762742ebbc",
+        "renamed_sha256": "27fc022d995c82ef1a7b81ca816e323869c91217355cb09ff7ee4541165fefee",
+        "baseline_name": "_d1_view_family_ids",
+        "current_name": "_d1_view_family_ids"
+      },
+      {
+        "module": "finalization",
+        "baseline_sha256": "47027ff1bb5319303d821826267a970fa7c5b80321ee3320b2e2012383c3f89f",
+        "renamed_sha256": "42e9226bf253e8b2cf841f228c0c0f29d72c774394fc03f5c748bca972c7a935",
+        "baseline_name": "assemble_view_volumes_into_native_union",
+        "current_name": "assemble_view_volumes_into_native_union"
+      },
+      {
+        "module": "finalization",
+        "baseline_sha256": "fd81cf9fc0a5587f79c19bbb789f2ee537872fa0bbbbeeda884375ee660b75c3",
+        "renamed_sha256": "572bc4849dcf3e24a68a884923bec55cc01d043ca4810ecabad35188139fbe6f",
+        "baseline_name": "_v14_sample_one_normal_section",
+        "current_name": "_v14_sample_one_normal_section"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "5e22580167195b9e08aceebd25f4e0bcdf82bcf7513f4d98a48beecba0cec798",
+        "renamed_sha256": "2718fe451f457cc974edb3fb9c5342506c75ce431d6ec07f531ce66e228b7072",
+        "baseline_name": "build_affine",
+        "current_name": "build_affine"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "41c0c7176137c581bcb2545fcdad80ded121c60a8d58f80f42dd5fe14aee16fd",
+        "renamed_sha256": "bedfad8597c4f78ef9b7528a684b35148c4c873615fd4ccbbe550ca949367129",
+        "baseline_name": "view_uses_inference_processing_grid",
+        "current_name": "view_uses_inference_processing_grid"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "b40d64cb6a725ccefb3871e339e991310011713c25047c1573fc5c29427617ce",
+        "renamed_sha256": "212bb575e773bcb7473a98b0dc7dc6fc3de5aeb07e8f129b12a4420fc1807fa9",
+        "baseline_name": "output_to_view_processing_affine",
+        "current_name": "output_to_view_processing_affine"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "49b3a0aad488cb2a4ef607062c9d30a882d0be1aeeb84592bdd19562ffeaf441",
+        "renamed_sha256": "ce14f45520a539e69be61e5c7e7c7f82111e392f2a860370f93a74d90e3bfde3",
+        "baseline_name": null,
+        "current_name": null
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "c8e5256bd662acf22cc3768a96593fce8084353e0c54c2bb00f80c64d771075a",
+        "renamed_sha256": "16cb3e58c7ad9ef48dbec5b3d239b7ca760af19d9f6687a8537cc31d4b292bf1",
+        "baseline_name": "ViewInfo",
+        "current_name": "ViewInfo"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "433e34d988af5d799cc29fcfae233d6af5fee599a564e6e53fef00beb2baaeb3",
+        "renamed_sha256": "ade42b42c34db33e395b8b0f64034fed942415ddb7b5e6c1821efc7f147a4110",
+        "baseline_name": "is_radial_view",
+        "current_name": "is_azimuthal_view"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "19940c404dd92c193d662e26be7160149d10fb32ad91aa921857d26540c8eca9",
+        "renamed_sha256": "7ca0c822beddc565573c7f1aedad8e32d561f9cccbcf262b9781ed72c904d896",
+        "baseline_name": "is_tilted_radial_view",
+        "current_name": "is_tilted_azimuthal_view"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "a9c8d7e570c83bc51ab3187cc0623c7628b45ef73c9e1b2b9187bafa33561427",
+        "renamed_sha256": "bece66e5177ac115f220af55da8567c62fdabd35d83b9833486a0c17840f8e19",
+        "baseline_name": "radial_base_view_name",
+        "current_name": "azimuthal_base_view_name"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "c39e7533be14ed2763077f19dd5da0e609fbfb2dd5f362651cb8a94f8cb19a46",
+        "renamed_sha256": "a121b5e55526e84f77b4572371f157aa4b39934ab74c30296402635bdb534d88",
+        "baseline_name": "radial_target_base_view",
+        "current_name": "azimuthal_target_base_view"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "49d717f7c09ab13e09acf8517540fecef43e8fa8d3a6be92dab32467c58efe7a",
+        "renamed_sha256": "6c11cdd553baa187deaa4ba6d192c9a5b00f15dfa88cac405136ada8f4da2258",
+        "baseline_name": "radial_plane_shape",
+        "current_name": "azimuthal_plane_shape"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "1b23bf717d2512439e5c5482928852da9a26a72e64be0c06d544af43312b59fd",
+        "renamed_sha256": "b9e7881d5fd15e82c9721611f1f58a4a725d1994a2cd48c03338d22763354f28",
+        "baseline_name": "radial_stack_length",
+        "current_name": "azimuthal_stack_length"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "8c06a1df208db62da023614faf2e2fe4a104657e36b966d6b83c57b2fc7afc9d",
+        "renamed_sha256": "d5e665692ac328ebc5003f9906bef985275283b6e94c8d9ab5fc5618a3013009",
+        "baseline_name": "radial_target_diameter",
+        "current_name": "azimuthal_target_diameter"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "c716d91d62f7d2491d235e4e7ead73ab5910258edcb459b64368622f70d75e54",
+        "renamed_sha256": "f3f6cebbfb5246fde49b83a43a3695a225d298978a3a0d53b0b3e46d316d6337",
+        "baseline_name": "tilted_radial_resident_gpu_render_enabled",
+        "current_name": "tilted_azimuthal_resident_gpu_render_enabled"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "867a633d144d678a6f5accba6476044d2161e4f890f2184a653ad1163e523745",
+        "renamed_sha256": "a22f95baf1941f7ecf2656035719388ab1cf7ca0e0ff161dcb682913cdc4b3c6",
+        "baseline_name": "radial_resident_gpu_render_supported",
+        "current_name": "azimuthal_resident_gpu_render_supported"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "c833df9f7a1c870423225fa3bb7795625e0f492ae46b11981d6e1f724b40f9a0",
+        "renamed_sha256": "a1a88817adee5f6f22af3d328c61bc034929731ea025cfb7a692fc4412ae083d",
+        "baseline_name": "radial_streaming_gpu_render_supported",
+        "current_name": "azimuthal_streaming_gpu_render_supported"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "90c6c81264e175a26fff89a4b195eb1cc74b6af6b6a8a3d2dbdd02f571b8b103",
+        "renamed_sha256": "51c99d773ed072ad51e217747cd700f696b2994fde25711dd11de96a13f74cf2",
+        "baseline_name": "radial_fused_render_supported",
+        "current_name": "azimuthal_fused_render_supported"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "4ed36642498012985549eafd80b0fff8a59c0429308a716484129fd93ccd0df0",
+        "renamed_sha256": "adf8ea77f43a608b6ccfffad9ea4351c0c45ea8a095bd3083594ad812d415848",
+        "baseline_name": "radial_sink_only_projection_supported",
+        "current_name": "azimuthal_sink_only_projection_supported"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "103c2bf776ed732479a218f984024a2a264ca235a013d6d7b3065baa74868985",
+        "renamed_sha256": "8af9bd41cd09d198e875a24e893b7d247a67b6df83c1a662d2625686b75586cf",
+        "baseline_name": "build_radial_azimuths",
+        "current_name": "build_azimuthal_azimuths"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "e0203b6d1f34c8f3463b5a344c6e7b40a22d6fe2ba67552bf9323b20ea9b59f9",
+        "renamed_sha256": "f46d8f0aabff926dae85b6f55ba6d35b0a9da1730539407664a035b18bd5a99e",
+        "baseline_name": "view_output_token",
+        "current_name": "view_output_token"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "6416572f6f1b662f481515a6e315050f576ce88d47654b791227bebc90faa7f6",
+        "renamed_sha256": "6c5da13aec70de5bcc83e9c2c3db00d7f5ed5bbab13a0067aa24a79950c22f4d",
+        "baseline_name": "_build_radial_view_info",
+        "current_name": "_build_azimuthal_view_info"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "8dc82bab831f06627feac09cef3e18bc409a3e371f62811fed8beabe3e242db3",
+        "renamed_sha256": "28933221417659b5320389a5713894df0cf1ac6d2f10b503044ed71f324671a8",
+        "baseline_name": "radial_source_tilted_view",
+        "current_name": "azimuthal_source_tilted_view"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "7032646b8c76f03c753731ba4ae6b573a3b2c999679b88c411b778834c1c0992",
+        "renamed_sha256": "35c34085a4a250308816d85aaf1a64cb49f81bb5afeacb446d7532fe61e68f53",
+        "baseline_name": "get_view_infos",
+        "current_name": "get_view_infos"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "f780fd84f2b912836019e8263fca211cb98d1979c4979dc723055027cfab0b2b",
+        "renamed_sha256": "a5a05eecbbde232c8b7344e95a3c0057ce277aac678ebcff5bc70e285a7065b8",
+        "baseline_name": "RadialSampler",
+        "current_name": "AzimuthalSampler"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "43bbbae65138829ce55b26ef4167eb5590bab1301d120840837c297d96c268a0",
+        "renamed_sha256": "0cf5aff3326e2ae0a294c540922b25ad7ace28a150156541ebaeb460c7986973",
+        "baseline_name": null,
+        "current_name": null
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "0b0b3e866339aa931c1cb8815d49540f7d7348ac794b9770d971ef02f8f42b62",
+        "renamed_sha256": "631b2ce483ee83044b19d6fa0b0be5fb9e481f6b8a11d971fe3cdb8dda40a24c",
+        "baseline_name": null,
+        "current_name": null
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "520f2be0eb824d2bb321c718283f840497707666ef9596050ff0688f400b4936",
+        "renamed_sha256": "3690fe249becbcf25f21393206a1c9248177c9d0388115e5d175cc30d5745fe8",
+        "baseline_name": null,
+        "current_name": null
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "8b8f72229e70cc1397939a6ba3163b4d54cd9651086b5c2fc4e227c7873e96a9",
+        "renamed_sha256": "7c3919be8421d4a50052310f3217482c153a8a2dc10718e5d953d8f8543491bd",
+        "baseline_name": "_radial_filter_offsets",
+        "current_name": "_azimuthal_filter_offsets"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "295b91a78c1868d43bac7b8c4554ab221b193e3fc7c5d1df6155b62f90e6f03e",
+        "renamed_sha256": "0e518d21320fa10d0d2d14afae88940fe8006c4e47cd09d6a4738d81e579d5d6",
+        "baseline_name": "_radial_filter_kernel",
+        "current_name": "_azimuthal_filter_kernel"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "534d27ad90177fc5c527e27ba1dbb9aaf5d1e0ddbbb859403b564f89e3300d08",
+        "renamed_sha256": "9039494bc4ac23c09d45faca3257da03583b5ce4d7eed61389b145083a0a9fdb",
+        "baseline_name": "choose_radial_exact_block_frames",
+        "current_name": "choose_azimuthal_exact_block_frames"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "8e967b0df33410397e96f86907bc48e134ef8af019c9d70dfb5882e1efaab641",
+        "renamed_sha256": "1b8a8dcb1aa8eb2aa3b68b725fd4503f23cc0345c9feff80fff80289982bb503",
+        "baseline_name": "_radial_sampler_flat_taps",
+        "current_name": "_azimuthal_sampler_flat_taps"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "b4157880ec44d7a36fd52041d4d26d280072e98849b7756172b5f90beb5f4f27",
+        "renamed_sha256": "44a7463aadc8e96c63f42e065665652f6740085f8af8310fd2a3852d6d10958c",
+        "baseline_name": "radial_oriented_stack_view",
+        "current_name": "azimuthal_oriented_stack_view"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "ed6360fa551908cea86443b82da6cec2673bbef0259e5e055528dd20cc783d06",
+        "renamed_sha256": "554fee9e20d29cbe722a59319e16a34fbca751ad8bcbdd97cd0b889266254a60",
+        "baseline_name": "_tilted_radial_row_centers",
+        "current_name": "_tilted_azimuthal_row_centers"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "c714a2b19c68b001c1c97ea3173eb36bf038e1a1faf3d061f890fe2b6ad7fb51",
+        "renamed_sha256": "252d5c40f87e899aefa8e320f392e797174b045ee5e4246ea9cfafd37f7991cb",
+        "baseline_name": "extract_tilted_radial_slice_frame",
+        "current_name": "extract_tilted_azimuthal_slice_frame"
+      },
+      {
+        "module": "geometry",
+        "baseline_sha256": "7971d05259012d2615747c9fb8af8bd5e7454f1a354624341bf0d32fc37dad82",
+        "renamed_sha256": "aa21a2315855a9cfb8bc3139fd0cda1c26ae9b58c4e12687c51bfbe66a266c3e",
+        "baseline_name": "get_view_frame_by_index",
+        "current_name": "get_view_frame_by_index"
+      },
+      {
+        "module": "interpolation",
+        "baseline_sha256": "225ccfafc2b01273762daff87a7b9e9d1b1aecaa5d29a0d1e65aabbc617822b8",
+        "renamed_sha256": "081283fc4da6bd7b3ccda855aed2ff70798e14aafb1e97fc351a6dcd9df2b38f",
+        "baseline_name": "_view_uses_interpolation",
+        "current_name": "_view_uses_interpolation"
+      },
+      {
+        "module": "runtime",
+        "baseline_sha256": "93b55cb41c4f0ca096bfcc9228c8a844f47225e16a42cff1dc5f566808d2a78a",
+        "renamed_sha256": "d56b149670e51ee902162e23ec0ff3a1ed9a0989ad0fa0668fb5a17dbe24fcf4",
+        "baseline_name": "_estimate_parent_view_postprocess_bytes",
+        "current_name": "_estimate_parent_view_postprocess_bytes"
+      },
+      {
+        "module": "workspace",
+        "baseline_sha256": "e8b56cf357063948a47536924ae668d2b9f1dfb6c714d0dc48c4663838f977a3",
+        "renamed_sha256": "0c5ee9b4784101686f40d71e5e5bf9350d84a6fcc1f94d24651602c44b80c22e",
+        "baseline_name": "radial_source_mode",
+        "current_name": "azimuthal_source_mode"
+      }
+    ]
+  }
 }

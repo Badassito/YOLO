@@ -19,7 +19,7 @@ Core behavior:
   - Applies Gaussian 3D mask smoothing when enabled for fully labeled volumes.
   - Cubic-resizes complete 3D volumes before view extraction.
   - Emits single-channel gray, triplicated RGB, or custom neighboring-slice
-    channel stacks for active transverse, sagittal, coronal, radial,
+    channel stacks for active transverse, sagittal, coronal, azimuthal,
     tilted-transverse, and tile variants.  Arbitrary-channel stacks are stored
     as multi-page TIFF with one grayscale page per channel; labels always come
     from the center slice.
@@ -169,19 +169,19 @@ from .pta_publication import (
 )
 from .pta_rendering import (
     DEFAULT_CHANNEL_VARIANT,
-    RADIAL_LANCZOS_A,
+    AZIMUTHAL_LANCZOS_A,
     AffineSpec,
     ChannelFormat,
     ChannelVariant,
-    RadialSampler,
+    AzimuthalSampler,
     RenderFrameSource,
     RenderPlan,
     RenderTileItem,
     TileConfig,
     TiltPlan,
     ViewInfo,
-    _RADIAL_CACHE,
-    _RADIAL_CACHE_LOCK,
+    _AZIMUTHAL_CACHE,
+    _AZIMUTHAL_CACHE_LOCK,
     _TILT_PLAN_CACHE,
     _TILT_PLAN_CACHE_LOCK,
     _require_pta_canonical_plan,
@@ -196,12 +196,12 @@ from .pta_rendering import (
     get_native_view_frame,
     get_native_view_image,
     get_native_view_mask,
-    get_radial_sampler,
+    get_azimuthal_sampler,
     get_tilt_plan,
     lanczos_kernel,
     lanczos_offsets,
     normalize_lanczos_weight_rows,
-    radial_extract_lanczos,
+    azimuthal_extract_lanczos,
     render_channel_formatted_images,
     render_full_and_optional_canvas,
     render_image_full_and_optional_canvas,
@@ -282,8 +282,9 @@ from .pta_scheduler import (
     split_work_batch as _split_gpu_work_batch,
 )
 from .unification.channels import resolve_channel_variants as resolve_v18_channel_variants
-from .workspace import radial_source_mode as _radial_source_mode
+from .workspace import azimuthal_source_mode as _azimuthal_source_mode
 from .unification.runtime import compile_physical_views
+from .unification.tta_manifest import radial_view_manifest_record, radial_view_plan_metadata
 from .unification.sampling import (
     build_forward_raster_plan,
     forward_sampling_execution_record,
@@ -1645,7 +1646,7 @@ def resize_to_approximately_cube(
 
 
 # ---------------------------------------------------------------------------
-# Geometry: views, radial sampling, affine transforms, tilted sampling
+# Geometry: views, azimuthal sampling, affine transforms, tilted sampling
 # ---------------------------------------------------------------------------
 
 
@@ -1653,7 +1654,9 @@ def adapt_shared_view(view: shared_geometry.ViewInfo) -> ViewInfo:
     """Expose a canonical TTA view to the unchanged PTA planner vocabulary."""
 
     physical_name = shared_geometry.physical_view_name(view)
-    if shared_geometry.is_radial_view(view):
+    if shared_geometry.is_azimuthal_view(view):
+        runtime_family = "azimuthal"
+    elif str(view.family) == "radial":
         runtime_family = "radial"
     elif shared_geometry.is_tilted_view(view):
         # The old token described only transverse tilts.  It is retained solely
@@ -1689,7 +1692,7 @@ def compile_v18_pta_views(
     h: int,
     w: int,
     config: object,
-    radial_native_raster: int,
+    azimuthal_native_raster: int,
 ) -> Tuple[List[ViewInfo], object]:
     """Compile PTA grouped requests with the exact shared TTA view compiler."""
 
@@ -1698,9 +1701,12 @@ def compile_v18_pta_views(
         height=int(h),
         width=int(w),
         cartesian_views=tuple(getattr(config, "cartesian_views")),
-        radial_requests=tuple(getattr(config, "radial_requests")),
+        azimuthal_requests=tuple(getattr(config, "azimuthal_requests")),
         tilted_groups=tuple(getattr(config, "tilted_groups")),
-        radial_native_raster=int(radial_native_raster),
+        azimuthal_native_raster=int(azimuthal_native_raster),
+        radial_requests=tuple(getattr(config, "radial_requests", ())),
+        radial_min_radius=getattr(getattr(config, "args", None), "radial_min_radius", None),
+        radial_patch_size=int(azimuthal_native_raster) if int(azimuthal_native_raster) > 0 else 3072,
     )
     return [adapt_shared_view(view) for view in compiled.views], compiled
 
@@ -1890,6 +1896,7 @@ def build_render_plan(
                 "runtime_view_id": str(view.name),
                 "runtime_job_id": str(tag),
                 "runtime_kind": "fullframe",
+                **radial_view_plan_metadata(view.shared_view),
             },
         )
 
@@ -1956,6 +1963,7 @@ def build_render_plan(
                         "tile_config_id": str(cfg.config_id),
                         "tile_x": int(x),
                         "tile_y": int(y),
+                        **radial_view_plan_metadata(view.shared_view),
                     },
                 )
             tile_items.append(RenderTileItem(
@@ -2319,7 +2327,8 @@ def _v18_view_manifest_record(view: ViewInfo) -> Dict[str, object]:
         "family": str(shared.family),
         "summary_family": str(shared.summary_family),
         "base_view": str(
-            shared.radial_base_view or shared.tilt_base_view or shared_geometry.physical_view_name(shared)
+            getattr(shared, "radial_base_view", "") or shared.azimuthal_base_view
+            or shared.tilt_base_view or shared_geometry.physical_view_name(shared)
         ),
         "num_slices": int(shared.num_slices),
         "source_raster_h_w": [int(shared.src_h), int(shared.src_w)],
@@ -2327,7 +2336,8 @@ def _v18_view_manifest_record(view: ViewInfo) -> Dict[str, object]:
         "azimuth_angles_deg": [float(value) for value in shared.azimuths_deg],
         "tilt_angle_deg": float(shared.tilt_angle_deg),
         "tilt_direction": str(shared.tilt_direction),
-        "radial_tilted_source": bool(shared.radial_tilted_source),
+        "azimuthal_tilted_source": bool(shared.azimuthal_tilted_source),
+        "radial_geometry": radial_view_manifest_record(shared),
     }
 
 
@@ -2495,7 +2505,7 @@ def write_v18_pta_manifest(
         + (("cpu", "categorical_ground_truth"),)
     )
     manifest = {
-        "schema": "pta-tta.v18.manifest.1",
+        "schema": "pta-tta.v20.manifest.1",
         "status": "complete",
         "pipeline_version": SCRIPT_VERSION,
         "mode": "pta",
@@ -2512,15 +2522,17 @@ def write_v18_pta_manifest(
             "requested_output_format": str(config.requested_output_format),
             "effective_output_format": str(config.effective_output_format),
             "cartesian_views": list(config.cartesian_views),
-            "radial_requests": [
+            "azimuthal_requests": [
                 {
                     "view": str(request.view),
                     "requested_azimuth_angle_deg": (
                         None if request.azimuth_angle is None else float(request.azimuth_angle)
                     ),
                 }
-                for request in config.radial_requests
+                for request in config.azimuthal_requests
             ],
+            "radial_requests": [str(request.view) for request in config.radial_requests],
+            "radial_min_radius": config.args.radial_min_radius,
             "tilted_groups": [
                 {
                     "views": list(group.views),
@@ -2581,14 +2593,16 @@ def write_v18_pta_manifest(
                 if cuda_intensity_selected
                 else "cpu"
             ),
-            "intensity_radial_filter": str(shared_geometry.RADIAL_FILTER_MODE),
+            "intensity_azimuthal_filter": str(shared_geometry.AZIMUTHAL_FILTER_MODE),
             "intensity_affine_filter": (
                 "cuda_grid_sample_bilinear_or_opencv_inter_linear_fallback"
                 if cuda_intensity_selected
                 else "opencv_inter_linear"
             ),
             "categorical_filter": "nearest_with_tilt_stack_threshold_0.5",
-            "radial_channel_boundary": "index_wrap_with_odd_crossing_mirror_u",
+            "azimuthal_channel_boundary": "index_wrap_with_odd_crossing_mirror_u",
+            "radial_channel_boundary": "clamp_radius_within_patch_trajectory",
+            "radial_patch_boundary": "periodic_azimuth_without_reflection; unsheared_height_padding_zero; zero_extended_source_taps",
             "prediction_interpolation": "not_applicable_to_pta",
         },
         "external_augmentation": {
@@ -3344,6 +3358,7 @@ def prepare_loaded_source(
         )
         disabled = [
             *(f"cartesian:{name}" for name in v18_config.cartesian_views if str(name) != "transverse"),
+            *(f"azimuthal:{request.view}" for request in v18_config.azimuthal_requests),
             *(f"radial:{request.view}" for request in v18_config.radial_requests),
             *(f"tilted:{','.join(group.views)}" for group in v18_config.tilted_groups),
         ]
@@ -3360,6 +3375,7 @@ def prepare_loaded_source(
         effective_config = replace(
             v18_config,
             cartesian_views=allowed_cartesian,
+            azimuthal_requests=(),
             radial_requests=(),
             tilted_groups=(),
         )
@@ -3368,15 +3384,15 @@ def prepare_loaded_source(
         h=int(h),
         w=int(w),
         config=effective_config,
-        radial_native_raster=int(args.imgsz),
+        azimuthal_native_raster=int(args.imgsz),
     )
     for request, diameter, spacing in zip(
-        effective_config.radial_requests,
-        compiled_views.radial_diameters,
-        compiled_views.radial_azimuth_angles,
+        effective_config.azimuthal_requests,
+        compiled_views.azimuthal_diameters,
+        compiled_views.azimuthal_azimuth_angles,
     ):
         print(
-            f"{src.stem}: shared TTA radial {request.view}, diameter={int(diameter)}, "
+            f"{src.stem}: shared TTA azimuthal {request.view}, diameter={int(diameter)}, "
             f"azimuth_angle={float(spacing):g} deg, hardware-linear intensity / nearest categorical"
         )
     native_partial_encoded_indices: Tuple[int, ...] = ()
@@ -4294,7 +4310,7 @@ def write_pta_summary(
     lines.append("Channel-stack discontinuity policy: a custom C...S... center is skipped when any required in-volume encoded image index is absent")
     lines.append("Stock Ultralytics multispectral compatibility target: version 8.3.112 or newer")
     lines.append(
-        "Shared forward sampling: TTA hardware-linear radial/intensity policy and "
+        "Shared forward sampling: TTA hardware-linear azimuthal/intensity policy and "
         "TTA affine stage; categorical ground truth uses nearest sampling with the "
         "TTA tilted-stack threshold"
     )
@@ -4393,15 +4409,23 @@ def write_pta_summary(
         lines.append("    active_views:")
         for v in rec.views:
             extra = ""
-            if v.family == "radial":
+            if v.family == "azimuthal":
                 spacing = float(v.azimuths_deg[1] - v.azimuths_deg[0]) if len(v.azimuths_deg) > 1 else 0.0
                 extra = (
                     f", azimuth_frames={len(v.azimuths_deg)}, azimuth_step={spacing:g}, "
-                    f"diameter={v.diameter}, image_sampling={shared_geometry.RADIAL_FILTER_MODE}, "
+                    f"diameter={v.diameter}, image_sampling={shared_geometry.AZIMUTHAL_FILTER_MODE}, "
                     "categorical_sampling=nearest"
                 )
             if v.family == "tilted_transverse":
                 extra = f", direction={v.tilt_direction}, signed_tilt={v.tilt_angle_deg:g}"
+            if v.family == "radial" and v.shared_view is not None:
+                shared = v.shared_view
+                extra = (
+                    f", shell_radii={list(shared.radial_radii)}, "
+                    f"arc_origin={shared.radial_arc_origin:g}, "
+                    f"height_origin={shared.radial_height_origin:g}, "
+                    f"periodic_patch={shared.radial_patch_size}"
+                )
             lines.append(f"      {v.display_name}: frames={int(v.num_slices)}, source_plane=({int(v.src_w)}x{int(v.src_h)}){extra}")
         lines.append("    rendered_output_sets:")
         for st in rec.render_stats:
@@ -5227,7 +5251,7 @@ def main(
                 retained,
             ):
                 cuda_family = family in {
-                    "cartesian", "upright-radial", "tilted-cartesian", "tilted-radial",
+                    "cartesian", "upright-azimuthal", "tilted-cartesian", "tilted-azimuthal",
                 }
                 backend_note = (
                     "resident CUDA when admitted; CPU fallback"

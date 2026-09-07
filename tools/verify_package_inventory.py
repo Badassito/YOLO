@@ -14,13 +14,17 @@ ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "XTA"
 MANIFEST = PACKAGE / "_package_inventory.json"
 
+# Pin the historical statements independently of the appended v20 review data.
+# Formatting or review metadata may change; statement names/hashes may not.
+IMMUTABLE_INVENTORY_STATEMENTS_SHA256 = '0c32fe9dcf8531e246e996cd276a010659f5564edb87f445b44dc7065147dfc5'
+
 # These definitions have reviewed, intentional implementation changes.
 INTENTIONALLY_CHANGED = {
     ("assembly", "materialize_interpolation_component_nrrd_view_layer"),
     ("assembly", "project_view_volume_to_orthogonal_volume"),
-    ("backprojection", "_backproject_cartesian_radial_generic"),
-    ("backprojection", "_backproject_tilted_radial_volume_to_volume"),
-    ("backprojection", "backproject_radial_volume_to_volume"),
+    ("backprojection", "_backproject_cartesian_azimuthal_generic"),
+    ("backprojection", "_backproject_tilted_azimuthal_volume_to_volume"),
+    ("backprojection", "backproject_azimuthal_volume_to_volume"),
     ("cuda_backend", "union_conf_volume_into_volume_inplace"),
     ("cuda_d1", "_d1_finalize_bitset_layer"),
     ("finalization", "_v14_apply_component_removal_plan"),
@@ -56,7 +60,7 @@ INTENTIONALLY_CHANGED = {
     ("topology", "label_foreground_volume_streaming"),
     ("backprojection", "_MainProcessGpuStageCoordinator"),
     ("backprojection", "_ResidentTensorRTRingExecutor"),
-    ("backprojection", "_radial_resident_backproject_kernel"),
+    ("backprojection", "_azimuthal_resident_backproject_kernel"),
     ("backprojection", "_resident_trt_pipeline_acquire"),
     ("backprojection", "_try_resident_trt_ring_accumulate"),
     ("backprojection", "HybridBackprojectionQueue"),
@@ -66,7 +70,7 @@ INTENTIONALLY_CHANGED = {
     ("config", "resolve_backend_precisions"),
     ("cuda_backend", "_GpuWorkerRenderEngine"),
     ("cuda_backend", "_fused_direct_render_kernels"),
-    ("cuda_backend", "_radial_slab_channel_renderer"),
+    ("cuda_backend", "_azimuthal_slab_channel_renderer"),
     ("cuda_d1", "_d1_backproject_kernels"),
     ("cuda_d1", "_d1_consume_device_union"),
     ("cuda_d1", "_D1WorkerViewState"),
@@ -85,7 +89,7 @@ INTENTIONALLY_CHANGED = {
     ("geometry", "build_view_frame_cache"),
     ("geometry", "dense_tile_positions"),
     ("geometry", "gpu_input_staging_ahead_sources"),
-    ("geometry", "get_radial_sampler"),
+    ("geometry", "get_azimuthal_sampler"),
     ("geometry", "make_dense_tile_channel_renderer"),
     ("geometry", "make_fullframe_channel_renderer"),
     ("geometry", "make_in_memory_yolo_source"),
@@ -104,7 +108,7 @@ INTENTIONALLY_CHANGED = {
     ("geometry", "write_aug_job_meta"),
     ("geometry", "write_dense_tile_job_meta"),
     ("geometry", "resolve_tile_configs"),
-    ("geometry", "extract_radial_slice_frame"),
+    ("geometry", "extract_azimuthal_slice_frame"),
     ("inference", "cpu_retina_masks_enabled"),
     ("inference", "PredictionAccumulationHandle"),
     ("inference", "_DeviceUnionAccumulator"),
@@ -180,7 +184,7 @@ INTENTIONALLY_CHANGED = {
     ("outputs", "nrrd_layer_output_suffix"),
     ("cuda_backend", "GpuRenderedYoloSource"),
     ("cuda_backend", "GpuTileRenderedYoloSource"),
-    ("cuda_backend", "_radial_slab_context_indices"),
+    ("cuda_backend", "_azimuthal_slab_context_indices"),
     ("workspace", "v1613_d1_pipeline_active"),
     ("workspace", "v1613_fast_bundle_active"),
     ("workspace", "available_anon_work_bytes"),
@@ -208,7 +212,7 @@ INTENTIONALLY_CHANGED_BINDINGS = {
     ("config", "9a8d538aa3d7fa8f8d2cf55e46f6ac5b31ff4bc6b5823d7bf242954e9055c6df"):
         "SAVE_OPTION_TOKENS",
     ("geometry", "a4f438f50fb19a43076e30f5f4b09acf5b68ca6487f501f2c51f2e2b4bd86623"):
-        "_RADIAL_SAMPLER_CACHE",
+        "_AZIMUTHAL_SAMPLER_CACHE",
 }
 
 # Functions that need to call back into a higher architectural layer carry this marker
@@ -222,113 +226,113 @@ LOCAL_IMPORT_SEAM_MARKER = "# Local import keeps the package dependency graph ac
 # AST, so pinning only the definition digest would still let a marker move to a different
 # already-existing local import without review.
 REVIEWED_LOCAL_IMPORT_SEAMS = {
-    ("assembly", "prepare_view_volume_after_fullframe"): (
-        "daf1c3a23c95665867ec79f21ff3c41562330bdde9671a3237a90258c365e6ad",
-        "322145486bb7f21b5f9ea590068bd323184072c7c7e9b2968473349950200ebe",
+    ('assembly', 'prepare_view_volume_after_fullframe'): (
+        '8c00e3949e69d5428f6bc946d11febbbd2763ce4acad285b378e9e960ea633f0',
+        '322145486bb7f21b5f9ea590068bd323184072c7c7e9b2968473349950200ebe',
     ),
-    ("assembly", "finalize_consolidated_tile_volume_for_parent"): (
-        "bc3ecd1d7d9f2d9e9f158a290d0e075bae85565b2b299cfe84f08b08ec7491a4",
-        "c955712cc1202c0be55b529d57026f25537c1d43e0e9c692ad6cdc85b3b913f5",
+    ('assembly', 'finalize_consolidated_tile_volume_for_parent'): (
+        'bc3ecd1d7d9f2d9e9f158a290d0e075bae85565b2b299cfe84f08b08ec7491a4',
+        'c955712cc1202c0be55b529d57026f25537c1d43e0e9c692ad6cdc85b3b913f5',
     ),
-    ("backprojection", "backproject_tilted_volume_to_volume"): (
-        "ae645bd53d368d0216171d90afe0bef10b7b1dd1dee80499b0eca6f0c8d49a9c",
-        "101a6fb2b4446cf0d71be4e025f1224cfecb863185f21e3482bfcfc9cf3a3231",
+    ('backprojection', 'backproject_tilted_volume_to_volume'): (
+        'ae645bd53d368d0216171d90afe0bef10b7b1dd1dee80499b0eca6f0c8d49a9c',
+        '101a6fb2b4446cf0d71be4e025f1224cfecb863185f21e3482bfcfc9cf3a3231',
     ),
-    ("cuda_backend", "_GpuWorkerRenderEngine"): (
-        "71d5808d4eace2b408d5983eaf082db7283433313f5920bd6650c49fafef13f4",
-        "ce39e44112e767b3cf804cf2f03ef9f687b475f5ec845105291193cd5554efd5",
+    ('cuda_backend', '_GpuWorkerRenderEngine'): (
+        'f3f2605d857dbbabe839f06c9a17bef2d89e6c47173fec85e8eb912f1005ced5',
+        'e25d3d3f292164aee026e8e9c8d49caf37a2be6241c7c36f65aca52d31d3bbf5',
     ),
-    ("geometry", "GpuPrefetchingYoloSource"): (
-        "d34ae87abc324d9aa32dd8906bad4d1ccb3cbab27bad863c4b1979404bfb5bc8",
-        "b230c59c54aa3f8c1c0efe9ffd6c4d6172f49531e530ce0a02acfc252c19a35d",
+    ('geometry', 'GpuPrefetchingYoloSource'): (
+        '1234b0ac1454e2d643e3688a7b94aab0510961d19ff4b0c91d4720f000568c17',
+        'b230c59c54aa3f8c1c0efe9ffd6c4d6172f49531e530ce0a02acfc252c19a35d',
     ),
-    ("geometry", "gpu_input_staging_enabled"): (
-        "3ac4bb523c36af4f98daf48f3153a3813cc9459f2aa879846459c4c3e3352e70",
-        "27c0b26fbbf4d1ccfa8a5af862a09cce91b81ea32d281a1b5301c84d4eb2876e",
+    ('geometry', 'gpu_input_staging_enabled'): (
+        '3ac4bb523c36af4f98daf48f3153a3813cc9459f2aa879846459c4c3e3352e70',
+        '27c0b26fbbf4d1ccfa8a5af862a09cce91b81ea32d281a1b5301c84d4eb2876e',
     ),
-    ("geometry", "gpu_input_staging_preflight_reserve"): (
-        "0fab02a75013aaff85c7b63328c518f3c2022e2de9fe8c5f64471b2a4cdde919",
-        "0dab677f37a32eea1b3a0138dcf73c6b876b41093fee8d61af77c89abbeb9699",
+    ('geometry', 'gpu_input_staging_preflight_reserve'): (
+        '0fab02a75013aaff85c7b63328c518f3c2022e2de9fe8c5f64471b2a4cdde919',
+        '0dab677f37a32eea1b3a0138dcf73c6b876b41093fee8d61af77c89abbeb9699',
     ),
-    ("geometry", "maybe_wrap_source_with_gpu_input_staging"): (
-        "496bf1060982040fb935f932af7624277ab7f4c8f8abe4f01f7864f1ab1f4213",
-        "28dda3f8902c87b048214bf8d3dd28f3117785ea42503b66e20db91056c6c2e2",
+    ('geometry', 'maybe_wrap_source_with_gpu_input_staging'): (
+        '496bf1060982040fb935f932af7624277ab7f4c8f8abe4f01f7864f1ab1f4213',
+        '28dda3f8902c87b048214bf8d3dd28f3117785ea42503b66e20db91056c6c2e2',
     ),
-    ("geometry", "ensure_ultralytics_accepts_in_memory_volume_source"): (
-        "60badc92d2dc2b6667dd10e4d14364d82fb8496c819c2e6a523682eca0802030",
-        "857b70aaccd5a89c0104cd8a7bb39fea7e92d30adc84025789fc7f03cfc81eb4",
+    ('geometry', 'ensure_ultralytics_accepts_in_memory_volume_source'): (
+        '60badc92d2dc2b6667dd10e4d14364d82fb8496c819c2e6a523682eca0802030',
+        '857b70aaccd5a89c0104cd8a7bb39fea7e92d30adc84025789fc7f03cfc81eb4',
     ),
-    ("geometry", "_materialize_prediction_volume_from_renderer"): (
-        "bb7809a0a676d84e97740ae2a38de8732cab4cea0c6a2c3b9b74ad41e1f7bf01",
-        "4a8cb9169fcfbc4bf1fa1658615d8f3ae1377e8ac32cc1aeaa65707f37e22cd3",
+    ('geometry', '_materialize_prediction_volume_from_renderer'): (
+        '134a732f44c0e24d20a4cd2bd779bb48b291088a4f56d0d71d009dc909de9da9',
+        '4a8cb9169fcfbc4bf1fa1658615d8f3ae1377e8ac32cc1aeaa65707f37e22cd3',
     ),
-    ("inference", "infer_yolo_model_input_channels"): (
-        "7e8d329f12766affd78ee938e593bb989e8535d157c375b143f4fbbeee1bec6c",
-        "d0e25f9ae060e0c7d74bece86ae3befb49f781d4a703061bb311fcb2c8d4f410",
+    ('inference', 'infer_yolo_model_input_channels'): (
+        '7e8d329f12766affd78ee938e593bb989e8535d157c375b143f4fbbeee1bec6c',
+        'd0e25f9ae060e0c7d74bece86ae3befb49f781d4a703061bb311fcb2c8d4f410',
     ),
-    ("inference", "predict_source_and_accumulate"): (
-        "2289ccc6dda3e1fb044716f8385b98fe83d4e83f6256bab0f0a19570a591b52a",
-        "ccf37e9656817910658d67d9c07dd114ce6eb29a820fda1bfa904ac246d955d8",
+    ('inference', 'predict_source_and_accumulate'): (
+        '6b3048e20bd43692dc08ba6ba9dd1e8db8ac6a6199cd60aff241a11a301f4fb4',
+        'ccf37e9656817910658d67d9c07dd114ce6eb29a820fda1bfa904ac246d955d8',
     ),
-    ("inference", "predict_source_and_submit_accumulation"): (
-        "a815666f85c4b0df61997937dea9279b32fe72b98afc1030727db1c3217c4838",
-        "1ce8d95596c7f073801ec32a1245bb5751595f1b3d6b5a2884063a126b89efdf",
+    ('inference', 'predict_source_and_submit_accumulation'): (
+        '025d1c3210be00b360d318306e71fcef8211d7ce116a43a77ca46a42dcead5eb',
+        '1ce8d95596c7f073801ec32a1245bb5751595f1b3d6b5a2884063a126b89efdf',
     ),
-    ("interpolation", "SliceComponentTableCache"): (
-        "fcb31853f671ae2dc0a8a7e9bada7e481186cd2b2d5c3369f803e850ff9bceab",
-        "29f4bad74e6bec994ef8fa59ab290dcb079b0a5ae918342c108b472e66ab66ab",
+    ('interpolation', 'SliceComponentTableCache'): (
+        'fcb31853f671ae2dc0a8a7e9bada7e481186cd2b2d5c3369f803e850ff9bceab',
+        '29f4bad74e6bec994ef8fa59ab290dcb079b0a5ae918342c108b472e66ab66ab',
     ),
-    ("interpolation", "_find_slice_projection_candidates_numba"): (
-        "cbeebf1855fd025de032082a83f62ed77b1120e6e16bdeba779c4f0badfc8e29",
-        "7fbd6e38c3db9d3821d9622ed891b1b7fbfe0f838c27de910d0944c749cfdcda",
+    ('interpolation', '_find_slice_projection_candidates_numba'): (
+        'cbeebf1855fd025de032082a83f62ed77b1120e6e16bdeba779c4f0badfc8e29',
+        '7fbd6e38c3db9d3821d9622ed891b1b7fbfe0f838c27de910d0944c749cfdcda',
     ),
-    ("interpolation", "_find_slice_projection_candidates_python"): (
-        "2964a4a06f74b43fbdca643ab9663fd3332fa8f854a2ae69f3fae162a7775dc0",
-        "94740a539572d09297cb90016159014fc849ececb6d5c529e605783041542bfd",
+    ('interpolation', '_find_slice_projection_candidates_python'): (
+        '2964a4a06f74b43fbdca643ab9663fd3332fa8f854a2ae69f3fae162a7775dc0',
+        '94740a539572d09297cb90016159014fc849ececb6d5c529e605783041542bfd',
     ),
-    ("interpolation", "_build_slice_endpoint_seeds"): (
-        "395fce80fd60d367237ff7400ed4a8ff1f3d27774e9ccdec8e3f3bdab1e89757",
-        "126545d0d25722c4df5918428643130e3c6a1eb639a0c61476fd7a259ad57cdf",
+    ('interpolation', '_build_slice_endpoint_seeds'): (
+        'bf29b06e72824fa78871fe502eb7ea79057bd352138dbf90bda55ca62f0d30ae',
+        '126545d0d25722c4df5918428643130e3c6a1eb639a0c61476fd7a259ad57cdf',
     ),
-    ("interpolation", "interpolate_view_volume_pass_inplace"): (
-        "0c91e9acd48ec2d9b7470e9b8143b0a77329ac59ecb01428288055595934e2b6",
-        "0a585dbad86412327820dccb21e479e86057fa65bb0ae01a016b198238a3f661",
+    ('interpolation', 'interpolate_view_volume_pass_inplace'): (
+        '0c91e9acd48ec2d9b7470e9b8143b0a77329ac59ecb01428288055595934e2b6',
+        '0a585dbad86412327820dccb21e479e86057fa65bb0ae01a016b198238a3f661',
     ),
-    ("interpolation", "RawBBoxMaskStore"): (
-        "5e076700cb529dfbbb7a0e6bb7f7b582249b312252ab7510afe9da701402aa0a",
-        "a19c94672d63a393b3a647ec73bba9da4791667f7b0082fa9f739ee56c50d16c",
+    ('interpolation', 'RawBBoxMaskStore'): (
+        '5e076700cb529dfbbb7a0e6bb7f7b582249b312252ab7510afe9da701402aa0a',
+        'a19c94672d63a393b3a647ec73bba9da4791667f7b0082fa9f739ee56c50d16c',
     ),
-    ("media", "resolve_radial_azimuth_angles"): (
-        "938f099878fc06c1be11510b28e23a799ab12ff42f496cc4e54f0126fc80541f",
-        "8d5afec87722d10ab7ef8bbc7606ce19d0bdae2fd6e68cf91fe3cd23ec5d77ca",
+    ('media', 'resolve_azimuthal_azimuth_angles'): (
+        'be46c0979af4d4395c6538c789df7ca43659c4c5f66b01175d0e9fafb7117087',
+        '94f8c4ba510aa3756118ce2ae981a3ce25f3d6eebc81c2b096045efe004b6b12',
     ),
-    ("runtime", "gpu_worker_default_seconds_per_frame"): (
-        "8a1c116c3636a5c90ea5f13260fad70cd2360f8dc703fe079e5209f0f8e1948c",
-        "efe66c8507863ddaabdad07859530397e9d25215132e7b9c854a6260bfe1281c",
+    ('runtime', 'gpu_worker_default_seconds_per_frame'): (
+        'cbdc743efad682f4c852ac135af8a38a9c3a85103499dfdedd36f92dbe0618d6',
+        '8417466843f56b5afeaeef3a2d20fd67a91a90b0355438581bb5b2eadb1f7623',
     ),
-    ("runtime", "gpu_worker_task_cost_key"): (
-        "7a962f913cbd65ea9efcf961dc0c240d9b4ec53048f5422c071259ae1b6928a6",
-        "bdd65ef45ec484d03fe3b3521df8ef368fde4d34eb9eeaa88529aedb4dd85082",
+    ('runtime', 'gpu_worker_task_cost_key'): (
+        'f98176aac67c05de805593dccc266ab9e6f595c2989a180d638cb2948f05f552',
+        '96f2a949e6948895eba3a583fa9f3da197a532674e991b8f98b921a196bff5ea',
     ),
-    ("runtime", "cpu_inference_supports_view"): (
-        "832bf116476c2bd39211d1d7232ca1b6d18bbe7d084445c3caa5809bb284e0d0",
-        "3c719dcf6dbaac2ea8151cbf0f55b27f848103316013a3aa0b26a8b24ba7439a",
+    ('runtime', 'cpu_inference_supports_view'): (
+        'ef761cc4da5ee4ba113200b9985d925659139b97d4d8c67201f0c8ffb989aa2a',
+        '2175b73531245efd35fd7b3ffef54a31b2eba271bb82f19d9a1f710796bd3c2f',
     ),
-    ("runtime", "cpu_inference_task_priority"): (
-        "bad6fb69cdc53cbb9b104e739de56a99392093d5c8b16666d6687a9cdb133090",
-        "50a97e164a4f6a098fbf7e773de161a7a1ad4a8ce05c9c37f286606a965df3bb",
+    ('runtime', 'cpu_inference_task_priority'): (
+        'cff4f59a9287337a997965bbfb9a63ebc1c1c1bd252cf11318317736d347c144',
+        '50a97e164a4f6a098fbf7e773de161a7a1ad4a8ce05c9c37f286606a965df3bb',
     ),
-    ("runtime", "_interpolation_process_entry"): (
-        "83c1a7c9b379a384e2d285231ec33dbc595870b09e793b62be7fc8baaf0bff91",
-        "babab2eb1d231e00bab18c5e3d624b34d92401f4a0fadd98b03035b6d38e0775",
+    ('runtime', '_interpolation_process_entry'): (
+        '83c1a7c9b379a384e2d285231ec33dbc595870b09e793b62be7fc8baaf0bff91',
+        'babab2eb1d231e00bab18c5e3d624b34d92401f4a0fadd98b03035b6d38e0775',
     ),
-    ("runtime", "interpolate_view_volume_pass_maybe_process"): (
-        "a2dcd962f43b127ff4e54748657b4c78e8f1b902239389ebcc33ff82d1fad5e8",
-        "fa8ba3a3af40efa0605c8b9e41e422281719adee141eeb6376b2e589eb88b213",
+    ('runtime', 'interpolate_view_volume_pass_maybe_process'): (
+        '00604305e8c8b8fab50881a1bc8a3e41b9265bd7a3d58515619527622e499f92',
+        'fa8ba3a3af40efa0605c8b9e41e422281719adee141eeb6376b2e589eb88b213',
     ),
-    ("topology", "_try_label_slices_stage_a_gpu"): (
-        "6dce9807e442982e580688a8466cb4076b7cf5d22db2599d943ac51b915aceff",
-        "79f6cfde9d6e366582897499240cf9ea21081d92328d16c658d9113891e0004e",
+    ('topology', '_try_label_slices_stage_a_gpu'): (
+        '6dce9807e442982e580688a8466cb4076b7cf5d22db2599d943ac51b915aceff',
+        '79f6cfde9d6e366582897499240cf9ea21081d92328d16c658d9113891e0004e',
     ),
 }
 
@@ -371,7 +375,7 @@ INTENTIONALLY_REMOVED = {
     ("config", "479a50756ba923fbe000d52aad5dea92511533a044b7903224de6715fd9301a7"):
         "variant_nrrd_stem",
     ("config", "e9cbdca394845cae9bdb26ad2d5cdfd5dea831d31b29c8b305e97300328760ee"):
-        "RADIAL_TEXTURE_VARIANT_LABEL",
+        "AZIMUTHAL_TEXTURE_VARIANT_LABEL",
     ("config", "813fa551257393b30cd4587ca2fdfa2de5cf42351be75a57f94c0e03f0b210ca"):
         "resolve_save_options",
     ("config", "071ba93675e9d91466da964da542560b322ea80c4498c011939bd24ebacca524"):
@@ -413,6 +417,67 @@ INTENTIONALLY_PRUNED_REPLACEMENTS = {
         ),
 }
 
+# v20 additions to formerly preserved definitions are pinned individually. These
+# are semantic changes, never accepted by the mechanical Azimuthal rename map.
+# Key: immutable (module, baseline AST digest). Value: current name/digest/reason.
+REVIEWED_V20_STATEMENT_REPLACEMENTS = {
+    ('geometry', 'c8e5256bd662acf22cc3768a96593fce8084353e0c54c2bb00f80c64d771075a'): (
+        'ViewInfo',
+        '698023677c765317066783bf66b23a0d618d2cc37b315ffe8148255c0124306a',
+        'Distinct shell trajectory fields retain azimuthal metadata and provide explicit radius/patch coordinates.',
+    ),
+    ('geometry', '7032646b8c76f03c753731ba4ae6b573a3b2c999679b88c411b778834c1c0992'): (
+        'get_view_infos',
+        'f77b27e9a095317082509cb8bd88f5a98dd561d3818ae74a351340ed9511c116',
+        'Compile shell requests after unchanged existing view-family order.',
+    ),
+    ('geometry', '7971d05259012d2615747c9fb8af8bd5e7454f1a354624341bf0d32fc37dad82'): (
+        'get_view_frame_by_index',
+        '9459aacb1f573c141b78224b6ca3be8596dabe93050f9e74574e04143cfca6d0',
+        'Dispatch new radial trajectories through bounded native shell rendering after source readiness.',
+    ),
+    ('cuda_backend', 'c8972e4acbdde22a8fe221daae7d343900a8d4862710528e4643374ca19093b7'): (
+        '_fused_preflight_family',
+        '7543d6727bbe5978c32a0e2f978f9560c83beb092fa334e6b9b98aacd687f6b4',
+        'Exclude shell views from fused kernels that only understand Cartesian and angular planes.',
+    ),
+    ('finalization', 'fd81cf9fc0a5587f79c19bbb789f2ee537872fa0bbbbeeda884375ee660b75c3'): (
+        '_v14_sample_one_normal_section',
+        '9f05a7abde1d13bd2fd201fd4f7cebd2c830c089178e6deac61901083a8347b4',
+        'Use the physical radial_distance variable name; square-root and annulus arithmetic are unchanged.',
+    ),
+    ('interpolation', '225ccfafc2b01273762daff87a7b9e9d1b1aecaa5d29a0d1e65aabbc617822b8'): (
+        '_view_uses_interpolation',
+        'bef22390c1d652d4e07a88261acd5ea5d16685f4c11517e7aad08e87e46e2ff5',
+        'Allow interpolation within independent radial radius stacks.',
+    ),
+    ('cuda_d1', 'c476ceeb33c77a59a0833f212f1a773eaf632c11819693121f46eb762742ebbc'): (
+        '_d1_view_family_ids',
+        'e9c75f246b0b9b6102d6758f0c917ef9ea0de1a1a997bfd7716b047e74ff43df',
+        'Reject shell views at the incompatible D1 kernel boundary; native union projection handles them.',
+    ),
+    ('inference', '58b9a7e4a8df5eba9cd5a011380d1baae25576338d2ecad05669ba8f3882a571'): (
+        '_build_direct_device_compacted_payload',
+        '01022e9cde7573fbd0883364c2aefde85cce82dffa0020cb4962cdb815f02324',
+        'Match the generic compact CUDA kernel eight-argument signature with image height, width and null optional bounding boxes; required by shell inference.',
+    ),
+    ('geometry', 'e0203b6d1f34c8f3463b5a344c6e7b40a22d6fe2ba67552bf9323b20ea9b59f9'): (
+        'view_output_token',
+        'd4b65eef0239cccad875fc7906131975aea307b033653b6d982c4a864a00002c',
+        'Give upright and tilted shell patches distinct filename-safe Radial output tokens retaining patch indices.',
+    ),
+    ('runtime', '105ed98db9ab4f6929a3244915a10ed1a3c14104f15068420e44bb9c89fa5b50'): (
+        '_sched_setaffinity_all_threads',
+        '0f11d5b4d48f7454adcb92d28c0cd2872e50481f0a1556c33f3405783afec7f4',
+        'Dispatch Windows to a verified process/thread affinity implementation with rollback; preserve the Linux affinity implementation.',
+    ),
+    ('inference', '9931df03e8cd8b9142d3ab7cae0b896ed054b3648fd9700fa2fe7149fe2be16b'): (
+        '_split_segmentation_backend_outputs',
+        '1ca4b7224262330ee4bc332ca2f16571a87fdb0abbde91321edb17ce60a38ce7',
+        'Accept the measured current Ultralytics PyTorch ((head, prototype), auxiliary dict) segmentation layout while retaining flat exported and legacy tuple outputs; reject unsupported tensor dimensions.',
+    ),
+}
+
 
 def stable_ast_dump(node: ast.AST) -> str:
     """Serialize an AST without Python 3.13's default empty-field elision."""
@@ -428,6 +493,39 @@ def stable_ast_dump(node: ast.AST) -> str:
 def digest(node: ast.AST) -> str:
     normalized = stable_ast_dump(node)
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def current_baseline_name(name: object) -> object:
+    """Map historical declaration names only; never normalize current source ASTs.
+
+    The old Radial family became Azimuthal in v20. New Radial shell definitions
+    must not satisfy those historical statements merely by reusing their names.
+    """
+    if not isinstance(name, str):
+        return name
+    return name.replace('radial', 'azimuthal').replace('Radial', 'Azimuthal').replace('RADIAL', 'AZIMUTHAL')
+
+
+def azimuthal_rename_replacements(manifest: dict[str, object]) -> dict[tuple[str, str], str]:
+    """Validate exact baseline-to-rename AST hash pairs, retaining all original hashes."""
+    statements = manifest['statements']
+    baseline = {(str(item['module']), str(item['sha256'])): item for item in statements}
+    review = manifest.get('v20_azimuthal_rename', {})
+    replacements = {}
+    for item in review.get('statements', []):
+        key = (str(item['module']), str(item['baseline_sha256']))
+        if key not in baseline:
+            raise RuntimeError(f'Azimuthal rename references an absent immutable statement: {key!r}')
+        if key in replacements:
+            raise RuntimeError(f'duplicate Azimuthal rename review: {key!r}')
+        original_name = baseline[key].get('name')
+        if item.get('baseline_name') != original_name or item.get('current_name') != current_baseline_name(original_name):
+            raise RuntimeError(f'Azimuthal rename declaration identity mismatch: {key!r}')
+        replacement = str(item['renamed_sha256'])
+        if len(replacement) != 64 or any(character not in '0123456789abcdef' for character in replacement):
+            raise RuntimeError(f'invalid reviewed Azimuthal AST digest: {key!r}')
+        replacements[key] = replacement
+    return replacements
 
 
 def reviewed_local_import_seams(
@@ -532,6 +630,12 @@ def reviewed_local_import_seams(
 
 def main() -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    baseline_digest = hashlib.sha256(json.dumps(
+        manifest['statements'], sort_keys=True, separators=(',', ':'),
+    ).encode('utf-8')).hexdigest()
+    if baseline_digest != IMMUTABLE_INVENTORY_STATEMENTS_SHA256:
+        raise RuntimeError('immutable inventory digest mismatch; retain historical statement records and add explicit reviews')
+    rename_replacements = azimuthal_rename_replacements(manifest)
 
     available: dict[str, Counter[str]] = {}
     trees: dict[str, ast.Module] = {}
@@ -579,6 +683,13 @@ def main() -> None:
             "reviewed changed-binding entries are absent from the immutable inventory: "
             f"{untracked_changed_bindings!r}"
         )
+    untracked_v20 = sorted(set(REVIEWED_V20_STATEMENT_REPLACEMENTS) - inventory_keys)
+    if untracked_v20:
+        raise RuntimeError(f'v20 replacement reviews are absent from the immutable inventory: {untracked_v20!r}')
+    for (module, _baseline_hash), (name, replacement_hash, reason) in REVIEWED_V20_STATEMENT_REPLACEMENTS.items():
+        matches = [node for node in top_level[module] if getattr(node, 'name', None) == name]
+        if not reason or len(matches) != 1 or digest(matches[0]) != replacement_hash:
+            raise RuntimeError(f'v20 reviewed definition changed or is missing: {module}.{name}')
     untracked_pruning = sorted(
         (set(INTENTIONALLY_REMOVED) | set(INTENTIONALLY_PRUNED_REPLACEMENTS))
         - inventory_keys
@@ -688,7 +799,7 @@ def main() -> None:
     removed = 0
     for item in manifest["statements"]:
         module = str(item["module"])
-        name = item.get("name")
+        name = current_baseline_name(item.get("name"))
         statement_hash = str(item["sha256"])
         inventory_key = (module, statement_hash)
         if inventory_key in INTENTIONALLY_REMOVED:
@@ -696,6 +807,11 @@ def main() -> None:
             continue
         if inventory_key in INTENTIONALLY_PRUNED_REPLACEMENTS:
             replacement_hash, _removed_name = INTENTIONALLY_PRUNED_REPLACEMENTS[inventory_key]
+            available[module][replacement_hash] -= 1
+            changed += 1
+            continue
+        if inventory_key in REVIEWED_V20_STATEMENT_REPLACEMENTS:
+            _name, replacement_hash, _reason = REVIEWED_V20_STATEMENT_REPLACEMENTS[inventory_key]
             available[module][replacement_hash] -= 1
             changed += 1
             continue
@@ -707,10 +823,11 @@ def main() -> None:
             changed += 1
             continue
         destination = INTENTIONALLY_RELOCATED.get((module, statement_hash), module)
-        if available[destination][statement_hash] < 1:
+        expected_hash = rename_replacements.get(inventory_key, statement_hash)
+        if available[destination][expected_hash] < 1:
             missing.append(item)
             continue
-        available[destination][statement_hash] -= 1
+        available[destination][expected_hash] -= 1
         preserved += 1
 
     if missing:

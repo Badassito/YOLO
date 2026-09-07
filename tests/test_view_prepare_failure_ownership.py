@@ -209,7 +209,7 @@ class ViewPrepareFailureOwnershipTests(unittest.TestCase):
 
 
 class ProjectionReservationTests(unittest.TestCase):
-    def test_radial_reservation_includes_target_maps_and_matches_fullframe_eligibility(self):
+    def test_azimuthal_reservation_includes_target_maps_and_matches_fullframe_eligibility(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary)
             (path / 'meta.json').write_text(json.dumps({'shape': [6, 3, 4]}), encoding='utf-8')
@@ -219,8 +219,8 @@ class ProjectionReservationTests(unittest.TestCase):
                              GIB=1024, component_projection_queue=queue)
             submit = _function(Path(pipeline.__file__).read_text(encoding='utf-8'),
                                '_submit_component_projection', namespace)
-            view = SimpleNamespace(family='radial', full_t=3, full_h=4, full_w=5,
-                                   num_slices=6, tta_angle_deg=15, physical_view_name='radial_transverse')
+            view = SimpleNamespace(family='azimuthal', full_t=3, full_h=4, full_w=5,
+                                   num_slices=6, tta_angle_deg=15, physical_view_name='azimuthal_transverse')
             submit(path, view=view, added_voxels=3, source='fullframe')
             expected = 30 * 40 * ((50 + 7) // 8) + 16 * (40 * 50) + 1024
             self.assertEqual(queue.submit.call_args.kwargs['working_bytes'], expected)

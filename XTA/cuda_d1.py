@@ -29,13 +29,14 @@ import numpy as np
 
 from .geometry import (
     ViewInfo,
+    is_azimuthal_view,
     is_radial_view,
-    is_tilted_radial_view,
+    is_tilted_azimuthal_view,
     is_tilted_view,
     physical_view_name,
     pretty_view_name,
-    radial_base_view_name,
-    radial_stack_length,
+    azimuthal_base_view_name,
+    azimuthal_stack_length,
     tilted_base_view_name,
     tilted_stack_axis_length,
 )
@@ -424,7 +425,7 @@ def _d1_backproject_kernels() -> object:
       float stack = (float)slice_index;
 
       if (family_id == 2) {
-        // Radial mask axes are (stack row, diameter sample); slice_index is azimuth.
+        // Azimuthal mask axes are (stack row, diameter sample); slice_index is azimuth.
         float line = view_w > 1
             ? -roi_radius + (2.0f * roi_radius) * (native_x / (float)(view_w - 1))
             : -roi_radius;
@@ -617,14 +618,16 @@ def _shutdown_d1_worker_pipeline() -> None:
 def _d1_view_family_ids(view: ViewInfo) -> Tuple[int, int, int, float, int, float, float]:
     """Return family/base/direction/shear/stack/center metadata for the CUDA kernel."""
     if is_radial_view(view):
+        raise ValueError('D1 source-space kernels do not support Radial shells; use native union projection')
+    if is_azimuthal_view(view):
         family_id = 2
-        base = radial_base_view_name(view)
-        tilted = bool(is_tilted_radial_view(view))
+        base = azimuthal_base_view_name(view)
+        tilted = bool(is_tilted_azimuthal_view(view))
         direction = str(view.tilt_direction or 'vertical')
         tan_tilt = (
             math.tan(math.radians(float(view.tilt_angle_deg))) if tilted else 0.0
         )
-        stack_len = int(radial_stack_length(view))
+        stack_len = int(azimuthal_stack_length(view))
         center_x = float(view.center_x)
         center_y = float(view.center_y)
     elif is_tilted_view(view):
@@ -659,6 +662,8 @@ def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionA
     view = task.get('view')
     if not isinstance(view, ViewInfo):
         raise TypeError('D1 task is missing ViewInfo metadata')
+    if is_radial_view(view):
+        raise ValueError('D1 source-space kernels do not support Radial shells; use native union projection')
     key = (str(task.get('model_name', '')), str(view.name))
     output_shape = tuple(int(v) for v in task.get('d1_output_shape', ()))
     if len(output_shape) != 3 or any(int(v) <= 0 for v in output_shape):
@@ -769,13 +774,13 @@ def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionA
             bitset = torch.zeros(
                 (int(word_count),), dtype=torch.int32, device=accumulator.device,
             )
-        if is_radial_view(view):
+        if is_azimuthal_view(view):
             radians = np.deg2rad(
                 np.ascontiguousarray(np.asarray(view.azimuths_deg, dtype=np.float32)).astype(np.float64)
             ).astype(np.float32)
             if int(radians.size) != int(view.num_slices):
                 raise RuntimeError(
-                    f'D1 Radial angle table has {int(radians.size)} entries for '
+                    f'D1 Azimuthal angle table has {int(radians.size)} entries for '
                     f'{int(view.num_slices)} slices'
                 )
             angle_cos = kernels.cp.asarray(np.ascontiguousarray(np.cos(radians), dtype=np.float32))
@@ -1182,7 +1187,7 @@ def _validate_d1_group_artifacts(
     # Coalescing must yield one complete view-depth interval.  This catches gaps and
     # duplicate ownership before any destructive reduction begins.
     if normalized != ((0, int(first.output_shape[0])),):
-        # D1 view depth can differ from output/source depth for orthogonal and radial
+        # D1 view depth can differ from output/source depth for orthogonal and azimuthal
         # geometry.  Artifacts therefore cover view slices, whose maximum is encoded by
         # their collectively contiguous range rather than output_shape[0].
         if not normalized or normalized[0][0] != 0 or len(normalized) != 1:

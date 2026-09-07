@@ -67,7 +67,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
                 "dataset",
                 "--enable_cartesian",
                 "transverse,sagittal",
-                "--enable_radial",
+                "--enable_azimuthal",
                 "transverse:60",
                 "--enable_tilted",
                 "coronal:15:horizontal",
@@ -79,7 +79,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             h=6,
             w=7,
             config=config,
-            radial_native_raster=8,
+            azimuthal_native_raster=8,
         )
 
         self.assertEqual(len(adapted), len(compiled.views))
@@ -88,9 +88,9 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             self.assertIs(pta_view.shared_view, shared_view)
             self.assertEqual(pta_view.name, shared_view.name)
             self.assertEqual(pta_view.num_slices, shared_view.num_slices)
-        radial = [view for view in adapted if view.family == "radial"]
-        self.assertTrue(radial)
-        self.assertEqual(radial[0].azimuths_deg, (0.0, 60.0, 120.0))
+        azimuthal = [view for view in adapted if view.family == "azimuthal"]
+        self.assertTrue(azimuthal)
+        self.assertEqual(azimuthal[0].azimuths_deg, (0.0, 60.0, 120.0))
 
     def test_fullframe_intensity_and_categorical_outputs_delegate_to_tta(self) -> None:
         config = parse_pta_args(
@@ -101,7 +101,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             h=4,
             w=5,
             config=config,
-            radial_native_raster=6,
+            azimuthal_native_raster=6,
         )
         view = views[0]
         aff = pta.build_affine(
@@ -152,6 +152,38 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
         self.assertEqual(mask_render.call_args.kwargs["output_height"], 6)
         self.assertEqual(mask_render.call_args.kwargs["output_width"], 6)
 
+    def test_radial_shell_patches_are_parent_views_before_optional_tiles(self) -> None:
+        config = parse_pta_args([
+            "--input", "dataset", "--enable_radial", "transverse",
+            "--imgsz", "8", "--radial_min_radius", "1.5", "--enable_tile", "4:4",
+        ])
+        views, compiled = pta.compile_v18_pta_views(
+            t_dim=10, h=11, w=13, config=config, azimuthal_native_raster=8,
+        )
+        self.assertEqual(compiled.radial_targets, ("transverse",))
+        self.assertGreater(len(views), 1)
+        for view in views:
+            self.assertEqual(view.family, "radial")
+            self.assertEqual((view.src_h, view.src_w), (8, 8))
+            self.assertEqual(view.num_slices, len(view.shared_view.radial_radii))
+        view = views[0]
+        aff = pta.build_affine(8, 8, 0.0, view.pad_mode, 8, shared_view=view.shared_view)
+        with tempfile.TemporaryDirectory() as temporary:
+            plan = pta.build_render_plan(
+                view=view, aff=aff, tag=view.name, out_dir=Path(temporary), stem="sample",
+                tile_configs=(pta.TileConfig(4, 4, "s4_st4"),),
+                save_overlay=False, imgsz=8, label_enabled=True,
+                publish_images=False, publish_labels=False,
+            )
+        self.assertEqual(len(plan.tile_layout), 4)
+        expected_radii = list(view.shared_view.radial_radii)
+        self.assertEqual(plan.canonical_plan.metadata["radial_shell"]["radial_radii"], tuple(expected_radii))
+        for tile in plan.tile_layout:
+            self.assertIsNotNone(tile.canonical_plan.tile_layout)
+            self.assertEqual(tile.canonical_plan.physical_view_id, plan.canonical_plan.physical_view_id)
+            self.assertEqual(tile.canonical_plan.metadata["radial_shell"]["radial_radii"], tuple(expected_radii))
+            self.assertEqual((tile.out_w, tile.out_h), (8, 8))
+
     def test_native_size_fullframe_uses_shared_grid_renderers(self) -> None:
         config = parse_pta_args(
             ["--input", "dataset", "--enable_cartesian", "transverse"]
@@ -161,7 +193,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             h=4,
             w=5,
             config=config,
-            radial_native_raster=0,
+            azimuthal_native_raster=0,
         )
         view = views[0]
         aff = pta.build_affine(
@@ -250,7 +282,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             h=4,
             w=4,
             config=config,
-            radial_native_raster=4,
+            azimuthal_native_raster=4,
         )
         view = views[0]
         aff = pta.build_affine(
@@ -340,16 +372,16 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             self.assertEqual(mask.shape, (tile.out_h, tile.out_w))
             self.assertLessEqual(set(np.unique(mask).tolist()), {0, 1})
 
-    def test_radial_custom_channels_use_shared_wrap_and_mirror_addresses(self) -> None:
+    def test_azimuthal_custom_channels_use_shared_wrap_and_mirror_addresses(self) -> None:
         config = parse_pta_args(
-            ["--input", "dataset", "--enable_radial", "transverse:60"]
+            ["--input", "dataset", "--enable_azimuthal", "transverse:60"]
         )
         views, _compiled = pta.compile_v18_pta_views(
             t_dim=3,
             h=4,
             w=5,
             config=config,
-            radial_native_raster=0,
+            azimuthal_native_raster=0,
         )
         view = views[0]
         aff = pta.build_affine(
@@ -372,7 +404,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             plan = pta.build_render_plan(
                 view=view,
                 aff=aff,
-                tag="radial_C3S1",
+                tag="azimuthal_C3S1",
                 out_dir=Path(temp_dir),
                 stem="sample",
                 tile_configs=(),
@@ -390,9 +422,9 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
                 source_idx: int,
                 _aff: pta.AffineSpec,
                 *,
-                mirror_radial_u: bool = False,
+                mirror_azimuthal_u: bool = False,
             ) -> np.ndarray:
-                value = int(source_idx) + (100 if mirror_radial_u else 0)
+                value = int(source_idx) + (100 if mirror_azimuthal_u else 0)
                 return np.full((_aff.out_h, _aff.out_w), value, dtype=np.uint8)
 
             with mock.patch.object(
@@ -637,7 +669,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
                 "dataset",
                 "--enable_cartesian",
                 "transverse,sagittal",
-                "--enable_radial",
+                "--enable_azimuthal",
                 "transverse:60",
                 "--channel_format",
                 "C3S1",
@@ -927,7 +959,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
         arguments = [
             "--input",
             "dataset",
-            "--enable_radial",
+            "--enable_azimuthal",
             "transverse:60",
             "--channel_format",
             "C3S1",
@@ -944,7 +976,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             h=4,
             w=5,
             config=config,
-            radial_native_raster=0,
+            azimuthal_native_raster=0,
         )
         channel_variants = pta.expand_channel_variants(
             pta.resolve_channel_formats(runtime_options.channel_format)
@@ -1015,7 +1047,7 @@ class PtaGeometryIntegrationTests(unittest.TestCase):
             )
             voxel = json.loads(voxel_path.read_text())
 
-        self.assertEqual(manifest["pipeline_version"], "19.0.4")
+        self.assertEqual(manifest["pipeline_version"], "20.0.0")
         self.assertEqual(manifest["mode"], "pta")
         self.assertEqual(
             manifest["determinism_contract"],

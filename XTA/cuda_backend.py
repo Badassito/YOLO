@@ -36,7 +36,7 @@ from .workspace import (
     _env_float,
     _env_int,
     _tilted_grid_is_identity,
-    radial_source_mode,
+    azimuthal_source_mode,
     tilted_inplane_linear_enabled,
 )
 from .runtime import (
@@ -50,9 +50,9 @@ from .geometry import (
     ChannelFormattedFrameRenderer,
     DenseTileJob,
     GpuPrefetchedYoloBatch,
-    RADIAL_FILTER_LABEL,
-    RADIAL_FILTER_MODE,
-    RADIAL_FILTER_TAP_COUNT,
+    AZIMUTHAL_FILTER_LABEL,
+    AZIMUTHAL_FILTER_MODE,
+    AZIMUTHAL_FILTER_TAP_COUNT,
     ViewInfo,
     _cupy_external_stream,
     _tilted_plan_cache_key,
@@ -60,21 +60,23 @@ from .geometry import (
     channel_view_slice_index,
     channel_view_slice_source,
     batch_result_frame_spec_for_view,
-    radial_batch_padding_count,
+    azimuthal_batch_padding_count,
     ensure_ultralytics_accepts_in_memory_volume_source,
     get_tilted_render_plan,
+    is_azimuthal_view,
     is_radial_view,
-    is_tilted_radial_view,
+    is_tilted_azimuthal_view,
     is_tilted_view,
     make_dense_tile_channel_renderer,
     make_fullframe_channel_renderer,
     physical_view_name,
-    radial_base_view_name,
-    radial_fused_render_supported,
-    radial_plane_shape,
-    radial_resident_gpu_render_supported,
-    radial_stack_length,
-    radial_streaming_gpu_render_supported,
+    azimuthal_base_view_name,
+    azimuthal_fused_render_supported,
+    azimuthal_plane_shape,
+    azimuthal_resident_gpu_render_supported,
+    azimuthal_stack_length,
+    azimuthal_streaming_gpu_render_supported,
+    radial_shell_coordinates,
     tilted_base_view_name,
     tilted_frame_center,
     tilted_stack_axis_length,
@@ -160,7 +162,7 @@ def gpu_render_reserve_bytes() -> int:
     return int(max(1.0, _env_float('YOLO_TTA_GPU_RENDER_RESERVE_GIB', 12.0)) * GIB)
 
 def gpu_render_tblock_slices() -> int:
-    """Transient source t-block size for streaming-mode GPU radial prerendering."""
+    """Transient source t-block size for streaming-mode GPU azimuthal prerendering."""
     return max(16, _env_int('YOLO_TTA_GPU_RENDER_TBLOCK_SLICES', 256))
 
 def gpu_cube_resize_enabled() -> bool:
@@ -174,9 +176,9 @@ def fused_direct_render_enabled() -> bool:
     """Allow resident-ring renderers to write normalized pixels straight to TRT bindings."""
     return _env_flag('YOLO_TTA_FUSED_DIRECT_RENDER', True)
 
-def fused_radial_render_enabled() -> bool:
-    """Use the Radial direct-to-binding kernel when enabled."""
-    return fused_direct_render_enabled() and _env_flag('YOLO_TTA_FUSED_RADIAL_RENDER', True)
+def fused_azimuthal_render_enabled() -> bool:
+    """Use the Azimuthal direct-to-binding kernel when enabled."""
+    return fused_direct_render_enabled() and _env_flag('YOLO_TTA_FUSED_AZIMUTHAL_RENDER', True)
 
 def fused_tilted_render_enabled() -> bool:
     """Use the Tilted direct-to-binding kernel when enabled."""
@@ -190,9 +192,9 @@ def fused_render_cuda_graphs_enabled() -> bool:
         and _env_flag('YOLO_TTA_FUSED_RENDER_CUDA_GRAPHS', True)
     )
 
-def radial_texture_source_copy_reserve_enabled() -> bool:
+def azimuthal_texture_source_copy_reserve_enabled() -> bool:
     """Reserve a second source-volume allocation when admitting GPU residency."""
-    return _env_flag('YOLO_TTA_RADIAL_TEXTURE_SOURCE_COPY_RESERVE', True)
+    return _env_flag('YOLO_TTA_AZIMUTHAL_TEXTURE_SOURCE_COPY_RESERVE', True)
 
 _FUSED_DIRECT_RENDER_KERNELS: Optional[object] = None
 
@@ -203,7 +205,7 @@ _FUSED_DIRECT_RENDER_KERNELS_ERROR: Optional[str] = None
 _FUSED_DIRECT_RENDER_KERNELS_WARNED = False
 
 def _fused_direct_render_kernels() -> Optional[object]:
-    """Compile the allocation-free resident Radial and Tilted render kernels once.
+    """Compile the allocation-free resident Azimuthal and Tilted render kernels once.
     
     Explicit fp32/fp16 entry points are materialized eagerly so toolchain failures retain a complete diagnostic."""
     global _FUSED_DIRECT_RENDER_KERNELS, _FUSED_DIRECT_RENDER_KERNELS_FAILED
@@ -222,7 +224,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
       return v < lo ? lo : (v > hi ? hi : v);
     }
     // Match align_corners=False + zero padding when the composed output affine lands
-    // within one bilinear-kernel radius of a Radial plane edge.  The native two-stage
+    // within one bilinear-kernel radius of a Azimuthal plane edge.  The native two-stage
     // renderer blends the edge texel with zero in this fringe; a hard [0,N-1] reject
     // creates a sparse but high-amplitude seam after square padding/scaling.
     __device__ __forceinline__ float zero_padded_linear_coord(
@@ -243,7 +245,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
       *clamped_coord = coord;
       return 1.0f;
     }
-    // The independent Torch Radial tap builder masks invalid taps and renormalizes the
+    // The independent Torch Azimuthal tap builder masks invalid taps and renormalizes the
     // surviving triangle weights.  Coordinates less than one pixel beyond the projected
     // source plane therefore clamp to the nearest edge texel rather than becoming zero.
     __device__ __forceinline__ bool renormalized_linear_coord(
@@ -285,7 +287,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
       return clamp_f(mapped, 0.0f, (float)(native_t - 1));
     }
 
-    __device__ __forceinline__ float radial_row_to_stack(
+    __device__ __forceinline__ float azimuthal_row_to_stack(
         float row, int rows, int stack_len) {
       if (rows == stack_len) return row;
       return clamp_f(
@@ -293,17 +295,17 @@ def _fused_direct_render_kernels() -> Optional[object]:
           0.0f, (float)(stack_len - 1));
     }
 
-    __device__ __forceinline__ int radial_plane_width(
+    __device__ __forceinline__ int azimuthal_plane_width(
         int base_id, int full_h, int full_w) {
       return base_id == 2 ? full_h : full_w;
     }
 
-    __device__ __forceinline__ int radial_plane_height(
+    __device__ __forceinline__ int azimuthal_plane_height(
         int base_id, int full_h, int logical_t) {
       return base_id == 0 ? full_h : logical_t;
     }
 
-    __device__ __forceinline__ float radial_source_texture(
+    __device__ __forceinline__ float azimuthal_source_texture(
         cudaTextureObject_t volume_tex,
         int native_t, int full_h, int full_w, int logical_t,
         int base_id, float plane_x, float plane_y, float stack) {
@@ -325,46 +327,46 @@ def _fused_direct_render_kernels() -> Optional[object]:
           volume_tex, source_x + 0.5f, source_y + 0.5f, source_t + 0.5f);
     }
 
-    __device__ __forceinline__ float radial_texture_sample(
+    __device__ __forceinline__ float azimuthal_texture_sample(
         cudaTextureObject_t volume_tex,
         int native_t, int full_h, int full_w, int logical_t,
         int rows, int n_u, int stack_len, int base_id, int direction_id,
         float tan_tilt, float center_x, float center_y, float roi_radius,
-        int angle_idx, float radial_y, float radial_x,
+        int angle_idx, float azimuthal_y, float azimuthal_x,
         const float* angle_cos, const float* angle_sin) {
-      float clamped_radial_x, clamped_radial_y;
+      float clamped_azimuthal_x, clamped_azimuthal_y;
       float border_x = zero_padded_linear_coord(
-          radial_x, n_u, &clamped_radial_x);
+          azimuthal_x, n_u, &clamped_azimuthal_x);
       float border_y = zero_padded_linear_coord(
-          radial_y, rows, &clamped_radial_y);
+          azimuthal_y, rows, &clamped_azimuthal_y);
       float output_border_weight = border_x * border_y;
       if (output_border_weight <= 0.0f) return 0.0f;
-      radial_x = clamped_radial_x;
-      radial_y = clamped_radial_y;
+      azimuthal_x = clamped_azimuthal_x;
+      azimuthal_y = clamped_azimuthal_y;
       float line = n_u > 1
-          ? -roi_radius + (2.0f * roi_radius) * (radial_x / (float)(n_u - 1))
+          ? -roi_radius + (2.0f * roi_radius) * (azimuthal_x / (float)(n_u - 1))
           : -roi_radius;
       float px = center_x + line * angle_cos[angle_idx];
       float py = center_y + line * angle_sin[angle_idx];
-      int plane_w = radial_plane_width(base_id, full_h, full_w);
-      int plane_h = radial_plane_height(base_id, full_h, logical_t);
+      int plane_w = azimuthal_plane_width(base_id, full_h, full_w);
+      int plane_h = azimuthal_plane_height(base_id, full_h, logical_t);
       float clamped_px, clamped_py;
       if (!renormalized_linear_coord(px, plane_w, &clamped_px)
           || !renormalized_linear_coord(py, plane_h, &clamped_py)) return 0.0f;
       px = clamped_px;
       py = clamped_py;
-      float stack = radial_row_to_stack(radial_y, rows, stack_len);
+      float stack = azimuthal_row_to_stack(azimuthal_y, rows, stack_len);
       if (tan_tilt != 0.0f) {
         float axis = direction_id == 0 ? py - center_y : px - center_x;
         stack = __fadd_rn(stack, __fmul_rn(tan_tilt, axis));
       }
       if (stack < 0.0f || stack > (float)(stack_len - 1)) return 0.0f;
-      return output_border_weight * radial_source_texture(
+      return output_border_weight * azimuthal_source_texture(
           volume_tex, native_t, full_h, full_w, logical_t,
           base_id, px, py, stack);
     }
 
-    __device__ __forceinline__ float radial_texture_direct_value(
+    __device__ __forceinline__ float azimuthal_texture_direct_value(
         cudaTextureObject_t volume_tex,
         int native_t, int full_h, int full_w, int logical_t,
         int rows, int n_u, int stack_len, int base_id, int direction_id,
@@ -373,18 +375,18 @@ def _fused_direct_render_kernels() -> Optional[object]:
         float m00, float m01, float m02, float m10, float m11, float m12,
         const float* angle_cos, const float* angle_sin, int oy, int ox) {
       int angle_idx = render_meta[0];
-      float radial_x = __fadd_rn(
+      float azimuthal_x = __fadd_rn(
           __fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
-      float radial_y = __fadd_rn(
+      float azimuthal_y = __fadd_rn(
           __fadd_rn(__fmul_rn(m10, (float)ox), __fmul_rn(m11, (float)oy)), m12);
-      return radial_texture_sample(
+      return azimuthal_texture_sample(
           volume_tex, native_t, full_h, full_w, logical_t,
           rows, n_u, stack_len, base_id, direction_id,
           tan_tilt, center_x, center_y, roi_radius,
-          angle_idx, radial_y, radial_x, angle_cos, angle_sin);
+          angle_idx, azimuthal_y, azimuthal_x, angle_cos, angle_sin);
     }
 
-    extern "C" __global__ void radial_texture_direct_f32(
+    extern "C" __global__ void azimuthal_texture_direct_f32(
         cudaTextureObject_t volume_tex,
         int native_t, int full_h, int full_w, int logical_t,
         int rows, int n_u, int stack_len, int base_id, int direction_id,
@@ -397,14 +399,14 @@ def _fused_direct_render_kernels() -> Optional[object]:
       int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
       if (ox >= ow || oy >= oh) return;
       int q = oy * ow + ox;
-      out[q] = clamp_f(radial_texture_direct_value(
+      out[q] = clamp_f(azimuthal_texture_direct_value(
           volume_tex, native_t, full_h, full_w, logical_t,
           rows, n_u, stack_len, base_id, direction_id, render_meta, tan_tilt,
           center_x, center_y, roi_radius,
           m00, m01, m02, m10, m11, m12, angle_cos, angle_sin, oy, ox), 0.0f, 1.0f);
     }
 
-    extern "C" __global__ void radial_texture_direct_f16(
+    extern "C" __global__ void azimuthal_texture_direct_f16(
         cudaTextureObject_t volume_tex,
         int native_t, int full_h, int full_w, int logical_t,
         int rows, int n_u, int stack_len, int base_id, int direction_id,
@@ -417,7 +419,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
       int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
       if (ox >= ow || oy >= oh) return;
       int q = oy * ow + ox;
-      float value = clamp_f(radial_texture_direct_value(
+      float value = clamp_f(azimuthal_texture_direct_value(
           volume_tex, native_t, full_h, full_w, logical_t,
           rows, n_u, stack_len, base_id, direction_id, render_meta, tan_tilt,
           center_x, center_y, roi_radius,
@@ -425,7 +427,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
       out[q] = __float2half_rn(value);
     }
 
-    extern "C" __global__ void radial_texture_native_f32(
+    extern "C" __global__ void azimuthal_texture_native_f32(
         cudaTextureObject_t volume_tex,
         int native_t, int full_h, int full_w, int logical_t,
         int rows, int n_u, int stack_len, int base_id, int direction_id,
@@ -436,7 +438,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
       int row = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
       if (u >= n_u || row >= rows) return;
       int q = row * n_u + u;
-      float value = radial_texture_sample(
+      float value = azimuthal_texture_sample(
           volume_tex, native_t, full_h, full_w, logical_t,
           rows, n_u, stack_len, base_id, direction_id,
           tan_tilt, center_x, center_y, roi_radius,
@@ -444,7 +446,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
       out[q] = clamp_f(value, 0.0f, 1.0f) * 255.0f;
     }
 
-    extern "C" __global__ void radial_texture_grid_f32(
+    extern "C" __global__ void azimuthal_texture_grid_f32(
         cudaTextureObject_t volume_tex,
         int native_t, int full_h, int full_w, int logical_t,
         int rows, int n_u, int stack_len, int base_id, int direction_id,
@@ -457,23 +459,23 @@ def _fused_direct_render_kernels() -> Optional[object]:
       int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
       if (ox >= ow || oy >= oh) return;
       int q = oy * ow + ox;
-      float radial_x = __fadd_rn(
+      float azimuthal_x = __fadd_rn(
           __fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
-      float radial_y = __fadd_rn(
+      float azimuthal_y = __fadd_rn(
           __fadd_rn(__fmul_rn(m10, (float)ox), __fmul_rn(m11, (float)oy)), m12);
-      float value = radial_texture_sample(
+      float value = azimuthal_texture_sample(
           volume_tex, native_t, full_h, full_w, logical_t,
           rows, n_u, stack_len, base_id, direction_id,
           tan_tilt, center_x, center_y, roi_radius,
-          angle_idx, radial_y, radial_x, angle_cos, angle_sin);
+          angle_idx, azimuthal_y, azimuthal_x, angle_cos, angle_sin);
       out[q] = clamp_f(value, 0.0f, 1.0f) * 255.0f;
     }
 
-    // A3: canonical-pointer Radial sampling. X/Y/stack are nearest-neighbor while
+    // A3: canonical-pointer Azimuthal sampling. X/Y/stack are nearest-neighbor while
     // the decoded native T axis remains linearly interpolated. This reads the same
     // resident uint8 allocation used by Cartesian/Tilted renderers and avoids a second
     // full-volume CUDA array/texture copy.
-    __device__ __forceinline__ float radial_source_pointer(
+    __device__ __forceinline__ float azimuthal_source_pointer(
         const unsigned char* volume,
         int native_t, int full_h, int full_w, int logical_t,
         int base_id, float plane_x, float plane_y, float stack) {
@@ -504,44 +506,44 @@ def _fused_direct_render_kernels() -> Optional[object]:
       return norm_u8(a + alpha * (b - a));
     }
 
-    __device__ __forceinline__ float radial_pointer_sample(
+    __device__ __forceinline__ float azimuthal_pointer_sample(
         const unsigned char* volume,
         int native_t, int full_h, int full_w, int logical_t,
         int rows, int n_u, int stack_len, int base_id, int direction_id,
         float tan_tilt, float center_x, float center_y, float roi_radius,
-        int angle_idx, float radial_y, float radial_x,
+        int angle_idx, float azimuthal_y, float azimuthal_x,
         const float* angle_cos, const float* angle_sin) {
-      float clamped_radial_x, clamped_radial_y;
-      float border_x = zero_padded_linear_coord(radial_x, n_u, &clamped_radial_x);
-      float border_y = zero_padded_linear_coord(radial_y, rows, &clamped_radial_y);
+      float clamped_azimuthal_x, clamped_azimuthal_y;
+      float border_x = zero_padded_linear_coord(azimuthal_x, n_u, &clamped_azimuthal_x);
+      float border_y = zero_padded_linear_coord(azimuthal_y, rows, &clamped_azimuthal_y);
       float output_border_weight = border_x * border_y;
       if (output_border_weight <= 0.0f) return 0.0f;
-      radial_x = clamped_radial_x;
-      radial_y = clamped_radial_y;
+      azimuthal_x = clamped_azimuthal_x;
+      azimuthal_y = clamped_azimuthal_y;
       float line = n_u > 1
-          ? -roi_radius + (2.0f * roi_radius) * (radial_x / (float)(n_u - 1))
+          ? -roi_radius + (2.0f * roi_radius) * (azimuthal_x / (float)(n_u - 1))
           : -roi_radius;
       float px = center_x + line * angle_cos[angle_idx];
       float py = center_y + line * angle_sin[angle_idx];
-      int plane_w = radial_plane_width(base_id, full_h, full_w);
-      int plane_h = radial_plane_height(base_id, full_h, logical_t);
+      int plane_w = azimuthal_plane_width(base_id, full_h, full_w);
+      int plane_h = azimuthal_plane_height(base_id, full_h, logical_t);
       float clamped_px, clamped_py;
       if (!renormalized_linear_coord(px, plane_w, &clamped_px)
           || !renormalized_linear_coord(py, plane_h, &clamped_py)) return 0.0f;
       px = clamped_px;
       py = clamped_py;
-      float stack_coord = radial_row_to_stack(radial_y, rows, stack_len);
+      float stack_coord = azimuthal_row_to_stack(azimuthal_y, rows, stack_len);
       if (tan_tilt != 0.0f) {
         float axis = direction_id == 0 ? py - center_y : px - center_x;
         stack_coord = __fadd_rn(stack_coord, __fmul_rn(tan_tilt, axis));
       }
       if (stack_coord < 0.0f || stack_coord > (float)(stack_len - 1)) return 0.0f;
-      return output_border_weight * radial_source_pointer(
+      return output_border_weight * azimuthal_source_pointer(
           volume, native_t, full_h, full_w, logical_t,
           base_id, px, py, stack_coord);
     }
 
-    __device__ __forceinline__ float radial_pointer_direct_value(
+    __device__ __forceinline__ float azimuthal_pointer_direct_value(
         const unsigned char* volume,
         int native_t, int full_h, int full_w, int logical_t,
         int rows, int n_u, int stack_len, int base_id, int direction_id,
@@ -550,18 +552,18 @@ def _fused_direct_render_kernels() -> Optional[object]:
         float m00, float m01, float m02, float m10, float m11, float m12,
         const float* angle_cos, const float* angle_sin, int oy, int ox) {
       int angle_idx = render_meta[0];
-      float radial_x = __fadd_rn(
+      float azimuthal_x = __fadd_rn(
           __fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
-      float radial_y = __fadd_rn(
+      float azimuthal_y = __fadd_rn(
           __fadd_rn(__fmul_rn(m10, (float)ox), __fmul_rn(m11, (float)oy)), m12);
-      return radial_pointer_sample(
+      return azimuthal_pointer_sample(
           volume, native_t, full_h, full_w, logical_t,
           rows, n_u, stack_len, base_id, direction_id,
           tan_tilt, center_x, center_y, roi_radius,
-          angle_idx, radial_y, radial_x, angle_cos, angle_sin);
+          angle_idx, azimuthal_y, azimuthal_x, angle_cos, angle_sin);
     }
 
-    extern "C" __global__ void radial_pointer_direct_f32(
+    extern "C" __global__ void azimuthal_pointer_direct_f32(
         const unsigned char* volume,
         int native_t, int full_h, int full_w, int logical_t,
         int rows, int n_u, int stack_len, int base_id, int direction_id,
@@ -574,14 +576,14 @@ def _fused_direct_render_kernels() -> Optional[object]:
       int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
       if (ox >= ow || oy >= oh) return;
       int q = oy * ow + ox;
-      out[q] = clamp_f(radial_pointer_direct_value(
+      out[q] = clamp_f(azimuthal_pointer_direct_value(
           volume, native_t, full_h, full_w, logical_t,
           rows, n_u, stack_len, base_id, direction_id, render_meta, tan_tilt,
           center_x, center_y, roi_radius,
           m00, m01, m02, m10, m11, m12, angle_cos, angle_sin, oy, ox), 0.0f, 1.0f);
     }
 
-    extern "C" __global__ void radial_pointer_direct_f16(
+    extern "C" __global__ void azimuthal_pointer_direct_f16(
         const unsigned char* volume,
         int native_t, int full_h, int full_w, int logical_t,
         int rows, int n_u, int stack_len, int base_id, int direction_id,
@@ -594,7 +596,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
       int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
       if (ox >= ow || oy >= oh) return;
       int q = oy * ow + ox;
-      float value = clamp_f(radial_pointer_direct_value(
+      float value = clamp_f(azimuthal_pointer_direct_value(
           volume, native_t, full_h, full_w, logical_t,
           rows, n_u, stack_len, base_id, direction_id, render_meta, tan_tilt,
           center_x, center_y, roi_radius,
@@ -602,7 +604,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
       out[q] = __float2half_rn(value);
     }
 
-    extern "C" __global__ void radial_pointer_native_f32(
+    extern "C" __global__ void azimuthal_pointer_native_f32(
         const unsigned char* volume,
         int native_t, int full_h, int full_w, int logical_t,
         int rows, int n_u, int stack_len, int base_id, int direction_id,
@@ -613,7 +615,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
       int row = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
       if (u >= n_u || row >= rows) return;
       int q = row * n_u + u;
-      float value = radial_pointer_sample(
+      float value = azimuthal_pointer_sample(
           volume, native_t, full_h, full_w, logical_t,
           rows, n_u, stack_len, base_id, direction_id,
           tan_tilt, center_x, center_y, roi_radius,
@@ -621,7 +623,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
       out[q] = clamp_f(value, 0.0f, 1.0f) * 255.0f;
     }
 
-    extern "C" __global__ void radial_pointer_grid_f32(
+    extern "C" __global__ void azimuthal_pointer_grid_f32(
         const unsigned char* volume,
         int native_t, int full_h, int full_w, int logical_t,
         int rows, int n_u, int stack_len, int base_id, int direction_id,
@@ -634,19 +636,19 @@ def _fused_direct_render_kernels() -> Optional[object]:
       int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
       if (ox >= ow || oy >= oh) return;
       int q = oy * ow + ox;
-      float radial_x = __fadd_rn(
+      float azimuthal_x = __fadd_rn(
           __fadd_rn(__fmul_rn(m00, (float)ox), __fmul_rn(m01, (float)oy)), m02);
-      float radial_y = __fadd_rn(
+      float azimuthal_y = __fadd_rn(
           __fadd_rn(__fmul_rn(m10, (float)ox), __fmul_rn(m11, (float)oy)), m12);
-      float value = radial_pointer_sample(
+      float value = azimuthal_pointer_sample(
           volume, native_t, full_h, full_w, logical_t,
           rows, n_u, stack_len, base_id, direction_id,
           tan_tilt, center_x, center_y, roi_radius,
-          angle_idx, radial_y, radial_x, angle_cos, angle_sin);
+          angle_idx, azimuthal_y, azimuthal_x, angle_cos, angle_sin);
       out[q] = clamp_f(value, 0.0f, 1.0f) * 255.0f;
     }
 
-    // Pointer-based helpers remain for the non-radial Tilted renderer.
+    // Pointer-based helpers remain for the non-azimuthal Tilted renderer.
     __device__ __forceinline__ void logical_t_taps(
         int logical_idx, int native_t, int logical_t, int* t0, int* t1, float* alpha) {
       float pos = ((float)logical_idx + 0.5f) * ((float)native_t / (float)logical_t) - 0.5f;
@@ -736,7 +738,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
       }
       // v16.1.8 forward-pass bilinear: match align_corners=False zero-padded warp
       // semantics on the native tilted raster (the same contract the Cartesian
-      // grid_sample warp and the radial kernels' edge handling use).
+      // grid_sample warp and the azimuthal kernels' edge handling use).
       float cx, cy;
       float border_x = zero_padded_linear_coord(sx, src_w, &cx);
       float border_y = zero_padded_linear_coord(sy, src_h, &cy);
@@ -808,10 +810,10 @@ def _fused_direct_render_kernels() -> Optional[object]:
         import cupy as cp  # type: ignore
         names = (
             'set_render_meta',
-            'radial_texture_direct_f32', 'radial_texture_direct_f16',
-            'radial_texture_native_f32', 'radial_texture_grid_f32',
-            'radial_pointer_direct_f32', 'radial_pointer_direct_f16',
-            'radial_pointer_native_f32', 'radial_pointer_grid_f32',
+            'azimuthal_texture_direct_f32', 'azimuthal_texture_direct_f16',
+            'azimuthal_texture_native_f32', 'azimuthal_texture_grid_f32',
+            'azimuthal_pointer_direct_f32', 'azimuthal_pointer_direct_f16',
+            'azimuthal_pointer_native_f32', 'azimuthal_pointer_grid_f32',
             'tilted_direct_f32', 'tilted_direct_f16',
         )
         module = cp.RawModule(code=src, options=('--std=c++14',))
@@ -854,7 +856,7 @@ def _fused_direct_render_kernels() -> Optional[object]:
         if not _FUSED_DIRECT_RENDER_KERNELS_WARNED:
             _FUSED_DIRECT_RENDER_KERNELS_WARNED = True
             print(
-                'Warning: fused Radial/Tilted NVRTC module failed to compile; '
+                'Warning: fused Azimuthal/Tilted NVRTC module failed to compile; '
                 f'{_FUSED_DIRECT_RENDER_KERNELS_ERROR}. '
                 'The reference Torch renderers remain active.'
             )
@@ -907,7 +909,7 @@ def _wait_for_cube_ready_sentinel(
         time.sleep(max(0.05, float(poll_seconds)))
 
 def fused_renderer_preflight_enabled() -> bool:
-    """Fail-fast worker probe for fused upright-Radial, Tilted, and tilted-Radial kernels."""
+    """Fail-fast worker probe for fused upright-Azimuthal, Tilted, and tilted-Azimuthal kernels."""
     return _env_flag('YOLO_TTA_FUSED_RENDER_PREFLIGHT', True)
 
 def fused_renderer_fail_fast_enabled() -> bool:
@@ -920,7 +922,7 @@ def fused_renderer_preflight_tolerances() -> Tuple[float, float, float, float, f
     A raw maximum is retained for diagnostics, but one nearest-neighbor tie or texture
     interpolation outlier among millions of pixels is not independently worker-fatal.
     ``max_abs_fraction`` bounds the share exceeding ``max_abs`` instead. The validator
-    may raise the default Radial hardware-texture limit to one raster-perimeter-equivalent
+    may raise the default Azimuthal hardware-texture limit to one raster-perimeter-equivalent
     seam; an explicit environment override remains exact.
     """
     return (
@@ -934,10 +936,12 @@ def fused_renderer_preflight_tolerances() -> Tuple[float, float, float, float, f
     )
 
 def _fused_preflight_family(view: ViewInfo) -> str:
-    if is_tilted_radial_view(view):
-        return 'tilted_radial'
     if is_radial_view(view):
-        return 'radial'
+        return ''
+    if is_tilted_azimuthal_view(view):
+        return 'tilted_azimuthal'
+    if is_azimuthal_view(view):
+        return 'azimuthal'
     if is_tilted_view(view):
         return 'tilted'
     return ''
@@ -974,7 +978,7 @@ def build_fused_renderer_preflight_specs(
     """
 
     specs: List[Dict[str, object]] = []
-    for requested_family in ('radial', 'tilted', 'tilted_radial'):
+    for requested_family in ('azimuthal', 'tilted', 'tilted_azimuthal'):
         seen_affines: set[Tuple[float, ...]] = set()
         for view in inference_views:
             if _fused_preflight_family(view) != requested_family:
@@ -1011,8 +1015,8 @@ def build_fused_renderer_preflight_specs(
 def _single_pixel_closed_seam_fraction(height: int, width: int) -> float:
     """Return the fraction occupied by a one-pixel closed seam around an HxW raster.
 
-    A fused hardware-texture Radial launch composes source sampling and output resampling in
-    one kernel, while the independent startup reference renders a native Radial plane and then
+    A fused hardware-texture Azimuthal launch composes source sampling and output resampling in
+    one kernel, while the independent startup reference renders a native Azimuthal plane and then
     resamples it. Their expected numerical disagreement can concentrate along one resampling
     seam even when the image-wide mean and broader mismatch rates remain negligible.
     """
@@ -1033,16 +1037,16 @@ def fused_renderer_effective_max_fraction_tolerance(
 ) -> Tuple[float, float]:
     """Return the effective high-error fraction limit and its automatic seam floor.
 
-    The one-pixel floor applies only to the default hardware-texture Radial comparison. An
+    The one-pixel floor applies only to the default hardware-texture Azimuthal comparison. An
     explicit ``YOLO_TTA_FUSED_PREFLIGHT_MAX_ABS_FRACTION`` remains authoritative, and the
     independent mean-error and 4/255 mismatch-fraction limits are never relaxed.
     """
     configured = max(0.0, min(1.0, float(configured_tolerance)))
     if os.environ.get('YOLO_TTA_FUSED_PREFLIGHT_MAX_ABS_FRACTION', '').strip():
         return configured, 0.0
-    if str(preflight_family) not in ('radial', 'tilted_radial'):
+    if str(preflight_family) not in ('azimuthal', 'tilted_azimuthal'):
         return configured, 0.0
-    if radial_source_mode() != 'texture_linear':
+    if azimuthal_source_mode() != 'texture_linear':
         return configured, 0.0
     seam_floor = _single_pixel_closed_seam_fraction(int(height), int(width))
     return max(configured, float(seam_floor)), float(seam_floor)
@@ -1091,11 +1095,11 @@ class _GpuWorkerRenderEngine:
         self._tilted_plans: 'OrderedDict[Tuple[str, int, int, Tuple[float, ...]], Dict[str, object]]' = OrderedDict()
         self._fold_cache: Dict[Tuple[int, int, int], Tuple[object, object, object]] = {}
         # Small per-azimuth sin/cos geometry plus one optional 3D texture object.
-        self._fused_radial_taps: 'OrderedDict[object, object]' = OrderedDict()
+        self._fused_azimuthal_taps: 'OrderedDict[object, object]' = OrderedDict()
         self._fused_volume_ref: Optional[object] = None
-        self._radial_texture_ref: Optional[object] = None
-        self._radial_texture_admitted: Optional[bool] = None
-        self._radial_texture_lock = threading.RLock()
+        self._azimuthal_texture_ref: Optional[object] = None
+        self._azimuthal_texture_admitted: Optional[bool] = None
+        self._azimuthal_texture_lock = threading.RLock()
         self._fused_disabled_families: set = set()
         self._fused_warned_families: set = set()
         self._fused_announced_families: set = set()
@@ -1125,7 +1129,7 @@ class _GpuWorkerRenderEngine:
         dtype: str = 'uint8',
         *,
         resize_to_t: Optional[int] = None,
-        require_radial_texture: bool = False,
+        require_azimuthal_texture: bool = False,
     ) -> str:
         """Resolve resident or streaming GPU source-volume mode.
         
@@ -1161,10 +1165,10 @@ class _GpuWorkerRenderEngine:
         self._native_u8_plane_cache.clear()
         self._fold_cache.clear()
         self._tilted_plans.clear()
-        self._fused_radial_taps.clear()
+        self._fused_azimuthal_taps.clear()
         self._fused_volume_ref = None
-        self._radial_texture_ref = None
-        self._radial_texture_admitted = None
+        self._azimuthal_texture_ref = None
+        self._azimuthal_texture_admitted = None
         self._fused_disabled_families.clear()
         self._fused_graph_rejected_keys.clear()
         self._fused_validated_keys.clear()
@@ -1179,9 +1183,9 @@ class _GpuWorkerRenderEngine:
                 texture_copy_bytes = (
                     int(nbytes)
                     if (
-                        bool(require_radial_texture)
-                        and radial_source_mode() == 'texture_linear'
-                        and radial_texture_source_copy_reserve_enabled()
+                        bool(require_azimuthal_texture)
+                        and azimuthal_source_mode() == 'texture_linear'
+                        and azimuthal_texture_source_copy_reserve_enabled()
                     )
                     else 0
                 )
@@ -1202,11 +1206,11 @@ class _GpuWorkerRenderEngine:
                 else:
                     print(
                         f'GPU render: source volume NOT resident ({nbytes / GIB:.1f} GiB source + '
-                        f'{texture_copy_bytes / GIB:.1f} GiB radial-texture copy + '
+                        f'{texture_copy_bytes / GIB:.1f} GiB azimuthal-texture copy + '
                         f'{gpu_render_reserve_bytes() / GIB:.1f} GiB reserve > '
                         f'{free_bytes / GIB:.1f} GiB free); '
-                        'only upright transverse-Radial tasks retain streamed GPU prerendering. '
-                        'Tilted-Radial, Cartesian, and other unsupported nonresident views use CPU rendering. '
+                        'only upright transverse-Azimuthal tasks retain streamed GPU prerendering. '
+                        'Tilted-Azimuthal, Cartesian, and other unsupported nonresident views use CPU rendering. '
                         'A TensorRT engine rebuilt at max batch 1 frees enough VRAM for residency.'
                     )
             except Exception as exc:
@@ -1216,7 +1220,7 @@ class _GpuWorkerRenderEngine:
                 print(f'GPU render: resident upload failed ({exc}); falling back to streaming mode.')
         if resize_active and self._mode != 'resident':
             # never leave a native-geometry memmap where streaming-mode
-            # consumers (radial slab prerender, shape probes) expect the cube.
+            # consumers (azimuthal slab prerender, shape probes) expect the cube.
             self._volume_key = None
             self._volume_mm = None
             self._logical_t = 0
@@ -1239,7 +1243,7 @@ class _GpuWorkerRenderEngine:
         volume: np.ndarray,
         *,
         identity: Optional[str] = None,
-        require_radial_texture: bool = False,
+        require_azimuthal_texture: bool = False,
     ) -> str:
         """Admit an already-materialized uint8 cube to the resident renderer.
 
@@ -1290,10 +1294,10 @@ class _GpuWorkerRenderEngine:
         self._native_u8_plane_cache.clear()
         self._fold_cache.clear()
         self._tilted_plans.clear()
-        self._fused_radial_taps.clear()
+        self._fused_azimuthal_taps.clear()
         self._fused_volume_ref = None
-        self._radial_texture_ref = None
-        self._radial_texture_admitted = None
+        self._azimuthal_texture_ref = None
+        self._azimuthal_texture_admitted = None
         self._fused_disabled_families.clear()
         self._fused_graph_rejected_keys.clear()
         self._fused_validated_keys.clear()
@@ -1308,9 +1312,9 @@ class _GpuWorkerRenderEngine:
                 texture_copy_bytes = (
                     nbytes
                     if (
-                        bool(require_radial_texture)
-                        and radial_source_mode() == "texture_linear"
-                        and radial_texture_source_copy_reserve_enabled()
+                        bool(require_azimuthal_texture)
+                        and azimuthal_source_mode() == "texture_linear"
+                        and azimuthal_texture_source_copy_reserve_enabled()
                     )
                     else 0
                 )
@@ -1332,7 +1336,7 @@ class _GpuWorkerRenderEngine:
                     self._volume_flat = resident.view(-1)
                     self._native_t_indices(int(shape_t[0]))
                     self._mode = "resident"
-                    self._radial_texture_admitted = bool(
+                    self._azimuthal_texture_admitted = bool(
                         int(free_bytes) >= int(preferred_need)
                     )
                     if int(free_bytes) < int(preferred_need):
@@ -1373,17 +1377,17 @@ class _GpuWorkerRenderEngine:
         neither the input file nor any parent's overlay source is closed/deleted.
         A failed stream fence leaves all renderer owners intact.
         """
-        with self._radial_texture_lock:
+        with self._azimuthal_texture_lock:
             if bool(getattr(self, '_inference_assets_released', False)):
                 return {'already_released': True, 'source_bytes': 0, 'texture_bytes': 0}
             self._stream.synchronize()
             volume = self._volume_gpu
             source_bytes = int(getattr(volume, 'nbytes', 0)) if volume is not None else 0
-            texture = self._radial_texture_ref
+            texture = self._azimuthal_texture_ref
             texture_bytes = int(getattr(texture, 'nbytes', 0)) if texture is not None else 0
             cache_names = (
                 '_native_t_map_cache', '_native_plane_cache', '_native_u8_plane_cache',
-                '_fold_cache', '_tilted_plans', '_fused_radial_taps',
+                '_fold_cache', '_tilted_plans', '_fused_azimuthal_taps',
             )
             cache_entries = sum(len(getattr(self, name)) for name in cache_names)
             # A texture namespace retains both its CUDAarray and the original
@@ -1392,7 +1396,7 @@ class _GpuWorkerRenderEngine:
             if texture is not None:
                 for name in ('texture', 'descriptor', 'resource', 'cuda_array', 'source_ref', 'channel'):
                     setattr(texture, name, None)
-            self._radial_texture_ref = None
+            self._azimuthal_texture_ref = None
             self._fused_volume_ref = None
             self._volume_flat = None
             self._volume_gpu = None
@@ -1404,7 +1408,7 @@ class _GpuWorkerRenderEngine:
             self._fused_preflight_validated_families.clear()
             self._fused_graph_rejected_keys.clear()
             self._fused_validated_keys.clear()
-            self._radial_texture_admitted = False
+            self._azimuthal_texture_admitted = False
             self._resident_runtime_disabled = True
             self._mode = 'inference_assets_released'
             self._inference_assets_released = True
@@ -1433,10 +1437,10 @@ class _GpuWorkerRenderEngine:
         self._native_u8_plane_cache.clear()
         self._fold_cache.clear()
         self._tilted_plans.clear()
-        self._fused_radial_taps.clear()
+        self._fused_azimuthal_taps.clear()
         self._fused_volume_ref = None
-        self._radial_texture_ref = None
-        self._radial_texture_admitted = None
+        self._azimuthal_texture_ref = None
+        self._azimuthal_texture_admitted = None
         self._fused_disabled_families.clear()
         self._fused_graph_rejected_keys.clear()
         self._fused_validated_keys.clear()
@@ -1492,13 +1496,13 @@ class _GpuWorkerRenderEngine:
         self._fused_disabled_families.add(family_s)
         if family_s not in self._fused_warned_families:
             self._fused_warned_families.add(family_s)
-            if family_s == 'tilted_radial':
+            if family_s == 'tilted_azimuthal':
                 gate = (
-                    'YOLO_TTA_FUSED_RADIAL_RENDER=0 disables only the direct kernel; '
-                    'YOLO_TTA_GPU_TILTED_RADIAL_RENDER=0 restores the v16.0.2 CPU path'
+                    'YOLO_TTA_FUSED_AZIMUTHAL_RENDER=0 disables only the direct kernel; '
+                    'YOLO_TTA_GPU_TILTED_AZIMUTHAL_RENDER=0 restores the v16.0.2 CPU path'
                 )
-            elif family_s == 'radial':
-                gate = 'YOLO_TTA_FUSED_RADIAL_RENDER=0'
+            elif family_s == 'azimuthal':
+                gate = 'YOLO_TTA_FUSED_AZIMUTHAL_RENDER=0'
             else:
                 gate = 'YOLO_TTA_FUSED_TILTED_RENDER=0'
             print(
@@ -1507,39 +1511,39 @@ class _GpuWorkerRenderEngine:
             )
 
     def _fused_cupy_volume(self, kernels: object) -> object:
-        with self._radial_texture_lock:
+        with self._azimuthal_texture_lock:
             if self._fused_volume_ref is None:
                 self._fused_volume_ref = kernels.cp.asarray(self._volume_gpu)
             return self._fused_volume_ref
 
-    def _ensure_radial_texture(self, kernels: object) -> object:
+    def _ensure_azimuthal_texture(self, kernels: object) -> object:
         """Create one normalized-float, hardware-linear 3D texture for the resident u8 source.
 
         CUDA arrays are allocated outside the Torch/CuPy memory pools, so construction is
         single-flight and performs an explicit free-memory admission check before allocation.
         """
-        cached = self._radial_texture_ref
+        cached = self._azimuthal_texture_ref
         if cached is not None:
             return cached
-        with self._radial_texture_lock:
-            cached = self._radial_texture_ref
+        with self._azimuthal_texture_lock:
+            cached = self._azimuthal_texture_ref
             if cached is not None:
                 return cached
             if self._volume_gpu is None or self._volume_gpu.dtype != self.torch.uint8:
-                raise RuntimeError('radial texture requires a resident uint8 source volume')
+                raise RuntimeError('azimuthal texture requires a resident uint8 source volume')
             if not bool(self._volume_gpu.is_contiguous()):
-                raise RuntimeError('radial texture requires a contiguous source volume')
+                raise RuntimeError('azimuthal texture requires a contiguous source volume')
 
             cp = kernels.cp
             native_t, full_h, full_w = (int(v) for v in self._volume_gpu.shape)
             texture_bytes = int(native_t) * int(full_h) * int(full_w)
             free_bytes, _total = self.torch.cuda.mem_get_info(self.device)
             texture_headroom = int(
-                max(0.5, _env_float('YOLO_TTA_RADIAL_TEXTURE_RESERVE_GIB', 2.0)) * GIB
+                max(0.5, _env_float('YOLO_TTA_AZIMUTHAL_TEXTURE_RESERVE_GIB', 2.0)) * GIB
             )
             if int(free_bytes) < int(texture_bytes) + int(texture_headroom):
                 raise RuntimeError(
-                    f'3D radial texture needs {texture_bytes / GIB:.2f} GiB plus '
+                    f'3D azimuthal texture needs {texture_bytes / GIB:.2f} GiB plus '
                     f'{texture_headroom / GIB:.2f} GiB headroom, only '
                     f'{int(free_bytes) / GIB:.2f} GiB free'
                 )
@@ -1582,11 +1586,11 @@ class _GpuWorkerRenderEngine:
                 nbytes=texture_bytes,
                 shape=(native_t, full_h, full_w),
             )
-            self._radial_texture_ref = cached
+            self._azimuthal_texture_ref = cached
             print(
-                f'Radial hardware texture allocated on {self.device}: '
+                f'Azimuthal hardware texture allocated on {self.device}: '
                 f'{native_t}x{full_h}x{full_w} u8 ({texture_bytes / GIB:.2f} GiB), '
-                f'filter={RADIAL_FILTER_LABEL}.'
+                f'filter={AZIMUTHAL_FILTER_LABEL}.'
             )
             return cached
 
@@ -1619,7 +1623,7 @@ class _GpuWorkerRenderEngine:
             )
         return ref
 
-    def _ensure_fused_radial_taps(self, view: ViewInfo, kernels: object) -> object:
+    def _ensure_fused_azimuthal_taps(self, view: ViewInfo, kernels: object) -> object:
         """Cache the per-azimuth sin/cos table used by texture render kernels.
 
         Reconstruction state is computed in registers, so each geometry retains only two
@@ -1631,18 +1635,18 @@ class _GpuWorkerRenderEngine:
         n_angles = int(angles_np.size)
         n_u = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
         if n_angles <= 0 or n_u <= 0:
-            raise RuntimeError('fused Radial texture geometry is empty')
-        plane_h, plane_w = radial_plane_shape(view)
-        source_mode = radial_source_mode()
+            raise RuntimeError('fused Azimuthal texture geometry is empty')
+        plane_h, plane_w = azimuthal_plane_shape(view)
+        source_mode = azimuthal_source_mode()
         key = (
-            RADIAL_FILTER_MODE, str(source_mode), int(plane_h), int(plane_w), int(n_u),
+            AZIMUTHAL_FILTER_MODE, str(source_mode), int(plane_h), int(plane_w), int(n_u),
             round(float(view.center_x), 5), round(float(view.center_y), 5),
             round(float(view.roi_radius), 5), angles_np.tobytes(),
         )
-        with self._radial_texture_lock:
-            cached = self._fused_radial_taps.get(key)
+        with self._azimuthal_texture_lock:
+            cached = self._fused_azimuthal_taps.get(key)
             if cached is not None:
-                self._fused_radial_taps.move_to_end(key)
+                self._fused_azimuthal_taps.move_to_end(key)
                 return cached
 
             radians = np.deg2rad(angles_np.astype(np.float64)).astype(np.float32)
@@ -1663,19 +1667,19 @@ class _GpuWorkerRenderEngine:
                 plane_w=int(plane_w),
                 nbytes=int(cos_np.nbytes + sin_np.nbytes),
             )
-            self._fused_radial_taps[key] = refs
-            self._fused_radial_taps.move_to_end(key)
-            limit = max(8, _env_int('YOLO_TTA_RADIAL_TEXTURE_GEOMETRY_CACHE_ENTRIES', 128))
-            while len(self._fused_radial_taps) > int(limit):
-                self._fused_radial_taps.popitem(last=False)
+            self._fused_azimuthal_taps[key] = refs
+            self._fused_azimuthal_taps.move_to_end(key)
+            limit = max(8, _env_int('YOLO_TTA_AZIMUTHAL_TEXTURE_GEOMETRY_CACHE_ENTRIES', 128))
+            while len(self._fused_azimuthal_taps) > int(limit):
+                self._fused_azimuthal_taps.popitem(last=False)
             print(
-                f'Radial geometry cached on {self.device}: {n_angles} azimuths, '
-                f'{n_u} radial samples, {int(plane_h)}x{int(plane_w)} projected plane; '
+                f'Azimuthal geometry cached on {self.device}: {n_angles} azimuths, '
+                f'{n_u} azimuthal samples, {int(plane_h)}x{int(plane_w)} projected plane; '
                 f'source_mode={source_mode}, angle_table={refs.nbytes / (1024 ** 2):.3f} MiB.'
             )
             return refs
 
-    def _try_fused_radial_into_slot(
+    def _try_fused_azimuthal_into_slot(
         self,
         slot: _ResidentGpuPipelineSlot,
         view: ViewInfo,
@@ -1686,17 +1690,17 @@ class _GpuWorkerRenderEngine:
         stage_metadata: bool = True,
         disable_on_failure: bool = True,
     ) -> bool:
-        tilted_radial = bool(is_tilted_radial_view(view))
-        render_family = 'tilted_radial' if tilted_radial else 'radial'
+        tilted_azimuthal = bool(is_tilted_azimuthal_view(view))
+        render_family = 'tilted_azimuthal' if tilted_azimuthal else 'azimuthal'
         if (
-            not fused_radial_render_enabled()
-            or 'radial' in self._fused_disabled_families
+            not fused_azimuthal_render_enabled()
+            or 'azimuthal' in self._fused_disabled_families
             or render_family in self._fused_disabled_families
-            or not radial_fused_render_supported(view)
+            or not azimuthal_fused_render_supported(view)
         ):
             return False
         try:
-            if str(view.family) != 'radial':
+            if str(view.family) != 'azimuthal':
                 return False
             if self._volume_gpu is None or not bool(self._volume_gpu.is_contiguous()):
                 raise RuntimeError('resident uint8 source volume is unavailable or non-contiguous')
@@ -1704,42 +1708,42 @@ class _GpuWorkerRenderEngine:
                 raise RuntimeError(f'expected uint8 source volume, got {self._volume_gpu.dtype}')
             native_t, full_h, full_w = (int(v) for v in self._volume_gpu.shape)
             if int(view.full_h) != full_h or int(view.full_w) != full_w:
-                raise RuntimeError('Radial view/source-volume XY geometry mismatch')
+                raise RuntimeError('Azimuthal view/source-volume XY geometry mismatch')
             if int(frame_index) < 0 or int(frame_index) >= len(view.azimuths_deg):
-                raise RuntimeError(f'Radial frame index {frame_index} is outside its azimuth table')
+                raise RuntimeError(f'Azimuthal frame index {frame_index} is outside its azimuth table')
             kernels = _fused_direct_render_kernels()
             if kernels is None:
                 raise RuntimeError(
                     'CuPy/NVRTC direct renderer kernels are unavailable: '
                     + str(_FUSED_DIRECT_RENDER_KERNELS_ERROR or 'no diagnostic')
                 )
-            geometry = self._ensure_fused_radial_taps(view, kernels)
-            source_mode = radial_source_mode()
+            geometry = self._ensure_fused_azimuthal_taps(view, kernels)
+            source_mode = azimuthal_source_mode()
             if source_mode == 'texture_linear':
-                source_arg = self._ensure_radial_texture(kernels).texture
-                kernel_prefix = 'radial_texture'
+                source_arg = self._ensure_azimuthal_texture(kernels).texture
+                kernel_prefix = 'azimuthal_texture'
             else:
                 source_arg = self._fused_cupy_volume(kernels)
-                kernel_prefix = 'radial_pointer'
+                kernel_prefix = 'azimuthal_pointer'
             matrix = np.asarray(aff.M_out_to_src, dtype=np.float32).reshape(2, 3)
             if not bool(np.all(np.isfinite(matrix))):
-                raise RuntimeError('Radial output-to-source affine is non-finite')
+                raise RuntimeError('Azimuthal output-to-source affine is non-finite')
             if slot.input.dtype not in (self.torch.float16, self.torch.float32):
                 raise RuntimeError(f'unsupported binding dtype {slot.input.dtype}')
 
-            base = str(radial_base_view_name(view))
+            base = str(azimuthal_base_view_name(view))
             base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
             if base not in base_ids:
-                raise RuntimeError(f'unsupported Radial base {base!r}')
-            direction = str(view.tilt_direction) if tilted_radial else 'vertical'
+                raise RuntimeError(f'unsupported Azimuthal base {base!r}')
+            direction = str(view.tilt_direction) if tilted_azimuthal else 'vertical'
             if direction not in ('vertical', 'horizontal'):
-                raise RuntimeError(f'unsupported tilted-Radial direction {direction!r}')
-            plane_h, plane_w = radial_plane_shape(view)
+                raise RuntimeError(f'unsupported tilted-Azimuthal direction {direction!r}')
+            plane_h, plane_w = azimuthal_plane_shape(view)
             if int(geometry.plane_h) != int(plane_h) or int(geometry.plane_w) != int(plane_w):
-                raise RuntimeError('Radial angle table/projected-plane geometry mismatch')
-            stack_len = int(radial_stack_length(view))
+                raise RuntimeError('Azimuthal angle table/projected-plane geometry mismatch')
+            stack_len = int(azimuthal_stack_length(view))
             if stack_len <= 0:
-                raise RuntimeError('Radial stack geometry is empty')
+                raise RuntimeError('Azimuthal stack geometry is empty')
 
             external = _cupy_external_stream(kernels.cp, self._stream)
             metadata = self._fused_slot_metadata(
@@ -1769,7 +1773,7 @@ class _GpuWorkerRenderEngine:
                     metadata,
                     np.float32(
                         math.tan(math.radians(float(view.tilt_angle_deg)))
-                        if tilted_radial else 0.0
+                        if tilted_azimuthal else 0.0
                     ),
                     np.float32(view.center_x), np.float32(view.center_y),
                     np.float32(view.roi_radius),
@@ -1782,16 +1786,16 @@ class _GpuWorkerRenderEngine:
             )
             if render_family not in self._fused_announced_families:
                 self._fused_announced_families.add(render_family)
-                geometry_label = f'tilted {base}' if tilted_radial else f'upright {base}'
+                geometry_label = f'tilted {base}' if tilted_azimuthal else f'upright {base}'
                 print(
-                    f'Fused {geometry_label} Radial renderer active: output affine + radial '
+                    f'Fused {geometry_label} Azimuthal renderer active: output affine + azimuthal '
                     f'mapping + source_mode={source_mode} -> TensorRT binding in one launch.'
                 )
             return True
         except Exception as exc:
             if not bool(disable_on_failure):
                 raise
-            self._fused_radial_taps.clear()
+            self._fused_azimuthal_taps.clear()
             self._fused_render_fallback(render_family, exc)
             return False
 
@@ -1807,6 +1811,8 @@ class _GpuWorkerRenderEngine:
         stage_metadata: bool = True,
         disable_on_failure: bool = True,
     ) -> bool:
+        if is_radial_view(view):
+            return False
         if not fused_tilted_render_enabled() or 'tilted' in self._fused_disabled_families:
             return False
         try:
@@ -1902,8 +1908,8 @@ class _GpuWorkerRenderEngine:
 
         if not fused_tilted_render_enabled() or 'tilted' in self._fused_disabled_families:
             raise RuntimeError('fused Tilted rendering is disabled')
-        if not is_tilted_view(view) or is_radial_view(view):
-            raise ValueError('standalone Tilted grid rendering requires a non-Radial Tilted view')
+        if not is_tilted_view(view) or is_azimuthal_view(view):
+            raise ValueError('standalone Tilted grid rendering requires a non-Azimuthal Tilted view')
         if self._volume_gpu is None or not bool(self._volume_gpu.is_contiguous()):
             raise RuntimeError('resident uint8 source volume is unavailable or non-contiguous')
         if self._volume_gpu.dtype != self.torch.uint8:
@@ -2035,11 +2041,13 @@ class _GpuWorkerRenderEngine:
         allow_graph_replay: bool = True,
         disable_on_failure: bool = True,
     ) -> bool:
-        """Render an eligible resident-ring Radial or Tilted frame into its fixed binding."""
+        """Render an eligible resident-ring Azimuthal or Tilted frame into its fixed binding."""
         # Local import keeps the package dependency graph acyclic.
         from .backprojection import _ResidentTensorRTRingFatalError
 
-        family = 'radial' if str(view.family) == 'radial' else ('tilted' if is_tilted_view(view) else '')
+        if is_radial_view(view):
+            return False
+        family = 'azimuthal' if str(view.family) == 'azimuthal' else ('tilted' if is_tilted_view(view) else '')
         if not family:
             return False
         if (
@@ -2052,10 +2060,10 @@ class _GpuWorkerRenderEngine:
             kernels = _fused_direct_render_kernels()
             if kernels is None:
                 return False
-            if family == 'radial':
+            if family == 'azimuthal':
                 if int(frame_index) < 0 or int(frame_index) >= len(view.azimuths_deg):
                     raise _ResidentTensorRTRingFatalError(
-                        f'P4 Radial graph frame {frame_index} is outside its descriptor table'
+                        f'P4 Azimuthal graph frame {frame_index} is outside its descriptor table'
                     )
                 dynamic_value = int(frame_index)
             else:
@@ -2074,8 +2082,8 @@ class _GpuWorkerRenderEngine:
                     f'P4 fused {family} renderer CUDA Graph replay failed'
                 ) from exc
             return True
-        if family == 'radial':
-            return self._try_fused_radial_into_slot(
+        if family == 'azimuthal':
+            return self._try_fused_azimuthal_into_slot(
                 slot, view, aff, frame_index, out_size,
                 stage_metadata=bool(stage_metadata),
                 disable_on_failure=bool(disable_on_failure),
@@ -2095,12 +2103,12 @@ class _GpuWorkerRenderEngine:
         aff: AffineSpec,
         out_size: int,
     ) -> Tuple[object, ...]:
-        family = 'radial' if str(view.family) == 'radial' else ('tilted' if is_tilted_view(view) else '')
+        family = 'azimuthal' if str(view.family) == 'azimuthal' else ('tilted' if is_tilted_view(view) else '')
         matrix_key = _fused_renderer_affine_key(aff)
-        if family == 'radial':
+        if family == 'azimuthal':
             family_geometry: Tuple[object, ...] = (
-                radial_base_view_name(view), bool(is_tilted_radial_view(view)),
-                int(view.src_h), int(view.src_w), *radial_plane_shape(view),
+                azimuthal_base_view_name(view), bool(is_tilted_azimuthal_view(view)),
+                int(view.src_h), int(view.src_w), *azimuthal_plane_shape(view),
                 round(float(view.center_x), 6), round(float(view.center_y), 6),
                 round(float(view.roi_radius), 6),
                 np.ascontiguousarray(np.asarray(view.azimuths_deg, dtype=np.float32)).tobytes(),
@@ -2116,7 +2124,7 @@ class _GpuWorkerRenderEngine:
             family_geometry = ()
         return (
             self._volume_key, str(view.name), family, int(out_size), str(slot.input.dtype),
-            radial_source_mode() if family == 'radial' else '',
+            azimuthal_source_mode() if family == 'azimuthal' else '',
             matrix_key, family_geometry,
         )
 
@@ -2132,10 +2140,10 @@ class _GpuWorkerRenderEngine:
             return self._render_tilted_frame(
                 view, aff.M_out_to_src, int(out_size), int(out_size), int(frame_index),
             )
-        if is_tilted_radial_view(view):
-            plane = self._render_tilted_radial_native_resident_torch(view, int(frame_index))
-        elif is_radial_view(view):
-            plane = self._render_radial_native_resident_torch(view, int(frame_index))
+        if is_tilted_azimuthal_view(view):
+            plane = self._render_tilted_azimuthal_native_resident_torch(view, int(frame_index))
+        elif is_azimuthal_view(view):
+            plane = self._render_azimuthal_native_resident_torch(view, int(frame_index))
         else:
             raise ValueError(f'No fused reference renderer for {view.name!r}')
         if self._affine_is_identity_render(aff):
@@ -2170,11 +2178,11 @@ class _GpuWorkerRenderEngine:
         # Local import keeps the package dependency graph acyclic.
         from .backprojection import _ResidentTensorRTRingFatalError
 
-        family = 'radial' if str(view.family) == 'radial' else ('tilted' if is_tilted_view(view) else '')
+        family = 'azimuthal' if str(view.family) == 'azimuthal' else ('tilted' if is_tilted_view(view) else '')
         preflight_family = _fused_preflight_family(view)
         if not family:
             return
-        if family == 'radial' and not fused_radial_render_enabled():
+        if family == 'azimuthal' and not fused_azimuthal_render_enabled():
             return
         if family == 'tilted' and not fused_tilted_render_enabled():
             return
@@ -2208,18 +2216,18 @@ class _GpuWorkerRenderEngine:
 
         if (
             bool(compare_reference)
-            and family == 'radial'
-            and radial_source_mode() != 'texture_linear'
+            and family == 'azimuthal'
+            and azimuthal_source_mode() != 'texture_linear'
         ):
             try:
                 fused = slot.input[0, 0].to(self.torch.float32)
                 if not bool(self.torch.isfinite(fused).all().item()):
-                    raise RuntimeError('pointer Radial renderer produced non-finite pixels')
+                    raise RuntimeError('pointer Azimuthal renderer produced non-finite pixels')
                 min_value = float(fused.min().item()) if int(fused.numel()) else 0.0
                 max_value = float(fused.max().item()) if int(fused.numel()) else 0.0
                 if min_value < -1e-6 or max_value > 1.0 + 1e-6:
                     raise RuntimeError(
-                        f'pointer Radial renderer escaped normalized range [{min_value},{max_value}]'
+                        f'pointer Azimuthal renderer escaped normalized range [{min_value},{max_value}]'
                     )
             except BaseException as exc:
                 raise _ResidentTensorRTRingFatalError(
@@ -2373,7 +2381,7 @@ class _GpuWorkerRenderEngine:
 
         if not fused_render_cuda_graphs_enabled():
             return
-        family = 'radial' if str(view.family) == 'radial' else ('tilted' if is_tilted_view(view) else '')
+        family = 'azimuthal' if str(view.family) == 'azimuthal' else ('tilted' if is_tilted_view(view) else '')
         if not family or family in self._fused_disabled_families:
             return
         key = self._fused_renderer_key(slot, view, job.aff, int(out_size))
@@ -2395,7 +2403,7 @@ class _GpuWorkerRenderEngine:
             return
         dynamic_value = (
             int(frame_index)
-            if family == 'radial'
+            if family == 'azimuthal'
             else int(tilted_frame_center(view, int(frame_index)))
         )
         # Create zero-copy wrappers before stream capture; their addresses remain stable.
@@ -2443,13 +2451,13 @@ class _GpuWorkerRenderEngine:
             self._fused_graph_announced_families.add(family)
             print(f'P4 fused {family} renderer CUDA Graph active (dynamic device metadata).')
 
-    # radial taps / fold (device) ----
+    # azimuthal taps / fold (device) ----
 
-    def _radial_taps_gpu(self, view: ViewInfo, angle_deg: float) -> Tuple[object, object]:
-        """Device fallback for the active orientation-aware radial reconstruction filter."""
+    def _azimuthal_taps_gpu(self, view: ViewInfo, angle_deg: float) -> Tuple[object, object]:
+        """Device fallback for the active orientation-aware azimuthal reconstruction filter."""
         torch = self.torch
         dev = self.device
-        plane_h, plane_w = radial_plane_shape(view)
+        plane_h, plane_w = azimuthal_plane_shape(view)
         n_u = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
         coords = torch.linspace(
             -float(view.roi_radius), float(view.roi_radius), n_u,
@@ -2475,7 +2483,7 @@ class _GpuWorkerRenderEngine:
         w2d = (y_w.unsqueeze(2) * x_w.unsqueeze(1)).reshape(n_u, -1)
         return flat_idx, w2d
 
-    def _radial_fold_indices(
+    def _azimuthal_fold_indices(
         self,
         t_dim: int,
         rows: int,
@@ -2502,44 +2510,44 @@ class _GpuWorkerRenderEngine:
         self._fold_cache[key] = out
         return out
 
-    def _radial_project_blocks(self, block2d: object, flat_idx: object, w2d: object) -> object:
+    def _azimuthal_project_blocks(self, block2d: object, flat_idx: object, w2d: object) -> object:
         """(rows, H*W) u8 block -> (rows, u) float32 active-filter projection."""
         samples = block2d[:, flat_idx]
         return (samples.to(self.torch.float32) * w2d.unsqueeze(0)).sum(dim=-1)
 
-    def _render_radial_native_resident(self, view: ViewInfo, frame_idx: int) -> object:
-        """Render a Radial native plane, preferring the direct hardware texture kernel."""
-        if not radial_resident_gpu_render_supported(view):
-            raise RuntimeError(f'resident GPU Radial rendering is disabled for {view.name!r}')
-        if is_tilted_radial_view(view):
-            return self._render_tilted_radial_native_resident(view, int(frame_idx))
+    def _render_azimuthal_native_resident(self, view: ViewInfo, frame_idx: int) -> object:
+        """Render a Azimuthal native plane, preferring the direct hardware texture kernel."""
+        if not azimuthal_resident_gpu_render_supported(view):
+            raise RuntimeError(f'resident GPU Azimuthal rendering is disabled for {view.name!r}')
+        if is_tilted_azimuthal_view(view):
+            return self._render_tilted_azimuthal_native_resident(view, int(frame_idx))
         if (
-            self._radial_texture_admitted is not False
-            and _env_flag('YOLO_TTA_GPU_RADIAL_NATIVE_TEXTURE_KERNEL', True)
+            self._azimuthal_texture_admitted is not False
+            and _env_flag('YOLO_TTA_GPU_AZIMUTHAL_NATIVE_TEXTURE_KERNEL', True)
         ):
             try:
-                return self._render_radial_native_texture(view, int(frame_idx))
+                return self._render_azimuthal_native_texture(view, int(frame_idx))
             except Exception as exc:
-                if 'radial_native' not in self._fused_warned_families:
-                    self._fused_warned_families.add('radial_native')
+                if 'azimuthal_native' not in self._fused_warned_families:
+                    self._fused_warned_families.add('azimuthal_native')
                     print(
-                        f'Warning: upright Radial texture kernel unavailable ({exc}); '
+                        f'Warning: upright Azimuthal texture kernel unavailable ({exc}); '
                         'using the resident Torch reconstruction path.'
                     )
-        return self._render_radial_native_resident_torch(view, int(frame_idx))
+        return self._render_azimuthal_native_resident_torch(view, int(frame_idx))
 
-    def _render_radial_native_resident_torch(self, view: ViewInfo, frame_idx: int) -> object:
-        """Render an upright or tilted Radial frame directly from the resident source volume."""
-        if not radial_resident_gpu_render_supported(view):
-            raise RuntimeError(f'resident GPU Radial rendering is disabled for {view.name!r}')
-        if is_tilted_radial_view(view):
-            return self._render_tilted_radial_native_resident_torch(view, int(frame_idx))
+    def _render_azimuthal_native_resident_torch(self, view: ViewInfo, frame_idx: int) -> object:
+        """Render an upright or tilted Azimuthal frame directly from the resident source volume."""
+        if not azimuthal_resident_gpu_render_supported(view):
+            raise RuntimeError(f'resident GPU Azimuthal rendering is disabled for {view.name!r}')
+        if is_tilted_azimuthal_view(view):
+            return self._render_tilted_azimuthal_native_resident_torch(view, int(frame_idx))
         torch = self.torch
         vol = self._volume_gpu
-        base = radial_base_view_name(view)
+        base = azimuthal_base_view_name(view)
         rows_out = int(view.src_h)
         u_len = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
-        flat_idx, w2d = self._radial_taps_gpu(view, float(view.azimuths_deg[int(frame_idx)]))
+        flat_idx, w2d = self._azimuthal_taps_gpu(view, float(view.azimuths_deg[int(frame_idx)]))
 
         if base == 'transverse':
             native_t = int(vol.shape[0])
@@ -2548,17 +2556,17 @@ class _GpuWorkerRenderEngine:
             chunk = 512
             for t0 in range(0, native_t, chunk):
                 t1 = min(native_t, t0 + chunk)
-                proj[t0:t1] = self._radial_project_blocks(vol2d[t0:t1], flat_idx, w2d)
+                proj[t0:t1] = self._azimuthal_project_blocks(vol2d[t0:t1], flat_idx, w2d)
             if rows_out == native_t and int(self._logical_t) == native_t:
                 return proj
-            r0, r1, alpha = self._radial_fold_indices(
+            r0, r1, alpha = self._azimuthal_fold_indices(
                 native_t, rows_out, logical_t=int(self._logical_t),
             )
             return proj[r0] * (1.0 - alpha) + proj[r1] * alpha
 
-        stack_len = int(radial_stack_length(view))
+        stack_len = int(azimuthal_stack_length(view))
         proj = torch.empty((stack_len, u_len), dtype=torch.float32, device=self.device)
-        block = max(1, _env_int('YOLO_TTA_GPU_RADIAL_STACK_BLOCK', 32))
+        block = max(1, _env_int('YOLO_TTA_GPU_AZIMUTHAL_STACK_BLOCK', 32))
         for s0 in range(0, stack_len, block):
             s1 = min(stack_len, s0 + block)
             if base == 'sagittal':
@@ -2568,17 +2576,17 @@ class _GpuWorkerRenderEngine:
                 # source (native_t, Y, Xblock) -> logical (Xblock, t, Y)
                 oriented = self._resample_native_t_axis(vol[:, :, s0:s1]).permute(2, 0, 1).contiguous()
             else:  # pragma: no cover
-                raise ValueError(f'Unsupported resident Radial base: {base}')
-            proj[s0:s1] = self._radial_project_blocks(
+                raise ValueError(f'Unsupported resident Azimuthal base: {base}')
+            proj[s0:s1] = self._azimuthal_project_blocks(
                 oriented.view(s1 - s0, -1), flat_idx, w2d,
             )
         if rows_out == stack_len:
             return proj
-        r0, r1, alpha = self._radial_fold_indices(stack_len, rows_out)
+        r0, r1, alpha = self._azimuthal_fold_indices(stack_len, rows_out)
         return proj[r0] * (1.0 - alpha) + proj[r1] * alpha
 
-    def _render_tilted_radial_native_resident_torch(self, view: ViewInfo, frame_idx: int) -> object:
-        """Reference CUDA/Torch implementation matching ``extract_tilted_radial_slice_frame``.
+    def _render_tilted_azimuthal_native_resident_torch(self, view: ViewInfo, frame_idx: int) -> object:
+        """Reference CUDA/Torch implementation matching ``extract_tilted_azimuthal_slice_frame``.
 
  This path is retained when the allocation-free NVRTC kernel is unavailable or explicitly
  disabled. It keeps every gather and interpolation on the resident GPU and therefore never
@@ -2587,12 +2595,12 @@ class _GpuWorkerRenderEngine:
         vol = self._volume_gpu
         native_t, full_h, full_w = (int(v) for v in vol.shape)
         logical_t = int(self._logical_t)
-        base = str(radial_base_view_name(view))
-        stack_len = int(radial_stack_length(view))
+        base = str(azimuthal_base_view_name(view))
+        stack_len = int(azimuthal_stack_length(view))
         rows = int(view.src_h)
         u_len = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
-        plane_h, plane_w = radial_plane_shape(view)
-        flat_idx, w2d = self._radial_taps_gpu(
+        plane_h, plane_w = azimuthal_plane_shape(view)
+        flat_idx, w2d = self._azimuthal_taps_gpu(
             view, float(view.azimuths_deg[int(frame_idx)]),
         )
         px = torch.remainder(flat_idx, int(plane_w)).to(torch.int64)
@@ -2604,7 +2612,7 @@ class _GpuWorkerRenderEngine:
         elif str(view.tilt_direction) == 'horizontal':
             tap_offsets = px.to(torch.float32) - float(view.center_x)
         else:
-            raise ValueError(f'Unsupported tilted-Radial direction: {view.tilt_direction!r}')
+            raise ValueError(f'Unsupported tilted-Azimuthal direction: {view.tilt_direction!r}')
 
         if rows == stack_len:
             row_centers = torch.arange(rows, dtype=torch.float32, device=self.device)
@@ -2618,7 +2626,7 @@ class _GpuWorkerRenderEngine:
         out = torch.empty((rows, u_len), dtype=torch.float32, device=self.device)
         row_block = max(
             1,
-            min(256, _env_int('YOLO_TTA_GPU_TILTED_RADIAL_ROW_BLOCK', 32)),
+            min(256, _env_int('YOLO_TTA_GPU_TILTED_AZIMUTHAL_ROW_BLOCK', 32)),
         )
         plane_stride = int(full_h) * int(full_w)
         volume_flat = self._volume_flat
@@ -2680,40 +2688,40 @@ class _GpuWorkerRenderEngine:
                     v0 = (f00 + ta * (f01 - f00)).round_().clamp_(0.0, 255.0)
                     v1 = (f10 + ta * (f11 - f10)).round_().clamp_(0.0, 255.0)
             else:  # pragma: no cover
-                raise ValueError(f'Unsupported tilted-Radial base: {base!r}')
+                raise ValueError(f'Unsupported tilted-Azimuthal base: {base!r}')
 
             values = v0 + stack_alpha * (v1 - v0)
             values = torch.where(valid, values, zero)
             out[row0:row1] = (values * weights.unsqueeze(0)).sum(dim=-1)
         return out
 
-    def _render_radial_native_texture(self, view: ViewInfo, frame_idx: int) -> object:
-        """Render one upright or tilted Radial native plane from the selected source mode."""
+    def _render_azimuthal_native_texture(self, view: ViewInfo, frame_idx: int) -> object:
+        """Render one upright or tilted Azimuthal native plane from the selected source mode."""
         kernels = _fused_direct_render_kernels()
         if kernels is None:
             raise RuntimeError(
                 'CuPy/NVRTC kernels unavailable: '
                 + str(_FUSED_DIRECT_RENDER_KERNELS_ERROR or 'no diagnostic')
             )
-        geometry = self._ensure_fused_radial_taps(view, kernels)
-        source_mode = radial_source_mode()
+        geometry = self._ensure_fused_azimuthal_taps(view, kernels)
+        source_mode = azimuthal_source_mode()
         if source_mode == 'texture_linear':
-            source_arg = self._ensure_radial_texture(kernels).texture
-            kernel = kernels.radial_texture_native_f32
+            source_arg = self._ensure_azimuthal_texture(kernels).texture
+            kernel = kernels.azimuthal_texture_native_f32
         else:
             source_arg = self._fused_cupy_volume(kernels)
-            kernel = kernels.radial_pointer_native_f32
-        base = str(radial_base_view_name(view))
+            kernel = kernels.azimuthal_pointer_native_f32
+        base = str(azimuthal_base_view_name(view))
         base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
-        tilted = bool(is_tilted_radial_view(view))
+        tilted = bool(is_tilted_azimuthal_view(view))
         direction = str(view.tilt_direction) if tilted else 'vertical'
         if base not in base_ids or direction not in ('vertical', 'horizontal'):
             raise RuntimeError(
-                f'unsupported Radial texture geometry base={base!r}, direction={direction!r}'
+                f'unsupported Azimuthal texture geometry base={base!r}, direction={direction!r}'
             )
         rows = int(view.src_h)
         n_u = int(geometry.n_u)
-        stack_len = int(radial_stack_length(view))
+        stack_len = int(azimuthal_stack_length(view))
         out = self.torch.empty((rows, n_u), dtype=self.torch.float32, device=self.device)
         cp_out = kernels.cp.asarray(out)
         render_block = (32, 8)
@@ -2739,16 +2747,16 @@ class _GpuWorkerRenderEngine:
             ),
             stream=_cupy_external_stream(kernels.cp, self._stream),
         )
-        announce_key = 'tilted_radial_native' if tilted else 'radial_native'
+        announce_key = 'tilted_azimuthal_native' if tilted else 'azimuthal_native'
         if announce_key not in self._fused_announced_families:
             self._fused_announced_families.add(announce_key)
             print(
-                f'Resident {"tilted-" if tilted else ""}Radial native-plane kernel active: '
+                f'Resident {"tilted-" if tilted else ""}Azimuthal native-plane kernel active: '
                 f'source_mode={source_mode}.'
             )
         return out
 
-    def _render_radial_texture_grid(
+    def _render_azimuthal_texture_grid(
         self,
         view: ViewInfo,
         frame_idx: int,
@@ -2756,12 +2764,12 @@ class _GpuWorkerRenderEngine:
         out_h: int,
         out_w: int,
     ) -> object:
-        """Compose the output affine and Radial transform in one selected-source launch."""
-        if not is_radial_view(view):
-            raise ValueError(f'{view.name!r} is not a Radial view')
+        """Compose the output affine and Azimuthal transform in one selected-source launch."""
+        if not is_azimuthal_view(view):
+            raise ValueError(f'{view.name!r} is not a Azimuthal view')
         if int(frame_idx) < 0 or int(frame_idx) >= len(view.azimuths_deg):
             raise IndexError(
-                f'Radial frame index {int(frame_idx)} is outside [0,{len(view.azimuths_deg)})'
+                f'Azimuthal frame index {int(frame_idx)} is outside [0,{len(view.azimuths_deg)})'
             )
         kernels = _fused_direct_render_kernels()
         if kernels is None:
@@ -2769,30 +2777,30 @@ class _GpuWorkerRenderEngine:
                 'CuPy/NVRTC kernels unavailable: '
                 + str(_FUSED_DIRECT_RENDER_KERNELS_ERROR or 'no diagnostic')
             )
-        geometry = self._ensure_fused_radial_taps(view, kernels)
-        source_mode = radial_source_mode()
+        geometry = self._ensure_fused_azimuthal_taps(view, kernels)
+        source_mode = azimuthal_source_mode()
         if source_mode == 'texture_linear':
-            source_arg = self._ensure_radial_texture(kernels).texture
-            kernel = kernels.radial_texture_grid_f32
+            source_arg = self._ensure_azimuthal_texture(kernels).texture
+            kernel = kernels.azimuthal_texture_grid_f32
         else:
             source_arg = self._fused_cupy_volume(kernels)
-            kernel = kernels.radial_pointer_grid_f32
-        base = str(radial_base_view_name(view))
+            kernel = kernels.azimuthal_pointer_grid_f32
+        base = str(azimuthal_base_view_name(view))
         base_ids = {'transverse': 0, 'sagittal': 1, 'coronal': 2}
-        tilted = bool(is_tilted_radial_view(view))
+        tilted = bool(is_tilted_azimuthal_view(view))
         direction = str(view.tilt_direction) if tilted else 'vertical'
         if base not in base_ids or direction not in ('vertical', 'horizontal'):
             raise RuntimeError(
-                f'unsupported Radial texture geometry base={base!r}, direction={direction!r}'
+                f'unsupported Azimuthal texture geometry base={base!r}, direction={direction!r}'
             )
         matrix = np.asarray(M_out_to_src, dtype=np.float32).reshape(2, 3)
         if not bool(np.all(np.isfinite(matrix))):
-            raise RuntimeError('Radial output-to-source affine is non-finite')
+            raise RuntimeError('Azimuthal output-to-source affine is non-finite')
         rows = int(view.src_h)
         n_u = int(geometry.n_u)
-        stack_len = int(radial_stack_length(view))
+        stack_len = int(azimuthal_stack_length(view))
         if min(rows, n_u, stack_len, int(out_h), int(out_w)) <= 0:
-            raise RuntimeError('Radial texture output/source geometry is empty')
+            raise RuntimeError('Azimuthal texture output/source geometry is empty')
         out = self.torch.empty(
             (int(out_h), int(out_w)), dtype=self.torch.float32, device=self.device,
         )
@@ -2822,70 +2830,70 @@ class _GpuWorkerRenderEngine:
             ),
             stream=_cupy_external_stream(kernels.cp, self._stream),
         )
-        announce_key = 'tilted_radial_grid' if tilted else 'radial_grid'
+        announce_key = 'tilted_azimuthal_grid' if tilted else 'azimuthal_grid'
         if announce_key not in self._fused_announced_families:
             self._fused_announced_families.add(announce_key)
             print(
-                f'Direct {"tilted-" if tilted else ""}Radial grid renderer active: '
-                f'output affine + radial mapping + source_mode={source_mode} in one launch.'
+                f'Direct {"tilted-" if tilted else ""}Azimuthal grid renderer active: '
+                f'output affine + azimuthal mapping + source_mode={source_mode} in one launch.'
             )
         return out
 
-    def _render_tilted_radial_native_resident(self, view: ViewInfo, frame_idx: int) -> object:
-        """Render a tilted-Radial plane through the texture kernel, with Torch fallback."""
-        if not is_tilted_radial_view(view):
-            raise ValueError(f'{view.name!r} is not a tilted-Radial view')
+    def _render_tilted_azimuthal_native_resident(self, view: ViewInfo, frame_idx: int) -> object:
+        """Render a tilted-Azimuthal plane through the texture kernel, with Torch fallback."""
+        if not is_tilted_azimuthal_view(view):
+            raise ValueError(f'{view.name!r} is not a tilted-Azimuthal view')
         native_kernel_enabled = (
-            self._radial_texture_admitted is not False
-            and _env_flag('YOLO_TTA_GPU_TILTED_RADIAL_NATIVE_KERNEL', True)
+            self._azimuthal_texture_admitted is not False
+            and _env_flag('YOLO_TTA_GPU_TILTED_AZIMUTHAL_NATIVE_KERNEL', True)
         )
         if native_kernel_enabled:
             try:
-                return self._render_radial_native_texture(view, int(frame_idx))
+                return self._render_azimuthal_native_texture(view, int(frame_idx))
             except Exception as exc:
-                if 'tilted_radial_native' not in self._fused_warned_families:
-                    self._fused_warned_families.add('tilted_radial_native')
+                if 'tilted_azimuthal_native' not in self._fused_warned_families:
+                    self._fused_warned_families.add('tilted_azimuthal_native')
                     print(
-                        f'Warning: tilted-Radial texture kernel unavailable ({exc}); '
+                        f'Warning: tilted-Azimuthal texture kernel unavailable ({exc}); '
                         'using the resident Torch reconstruction path without requesting the host cube.'
                     )
-        return self._render_tilted_radial_native_resident_torch(view, int(frame_idx))
+        return self._render_tilted_azimuthal_native_resident_torch(view, int(frame_idx))
 
 
-    def prerender_radial_slab(
+    def prerender_azimuthal_slab(
         self,
         view: ViewInfo,
         frame_indices: Sequence[int],
     ) -> np.ndarray:
-        """GPU-render selected upright Radial frames from logical stack-axis slabs.
+        """GPU-render selected upright Azimuthal frames from logical stack-axis slabs.
 
         Transverse streams t slabs, sagittal streams y slabs arranged as ``(y,t,x)``,
         and coronal streams x slabs arranged as ``(x,t,y)``.  Each bounded slab is
-        contiguous before H2D transfer, so the active radial-filter projection contract is
-        shared by all three Cartesian Radial bases without materializing a full oriented
+        contiguous before H2D transfer, so the active azimuthal-filter projection contract is
+        shared by all three Cartesian Azimuthal bases without materializing a full oriented
         volume on either host or device.
         """
-        if not radial_streaming_gpu_render_supported(view):
+        if not azimuthal_streaming_gpu_render_supported(view):
             raise RuntimeError(
-                f'non-resident GPU Radial prerender does not support {view.name!r}'
+                f'non-resident GPU Azimuthal prerender does not support {view.name!r}'
             )
         if self._volume_mm is None:
-            raise RuntimeError('non-resident GPU Radial prerender has no source memmap')
+            raise RuntimeError('non-resident GPU Azimuthal prerender has no source memmap')
         torch = self.torch
         native_t, full_h, full_w = (int(x) for x in self._volume_mm.shape)
-        base = radial_base_view_name(view)
-        stack_len = int(radial_stack_length(view))
-        plane_h, plane_w = radial_plane_shape(view)
+        base = azimuthal_base_view_name(view)
+        stack_len = int(azimuthal_stack_length(view))
+        plane_h, plane_w = azimuthal_plane_shape(view)
         rows_out = int(view.src_h)
         u_len = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
         indices = tuple(int(value) for value in frame_indices)
         if not indices:
-            raise RuntimeError('streamed radial prerender received no frame indices')
+            raise RuntimeError('streamed azimuthal prerender received no frame indices')
         if len(set(indices)) != len(indices):
-            raise RuntimeError('streamed radial prerender frame indices must be unique')
+            raise RuntimeError('streamed azimuthal prerender frame indices must be unique')
         if any(value < 0 or value >= int(view.num_slices) for value in indices):
             raise RuntimeError(
-                f'streamed radial prerender indices are outside [0,{int(view.num_slices)})'
+                f'streamed azimuthal prerender indices are outside [0,{int(view.num_slices)})'
             )
         expected_plane = {
             'transverse': (full_h, full_w),
@@ -2897,7 +2905,7 @@ class _GpuWorkerRenderEngine:
             int(expected_plane[0]), int(expected_plane[1]), int(expected_stack)
         ):
             raise RuntimeError(
-                f'{base} Radial logical geometry mismatch: plane={plane_h}x{plane_w}, '
+                f'{base} Azimuthal logical geometry mismatch: plane={plane_h}x{plane_w}, '
                 f'stack={stack_len}; expected {expected_plane[0]}x{expected_plane[1]}, '
                 f'stack={expected_stack}'
             )
@@ -2905,7 +2913,7 @@ class _GpuWorkerRenderEngine:
         count = len(indices)
         slab = np.empty((count, rows_out, u_len), dtype=np.uint8)
         stack_block = max(1, min(int(gpu_render_tblock_slices()), int(stack_len)))
-        tap_count = int(RADIAL_FILTER_TAP_COUNT) ** 2
+        tap_count = int(AZIMUTHAL_FILTER_TAP_COUNT) ** 2
         per_az_bytes = (
             int(stack_len) * int(u_len) * np.dtype(np.float16).itemsize
             + int(u_len) * int(tap_count) * (
@@ -2935,19 +2943,19 @@ class _GpuWorkerRenderEngine:
             az_chunk = int(np.clip(budget // max(1, per_az_bytes), 1, count))
             if az_chunk < min(8, count):
                 raise RuntimeError(
-                    f'insufficient free VRAM for streamed {base} Radial prerender '
+                    f'insufficient free VRAM for streamed {base} Azimuthal prerender '
                     f'(az_chunk={az_chunk}, free={free_bytes / GIB:.1f} GiB)'
                 )
             fold = rows_out != stack_len
             if fold:
-                r0, r1, alpha = self._radial_fold_indices(stack_len, rows_out)
+                r0, r1, alpha = self._azimuthal_fold_indices(stack_len, rows_out)
             for a0 in range(0, count, az_chunk):
                 a1 = min(count, a0 + az_chunk)
                 proj = torch.zeros(
                     (a1 - a0, stack_len, u_len), dtype=torch.float16, device=self.device,
                 )
                 taps = [
-                    self._radial_taps_gpu(view, float(view.azimuths_deg[indices[i]]))
+                    self._azimuthal_taps_gpu(view, float(view.azimuths_deg[indices[i]]))
                     for i in range(a0, a1)
                 ]
                 for s0 in range(0, stack_len, stack_block):
@@ -2956,7 +2964,7 @@ class _GpuWorkerRenderEngine:
                     block = torch.from_numpy(block_np).to(self.device)
                     block2d = block.view(s1 - s0, -1)
                     for j, (flat_idx, w2d) in enumerate(taps):
-                        proj[j, s0:s1] = self._radial_project_blocks(
+                        proj[j, s0:s1] = self._azimuthal_project_blocks(
                             block2d, flat_idx, w2d,
                         ).to(torch.float16)
                     del block, block2d, block_np
@@ -3128,7 +3136,7 @@ class _GpuWorkerRenderEngine:
     ) -> object:
         """Apply PTA's post-quantization affine on the resident render stream.
 
-        PTA historically quantizes the native Radial projection to uint8 before
+        PTA historically quantizes the native Azimuthal projection to uint8 before
         its in-plane affine/resize. Keeping that boundary avoids the fused
         float-stage semantic change while removing the native-raster D2H,
         OpenCV warp, and subsequent H2D upload.
@@ -3218,8 +3226,8 @@ class _GpuWorkerRenderEngine:
     ) -> object:
         """Return one resident ordinary-Cartesian plane without a float round trip."""
 
-        if is_radial_view(view) or is_tilted_view(view):
-            raise ValueError("ordinary Cartesian u8 rendering excludes Radial/Tilted views")
+        if is_azimuthal_view(view) or is_radial_view(view) or is_tilted_view(view):
+            raise ValueError("ordinary Cartesian u8 rendering excludes cylindrical and Tilted views")
         physical = str(physical_view_name(view))
         if physical not in {"transverse", "sagittal", "coronal"}:
             raise ValueError(f"unsupported ordinary Cartesian view {physical!r}")
@@ -3279,6 +3287,8 @@ class _GpuWorkerRenderEngine:
         self._native_u8_plane_cache.clear()
 
     def _render_native_plane(self, view: ViewInfo, frame_idx: int) -> object:
+        if is_radial_view(view):
+            return self._render_radial_native_resident(view, int(frame_idx))
         vol = self._volume_gpu
         name = physical_view_name(view)
         if name == 'transverse':
@@ -3294,13 +3304,82 @@ class _GpuWorkerRenderEngine:
             return self._resample_native_t_axis(vol[:, int(frame_idx), :])
         if name == 'coronal':
             return self._resample_native_t_axis(vol[:, :, int(frame_idx)]).contiguous()
-        if str(view.family) == 'radial':
-            return self._render_radial_native_resident(view, int(frame_idx))
+        if str(view.family) == 'azimuthal':
+            return self._render_azimuthal_native_resident(view, int(frame_idx))
         raise ValueError(f'Unsupported view for GPU native plane: {name}')
 
+    def _render_radial_native_resident(self, view: ViewInfo, frame_idx: int) -> object:
+        """Sample one periodic shell patch from the resident uint8 source.
+
+        Coordinates are shared with CPU rendering and backprojection. Gather only
+        a bounded row block, preserving the uint8 native-frame boundary before
+        generic full-frame/tile affines. A deferred T resize must first reconstruct
+        each logical integer source voxel, including its uint8 rounding. Source
+        taps outside the cube have zero weight; fractional boundary samples retain
+        the contribution of their in-bounds taps without clamping the coordinate.
+        """
+        if not is_radial_view(view):
+            raise ValueError('Radial shell rendering requires a Radial view')
+        torch = self.torch
+        volume = self._volume_gpu
+        if volume is None:
+            raise RuntimeError('Radial shell rendering requires a resident source volume')
+        native_t, full_h, full_w = (int(v) for v in volume.shape)
+        logical_t = int(self._logical_t)
+        if (logical_t, full_h, full_w) != (int(view.full_t), int(view.full_h), int(view.full_w)):
+            raise ValueError('Radial shell source shape does not match physical view geometry')
+        rows, columns = int(view.src_h), int(view.src_w)
+        out = torch.empty((rows, columns), dtype=torch.float32, device=self.device)
+        row_block = max(1, min(256, _env_int('YOLO_TTA_GPU_RADIAL_ROW_BLOCK', 64)))
+        source_flat = self._volume_flat
+        native_indices = self._native_t_indices(logical_t) if native_t != logical_t else None
+
+        def gather(t: object, y: object, x: object) -> object:
+            spatial = y * full_w + x
+            stride = full_h * full_w
+            if native_indices is None:
+                return torch.take(source_flat, t * stride + spatial).to(torch.float32)
+            r0, r1, alpha = native_indices
+            f0 = torch.take(source_flat, r0[t] * stride + spatial).to(torch.float32)
+            f1 = torch.take(source_flat, r1[t] * stride + spatial).to(torch.float32)
+            return (f0 + alpha[t] * (f1 - f0)).round_().clamp_(0.0, 255.0)
+
+        for row0 in range(0, rows, row_block):
+            row1 = min(rows, row0 + row_block)
+            coordinates = radial_shell_coordinates(
+                view, int(frame_idx),
+                x=np.arange(columns, dtype=np.float32)[None, :],
+                y=np.arange(row0, row1, dtype=np.float32)[:, None],
+            )
+            valid = torch.as_tensor(
+                np.ascontiguousarray(coordinates[3]), dtype=torch.bool, device=self.device,
+            )
+            axis_taps = []
+            for coord, length in zip(coordinates[:3], (logical_t, full_h, full_w)):
+                lower_np = np.floor(coord).astype(np.int64)
+                fraction = (coord - lower_np).astype(np.float32)
+                taps = []
+                for offset, weight in ((0, np.float32(1) - fraction), (1, fraction)):
+                    index = lower_np + offset
+                    weight = weight * ((index >= 0) & (index < length))
+                    taps.append((
+                        torch.as_tensor(np.ascontiguousarray(np.clip(index, 0, length - 1)),
+                                        dtype=torch.int64, device=self.device),
+                        torch.as_tensor(np.ascontiguousarray(weight),
+                                        dtype=torch.float32, device=self.device),
+                    ))
+                axis_taps.append(taps)
+            values = torch.zeros_like(axis_taps[0][0][1])
+            for ti, tw in axis_taps[0]:
+                for yi, yw in axis_taps[1]:
+                    for xi, xw in axis_taps[2]:
+                        values.add_(gather(ti, yi, xi) * (tw * yw * xw))
+            out[row0:row1] = values.masked_fill_(~valid, 0.0).round_().clamp_(0.0, 255.0)
+        return out
+
     @staticmethod
-    def _mirror_radial_u_out_to_src(M_out_to_src: np.ndarray, source_width: int) -> np.ndarray:
-        """Compose output-to-source sampling with native radial-u reversal."""
+    def _mirror_azimuthal_u_out_to_src(M_out_to_src: np.ndarray, source_width: int) -> np.ndarray:
+        """Compose output-to-source sampling with native azimuthal-u reversal."""
         mirrored = np.asarray(M_out_to_src, dtype=np.float32).copy()
         mirrored[0, :] *= np.float32(-1.0)
         mirrored[0, 2] += np.float32(max(0, int(source_width) - 1))
@@ -3313,28 +3392,28 @@ class _GpuWorkerRenderEngine:
         frame_idx: int,
         out_size: int,
         *,
-        mirror_radial_u: bool = False,
+        mirror_azimuthal_u: bool = False,
     ) -> object:
         if is_tilted_view(view):
             return self._render_tilted_frame(
                 view, aff.M_out_to_src, int(out_size), int(out_size), int(frame_idx),
             )
-        mirror_u = bool(mirror_radial_u and is_radial_view(view))
-        if is_radial_view(view) and _env_flag('YOLO_TTA_GPU_RADIAL_DIRECT_TEXTURE_GRID', True):
+        mirror_u = bool(mirror_azimuthal_u and is_azimuthal_view(view))
+        if is_azimuthal_view(view) and _env_flag('YOLO_TTA_GPU_AZIMUTHAL_DIRECT_TEXTURE_GRID', True):
             try:
                 direct_matrix = (
-                    self._mirror_radial_u_out_to_src(aff.M_out_to_src, int(view.src_w))
+                    self._mirror_azimuthal_u_out_to_src(aff.M_out_to_src, int(view.src_w))
                     if mirror_u else aff.M_out_to_src
                 )
-                return self._render_radial_texture_grid(
+                return self._render_azimuthal_texture_grid(
                     view, int(frame_idx), direct_matrix, int(out_size), int(out_size),
                 )
             except Exception as exc:
-                warning_key = 'tilted_radial_grid_fallback' if is_tilted_radial_view(view) else 'radial_grid_fallback'
+                warning_key = 'tilted_azimuthal_grid_fallback' if is_tilted_azimuthal_view(view) else 'azimuthal_grid_fallback'
                 if warning_key not in self._fused_warned_families:
                     self._fused_warned_families.add(warning_key)
                     print(
-                        f'Warning: direct Radial texture-grid render unavailable ({exc}); '
+                        f'Warning: direct Azimuthal texture-grid render unavailable ({exc}); '
                         'using native-plane reconstruction followed by the affine warp.'
                     )
         plane = self._render_native_plane(view, int(frame_idx))
@@ -3359,7 +3438,7 @@ class _GpuWorkerRenderEngine:
         frame_idx: int,
         out_size: int,
         *,
-        mirror_radial_u: bool = False,
+        mirror_azimuthal_u: bool = False,
     ) -> object:
         """Render one tile inference raster directly when the view supports it."""
         matrix = np.asarray(M_out_to_src, dtype=np.float32)
@@ -3367,22 +3446,22 @@ class _GpuWorkerRenderEngine:
             return self._render_tilted_frame(
                 view, matrix, int(out_size), int(out_size), int(frame_idx),
             )
-        mirror_u = bool(mirror_radial_u and is_radial_view(view))
-        if is_radial_view(view) and _env_flag('YOLO_TTA_GPU_RADIAL_DIRECT_TEXTURE_GRID', True):
+        mirror_u = bool(mirror_azimuthal_u and is_azimuthal_view(view))
+        if is_azimuthal_view(view) and _env_flag('YOLO_TTA_GPU_AZIMUTHAL_DIRECT_TEXTURE_GRID', True):
             try:
                 direct_matrix = (
-                    self._mirror_radial_u_out_to_src(matrix, int(view.src_w))
+                    self._mirror_azimuthal_u_out_to_src(matrix, int(view.src_w))
                     if mirror_u else matrix
                 )
-                return self._render_radial_texture_grid(
+                return self._render_azimuthal_texture_grid(
                     view, int(frame_idx), direct_matrix, int(out_size), int(out_size),
                 )
             except Exception as exc:
-                warning_key = 'tilted_radial_tile_grid_fallback' if is_tilted_radial_view(view) else 'radial_tile_grid_fallback'
+                warning_key = 'tilted_azimuthal_tile_grid_fallback' if is_tilted_azimuthal_view(view) else 'azimuthal_tile_grid_fallback'
                 if warning_key not in self._fused_warned_families:
                     self._fused_warned_families.add(warning_key)
                     print(
-                        f'Warning: direct Radial tile texture-grid render unavailable ({exc}); '
+                        f'Warning: direct Azimuthal tile texture-grid render unavailable ({exc}); '
                         'using the cached native plane plus affine grid sampling.'
                     )
         plane = self._render_native_plane_cached(view, int(frame_idx))
@@ -3432,7 +3511,7 @@ class _GpuWorkerRenderEngine:
                         source_idx, mirror_u = source
                         unique_sources[source] = self._render_tile_plane(
                             view, matrix, int(source_idx), int(out_size),
-                            mirror_radial_u=bool(mirror_u),
+                            mirror_azimuthal_u=bool(mirror_u),
                         )
 
             frames: List[object] = []
@@ -3479,7 +3558,7 @@ class _GpuWorkerRenderEngine:
                         source_idx, mirror_u = source
                         unique_sources[source] = self._render_fullframe_frame(
                             view, job.aff, int(source_idx), int(out_size),
-                            mirror_radial_u=bool(mirror_u),
+                            mirror_azimuthal_u=bool(mirror_u),
                         )
 
             frames: List[object] = []
@@ -3550,7 +3629,7 @@ class _GpuWorkerRenderEngine:
                 source_idx, mirror_u = source
                 plane = self._render_fullframe_frame(
                     view, job.aff, int(source_idx), int(out_size),
-                    mirror_radial_u=bool(mirror_u),
+                    mirror_azimuthal_u=bool(mirror_u),
                 )
                 plane.clamp_(0.0, 255.0).mul_(1.0 / 255.0)
                 slot.input[0, int(channel_idx)].copy_(plane, non_blocking=True)
@@ -3595,7 +3674,7 @@ class _GpuWorkerRenderEngine:
                 source_index, mirror_u = source
                 plane = self._render_tile_plane(
                     view, matrix, int(source_index), int(out_size),
-                    mirror_radial_u=bool(mirror_u),
+                    mirror_azimuthal_u=bool(mirror_u),
                 )
                 plane.clamp_(0.0, 255.0).mul_(1.0 / 255.0)
                 slot.input[0, int(channel_index)].copy_(plane, non_blocking=True)
@@ -3629,6 +3708,7 @@ class GpuRenderedYoloSource:
         require_forward_sampling('cuda', DataRole.INTENSITY)
         self.engine = engine
         self.view = view
+        self.resident_ring_supported = not is_radial_view(view)
         self.job = job
         self.slice_offset = int(slice_offset)
         self.name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(name)).strip('_') or 'gpu_rendered_volume'
@@ -3646,7 +3726,7 @@ class GpuRenderedYoloSource:
         self.bs = max(1, int(batch_size))
         self.yield_nf = int(math.ceil(float(self.nf) / float(self.bs)) * self.bs) if self.nf > 0 else 0
         self.synthetic_count = max(0, int(self.yield_nf) - int(self.nf))
-        self.radial_padding_count = radial_batch_padding_count(
+        self.azimuthal_padding_count = azimuthal_batch_padding_count(
             self.view, self.nf, self.bs, slice_offset=self.slice_offset,
         )
         self.mode = 'image'
@@ -3695,6 +3775,8 @@ class GpuRenderedYoloSource:
  Unified ``--quantize`` selects the predictor precision policy, but exported TensorRT
  engines may expose an input binding whose dtype differs from that policy. The capability
  probe resolves the actual binding first; ``self.fp16`` is only the generic fallback."""
+        if not bool(getattr(self, 'resident_ring_supported', True)):
+            raise RuntimeError('Radial shell views use generic CUDA inference; the resident ring is unsupported')
         if (
             self.bs != 1
             or self.nf <= 0
@@ -3730,7 +3812,7 @@ class GpuRenderedYoloSource:
                 for i in range(2)
             ]
         family = (
-            'radial' if str(self.view.family) == 'radial'
+            'azimuthal' if str(self.view.family) == 'azimuthal'
             else ('tilted' if is_tilted_view(self.view) else '')
         )
         if int(self.channel_count) == 1 and family:
@@ -3813,17 +3895,17 @@ class GpuRenderedYoloSource:
         last_real_idx = max(0, int(self.nf) - 1)
         for idx in range(start, stop):
             spec = self.result_frame_spec(int(idx))
-            radial_wrap = bool(spec is not None and spec.is_radial_padding)
-            real_idx = int(idx) if (int(idx) < int(self.nf) or radial_wrap) else int(last_real_idx)
+            azimuthal_wrap = bool(spec is not None and spec.is_azimuthal_padding)
+            real_idx = int(idx) if (int(idx) < int(self.nf) or azimuthal_wrap) else int(last_real_idx)
             synthetic = int(idx) >= int(self.nf)
-            suffix = '_radial_wrap' if radial_wrap else ('_synthetic' if synthetic else '')
+            suffix = '_azimuthal_wrap' if azimuthal_wrap else ('_synthetic' if synthetic else '')
             abs_indices.append(int(self.slice_offset) + int(real_idx))
             paths.append(f'{self.name}_{idx + 1:06d}{suffix}.png')
-            if radial_wrap and spec is not None:
+            if azimuthal_wrap and spec is not None:
                 info.append(
-                    f'gpu-rendered {self.name} radial seam extension {idx + 1}/{self.yield_nf} '
+                    f'gpu-rendered {self.name} azimuthal seam extension {idx + 1}/{self.yield_nf} '
                     f'wraps to slice {int(spec.global_destination_index) + 1}/{int(self.view.num_slices)} '
-                    f'with radial-u {"mirrored" if spec.mirror_radial_u else "unchanged"}: '
+                    f'with azimuthal-u {"mirrored" if spec.mirror_azimuthal_u else "unchanged"}: '
                 )
             elif synthetic:
                 info.append(f'gpu-rendered {self.name} synthetic padded slice {idx + 1}/{self.yield_nf} repeats real slice {real_idx + 1}/{self.nf}: ')
@@ -3870,6 +3952,7 @@ class GpuTileRenderedYoloSource:
         require_forward_sampling('cuda', DataRole.INTENSITY)
         self.engine = engine
         self.view = view
+        self.resident_ring_supported = not is_radial_view(view)
         self.tile_job = tile_job
         self.tile_affine = np.asarray(tile_job.M_out_to_src, dtype=np.float32)
         self.slice_offset = int(slice_offset)
@@ -3884,7 +3967,7 @@ class GpuTileRenderedYoloSource:
         self.bs = max(1, int(batch_size))
         self.yield_nf = int(math.ceil(float(self.nf) / float(self.bs)) * self.bs) if self.nf > 0 else 0
         self.synthetic_count = max(0, int(self.yield_nf) - int(self.nf))
-        self.radial_padding_count = radial_batch_padding_count(
+        self.azimuthal_padding_count = azimuthal_batch_padding_count(
             self.view, self.nf, self.bs, slice_offset=self.slice_offset,
         )
         self.mode = 'image'
@@ -3930,6 +4013,8 @@ class GpuTileRenderedYoloSource:
 
     def prepare_direct_ring(self, input_dtype: Optional[object] = None) -> List[_ResidentGpuPipelineSlot]:
         """Allocate and validate two static TensorRT input slots for this tile."""
+        if not bool(getattr(self, 'resident_ring_supported', True)):
+            raise RuntimeError('Radial shell views use generic CUDA inference; the resident tile ring is unsupported')
         if self.bs != 1 or self.nf <= 0 or str(getattr(self.engine, '_mode', '')) != 'resident':
             raise RuntimeError('direct tile ring requires a nonempty batch-1 resident tile source')
         torch = self.engine.torch
@@ -4000,17 +4085,17 @@ class GpuTileRenderedYoloSource:
         last_real_idx = max(0, int(self.nf) - 1)
         for idx in range(start, stop):
             spec = self.result_frame_spec(int(idx))
-            radial_wrap = bool(spec is not None and spec.is_radial_padding)
-            real_idx = int(idx) if (int(idx) < int(self.nf) or radial_wrap) else int(last_real_idx)
+            azimuthal_wrap = bool(spec is not None and spec.is_azimuthal_padding)
+            real_idx = int(idx) if (int(idx) < int(self.nf) or azimuthal_wrap) else int(last_real_idx)
             synthetic = int(idx) >= int(self.nf)
-            suffix = '_radial_wrap' if radial_wrap else ('_synthetic' if synthetic else '')
+            suffix = '_azimuthal_wrap' if azimuthal_wrap else ('_synthetic' if synthetic else '')
             absolute_indices.append(int(self.slice_offset) + int(real_idx))
             paths.append(f'{self.name}_{idx + 1:06d}{suffix}.png')
-            if radial_wrap and spec is not None:
+            if azimuthal_wrap and spec is not None:
                 info.append(
-                    f'gpu-tile {self.name} radial seam extension {idx + 1}/{self.yield_nf} '
+                    f'gpu-tile {self.name} azimuthal seam extension {idx + 1}/{self.yield_nf} '
                     f'wraps to slice {int(spec.global_destination_index) + 1}/{int(self.view.num_slices)} '
-                    f'with radial-u {"mirrored" if spec.mirror_radial_u else "unchanged"}: '
+                    f'with azimuthal-u {"mirrored" if spec.mirror_azimuthal_u else "unchanged"}: '
                 )
             elif synthetic:
                 info.append(
@@ -4032,7 +4117,7 @@ class GpuTileRenderedYoloSource:
 
 _WORKER_GPU_RENDER_ENGINE: Optional[_GpuWorkerRenderEngine] = None
 
-_WORKER_TILTED_RADIAL_CPU_WARNED: set[str] = set()
+_WORKER_TILTED_AZIMUTHAL_CPU_WARNED: set[str] = set()
 
 def _worker_gpu_render_engine() -> Optional[_GpuWorkerRenderEngine]:
     return _WORKER_GPU_RENDER_ENGINE
@@ -4055,16 +4140,16 @@ def _init_worker_gpu_render_engine(device_str: str = 'cuda:0') -> Optional[_GpuW
         _WORKER_GPU_RENDER_ENGINE = None
     return _WORKER_GPU_RENDER_ENGINE
 
-def _radial_slab_context_indices(
+def _azimuthal_slab_context_indices(
     view: ViewInfo,
     center_start: int,
     center_count: int,
     channel_format: ChannelFormat,
     batch_size: int = 1,
 ) -> Tuple[int, ...]:
-    """Return the sparse global plane bank required by one radial task window."""
+    """Return the sparse global plane bank required by one azimuthal task window."""
     fmt = resolve_channel_format(channel_format)
-    execution_count = int(center_count) + radial_batch_padding_count(
+    execution_count = int(center_count) + azimuthal_batch_padding_count(
         view, int(center_count), int(batch_size), slice_offset=int(center_start),
     )
     required = {
@@ -4074,7 +4159,7 @@ def _radial_slab_context_indices(
     }
     return tuple(sorted(int(value) for value in required))
 
-def _radial_slab_channel_renderer(
+def _azimuthal_slab_channel_renderer(
     slab: np.ndarray,
     frame_indices: Sequence[int],
     view: ViewInfo,
@@ -4083,16 +4168,16 @@ def _radial_slab_channel_renderer(
     center_start: int,
     channel_format: ChannelFormat,
 ) -> Callable[[int], np.ndarray]:
-    """Apply the job affine to a sparse radial plane bank and assemble HWC stacks."""
+    """Apply the job affine to a sparse azimuthal plane bank and assemble HWC stacks."""
     fmt = resolve_channel_format(channel_format)
     indices = tuple(int(value) for value in frame_indices)
     bank = np.asarray(slab, dtype=np.uint8)
     if bank.ndim != 3 or int(bank.shape[0]) != len(indices):
         raise ValueError(
-            f'radial slab shape {bank.shape} does not match {len(indices)} frame indices'
+            f'azimuthal slab shape {bank.shape} does not match {len(indices)} frame indices'
         )
     if len(set(indices)) != len(indices):
-        raise ValueError('radial slab frame indices must be unique')
+        raise ValueError('azimuthal slab frame indices must be unique')
 
     aff = job.aff
     identity = (
@@ -4109,7 +4194,7 @@ def _radial_slab_channel_renderer(
         if identity:
             if plane.shape != (int(aff.out_size), int(aff.out_size)):
                 raise ValueError(
-                    f'identity radial slab plane has shape {plane.shape}, expected '
+                    f'identity azimuthal slab plane has shape {plane.shape}, expected '
                     f'({int(aff.out_size)},{int(aff.out_size)})'
                 )
             return plane
@@ -4135,7 +4220,7 @@ def _radial_slab_channel_renderer(
             return transformed[row_by_index[int(global_idx)]]
         except KeyError as exc:
             raise IndexError(
-                f'global radial plane {int(global_idx)} was not prerendered'
+                f'global azimuthal plane {int(global_idx)} was not prerendered'
             ) from exc
 
     def _render_mirrored_plane(global_idx: int) -> np.ndarray:
@@ -4143,9 +4228,9 @@ def _radial_slab_channel_renderer(
             native_plane = bank[row_by_index[int(global_idx)]]
         except KeyError as exc:
             raise IndexError(
-                f'global radial plane {int(global_idx)} was not prerendered'
+                f'global azimuthal plane {int(global_idx)} was not prerendered'
             ) from exc
-        # Reverse native radial-u before the job affine. Flipping the already transformed
+        # Reverse native azimuthal-u before the job affine. Flipping the already transformed
         # inference plane would compose in the wrong order for nonzero TTA angles.
         return _transform_native_plane(native_plane, mirror_u=True)
 

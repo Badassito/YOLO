@@ -13,16 +13,16 @@ install_stubs()
 from XTA import cuda_backend, geometry, inference
 
 
-class RadialBatchPaddingTests(unittest.TestCase):
+class AzimuthalBatchPaddingTests(unittest.TestCase):
     @staticmethod
-    def _radial_view(num_slices: int = 3) -> geometry.ViewInfo:
+    def _azimuthal_view(num_slices: int = 3) -> geometry.ViewInfo:
         return geometry.ViewInfo(
-            name='radial_transverse',
+            name='azimuthal_transverse',
             num_slices=int(num_slices),
             src_h=2,
             src_w=4,
             pad_mode='pad',
-            family='radial',
+            family='azimuthal',
             azimuths_deg=tuple(
                 float(index * 180.0 / num_slices) for index in range(num_slices)
             ),
@@ -54,19 +54,19 @@ class RadialBatchPaddingTests(unittest.TestCase):
         _paths, images, info = next(source)
 
         self.assertEqual(source.synthetic_count, 7)
-        self.assertEqual(source.radial_padding_count, 0)
+        self.assertEqual(source.azimuthal_padding_count, 0)
         self.assertEqual(len(images), 10)
         for result_index in range(3, 10):
             self.assertIsNone(source.result_frame_spec(result_index))
             np.testing.assert_array_equal(images[result_index][:, :, 0], planes[2])
             self.assertIn('repeats real slice 3/3', info[result_index])
 
-    def test_one_wrap_radial_source_mirrors_input_and_inverse_accumulates_to_slice_zero(self) -> None:
-        view = self._radial_view()
+    def test_one_wrap_azimuthal_source_mirrors_input_and_inverse_accumulates_to_slice_zero(self) -> None:
+        view = self._azimuthal_view()
         planes = self._planes()
         source = geometry.InMemoryYoloVolumeSource(
             planes,
-            name='radial',
+            name='azimuthal',
             batch_size=4,
             view=view,
         )
@@ -74,8 +74,8 @@ class RadialBatchPaddingTests(unittest.TestCase):
         spec = source.result_frame_spec(3)
         self.assertIsNotNone(spec)
         assert spec is not None
-        self.assertTrue(spec.is_radial_padding)
-        self.assertTrue(spec.mirror_radial_u)
+        self.assertTrue(spec.is_azimuthal_padding)
+        self.assertTrue(spec.mirror_azimuthal_u)
         self.assertEqual(spec.global_destination_index, 0)
         np.testing.assert_array_equal(images[3][:, :, 0], planes[0][:, ::-1])
 
@@ -88,8 +88,8 @@ class RadialBatchPaddingTests(unittest.TestCase):
                 spec,
                 view_union_mm=destination,
                 view_confmap_mm=None,
-                radial_padding_union_mm=None,
-                radial_padding_confmap_mm=None,
+                azimuthal_padding_union_mm=None,
+                azimuthal_padding_confmap_mm=None,
                 M_out_to_native=identity,
                 native_w=4,
             )
@@ -129,7 +129,7 @@ class RadialBatchPaddingTests(unittest.TestCase):
         self.assertEqual(int(np.count_nonzero(destination[1:])), 0)
 
     def test_padding_only_prediction_uses_aux_sink_without_corrupting_logical_stats(self) -> None:
-        view = self._radial_view()
+        view = self._azimuthal_view()
         source = geometry.InMemoryYoloVolumeSource(
             self._planes(),
             name='padding-only',
@@ -195,19 +195,19 @@ class RadialBatchPaddingTests(unittest.TestCase):
                 native_h=4,
                 native_w=4,
                 postprocess_workers=2,
-                radial_padding_union_mm=padding_destination,
-                radial_padding_confmap_mm=None,
+                azimuthal_padding_union_mm=padding_destination,
+                azimuthal_padding_confmap_mm=None,
             )
 
         self.assertEqual(stats['prediction_count'], 0)
         self.assertEqual(stats['frames_with_predictions'], 0)
-        self.assertEqual(stats['radial_padding_processed'], 1)
+        self.assertEqual(stats['azimuthal_padding_processed'], 1)
         self.assertEqual(int(np.count_nonzero(destination)), 0)
         self.assertEqual(int(padding_destination[0, 1, 3]), 1)
 
     def test_multiwrap_batch_preserves_exact_destinations_and_crossing_parity(self) -> None:
-        view = self._radial_view()
-        specs = geometry.radial_batch_padding_frame_specs(
+        view = self._azimuthal_view()
+        specs = geometry.azimuthal_batch_padding_frame_specs(
             view,
             num_frames=3,
             batch_size=10,
@@ -219,11 +219,11 @@ class RadialBatchPaddingTests(unittest.TestCase):
             [0, 1, 2, 0, 1, 2, 0],
         )
         self.assertEqual(
-            [spec.mirror_radial_u for spec in specs],
+            [spec.mirror_azimuthal_u for spec in specs],
             [True, True, True, False, False, False, True],
         )
         self.assertEqual(
-            geometry.radial_batch_padding_mirror_groups(view, 3, 10),
+            geometry.azimuthal_batch_padding_mirror_groups(view, 3, 10),
             (True, False),
         )
 
@@ -238,8 +238,8 @@ class RadialBatchPaddingTests(unittest.TestCase):
                 even_spec,
                 view_union_mm=np.zeros((3, 2, 4), dtype=np.uint8),
                 view_confmap_mm=None,
-                radial_padding_union_mm=None,
-                radial_padding_confmap_mm=None,
+                azimuthal_padding_union_mm=None,
+                azimuthal_padding_confmap_mm=None,
                 M_out_to_native=identity,
                 native_w=4,
             )
@@ -249,11 +249,11 @@ class RadialBatchPaddingTests(unittest.TestCase):
         np.testing.assert_array_equal(affine, identity)
 
     def test_multiwrap_in_memory_compatibility_frames_follow_parity(self) -> None:
-        view = self._radial_view()
+        view = self._azimuthal_view()
         planes = self._planes()
         source = geometry.InMemoryYoloVolumeSource(
             planes,
-            name='radial-multiwrap',
+            name='azimuthal-multiwrap',
             batch_size=10,
             view=view,
         )
@@ -269,7 +269,7 @@ class RadialBatchPaddingTests(unittest.TestCase):
         np.testing.assert_array_equal(images[9][:, :, 0], planes[0][:, ::-1])
 
     def test_streaming_source_renders_every_wrapped_center_instead_of_repeating_tail(self) -> None:
-        view = self._radial_view()
+        view = self._azimuthal_view()
         planes = self._planes()
         requested_centers: list[int] = []
 
@@ -282,7 +282,7 @@ class RadialBatchPaddingTests(unittest.TestCase):
         source = geometry.StreamingYoloVolumeSource(
             render,
             num_frames=3,
-            name='streaming-radial-multiwrap',
+            name='streaming-azimuthal-multiwrap',
             batch_size=10,
             out_size=None,
             render_workers=1,
@@ -301,7 +301,7 @@ class RadialBatchPaddingTests(unittest.TestCase):
         np.testing.assert_array_equal(images[9][:, :, 0], planes[0][:, ::-1])
 
     def test_resident_fullframe_and_tile_sources_forward_logical_multiwrap_indices(self) -> None:
-        view = self._radial_view()
+        view = self._azimuthal_view()
 
         class FakeEngine:
             def __init__(self) -> None:
@@ -343,7 +343,7 @@ class RadialBatchPaddingTests(unittest.TestCase):
                 batch_size=10,
                 out_size=4,
                 fp16=False,
-                name='gpu-full-radial-multiwrap',
+                name='gpu-full-azimuthal-multiwrap',
             )
             tile_source = cuda_backend.GpuTileRenderedYoloSource(
                 engine,
@@ -354,7 +354,7 @@ class RadialBatchPaddingTests(unittest.TestCase):
                 batch_size=10,
                 out_size=4,
                 fp16=False,
-                name='gpu-tile-radial-multiwrap',
+                name='gpu-tile-azimuthal-multiwrap',
             )
 
         next(full_source)
@@ -364,7 +364,7 @@ class RadialBatchPaddingTests(unittest.TestCase):
         self.assertEqual(engine.tile_indices, list(range(10)))
         self.assertEqual(
             [
-                full_source.result_frame_spec(index).mirror_radial_u
+                full_source.result_frame_spec(index).mirror_azimuthal_u
                 for index in range(3, 10)
             ],
             [True, True, True, False, False, False, True],
@@ -378,8 +378,8 @@ class RadialBatchPaddingTests(unittest.TestCase):
         )
 
     def test_tile_contract_keeps_parity_crops_and_empty_completion_ids_separate(self) -> None:
-        view = self._radial_view()
-        result_ids = geometry.radial_batch_padding_tile_result_ids(
+        view = self._azimuthal_view()
+        result_ids = geometry.azimuthal_batch_padding_tile_result_ids(
             'tile-7', view, 3, 10,
         )
 
@@ -387,8 +387,8 @@ class RadialBatchPaddingTests(unittest.TestCase):
             result_ids,
             (
                 'tile-7',
-                'tile-7__radial_batch_seam_mirrored',
-                'tile-7__radial_batch_seam_unmirrored',
+                'tile-7__azimuthal_batch_seam_mirrored',
+                'tile-7__azimuthal_batch_seam_unmirrored',
             ),
         )
         # Completion IDs are geometry-derived, not foreground-derived; both auxiliary IDs
@@ -396,7 +396,7 @@ class RadialBatchPaddingTests(unittest.TestCase):
         self.assertEqual(len(set(result_ids)), 3)
         original_crop = (1, 5, 2, 6)
         self.assertEqual(
-            geometry.mirrored_radial_parent_crop(original_crop, parent_width=10),
+            geometry.mirrored_azimuthal_parent_crop(original_crop, parent_width=10),
             (1, 5, 4, 8),
         )
         self.assertEqual(original_crop, (1, 5, 2, 6))

@@ -40,7 +40,7 @@ class PtaModeBoundaryTests(unittest.TestCase):
             "--augmentation_ratio", "2.5", "--augmentation_execution", "offline",
             "--offline_augmentation_backend", "gpu", "--gpu_batch_size", "7",
             "--enable_cartesian", "sagittal,transverse",
-            "--enable_radial", "transverse:2.5", "tilted_coronal:auto",
+            "--enable_azimuthal", "transverse:2.5", "tilted_coronal:auto",
             "--enable_tilted", "coronal:15:horizontal",
             "--enable_tile", "512:256", "128:64", "--workers", "4",
             "--frame_workers", "3", "--png_compression", "5",

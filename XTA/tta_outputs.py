@@ -52,7 +52,7 @@ class TtaOutputArtifacts:
     final_output_mask_mm: np.ndarray
     final_union_mm: np.ndarray
     native_view_support_by_model: Dict[str, Dict[str, np.ndarray]]
-    radial_native_output_by_model: Dict[str, Dict[str, np.ndarray]]
+    azimuthal_native_output_by_model: Dict[str, Dict[str, np.ndarray]]
     tilted_native_output_by_model: Dict[str, Dict[str, np.ndarray]]
     view_volumes_by_model: Dict[str, Dict[str, np.ndarray]]
     parent_mask_support_by_model: Dict[str, Dict[str, object]]
@@ -104,7 +104,7 @@ class TtaOutputArtifacts:
                 operations.close_memmap_array(volume)
                 close_memmap_calls += 1
             model_support.clear()
-        for model_views in self.radial_native_output_by_model.values():
+        for model_views in self.azimuthal_native_output_by_model.values():
             for volume in model_views.values():
                 operations.close_memmap_array(volume)
                 close_memmap_calls += 1

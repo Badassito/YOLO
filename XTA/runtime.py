@@ -67,10 +67,10 @@ if TYPE_CHECKING:
     from .geometry import (
         TILTED_VIEW_FAMILY,
         ViewInfo,
-        is_radial_view,
-        is_tilted_radial_view,
+        is_azimuthal_view,
+        is_tilted_azimuthal_view,
         is_tilted_view,
-        radial_base_view_name,
+        azimuthal_base_view_name,
         tilted_base_view_name,
     )
     from .interpolation import interpolate_view_volume_pass_inplace
@@ -1108,9 +1108,155 @@ def plan_openvino_cpu_instances(
         ))
     return plans
 
+class _WindowsAffinityApi:
+    """Small Win32 affinity adapter; constructed only on Windows.
+
+    CPU IDs in this API are group-local. Refuse multi-group hosts rather than
+    interpreting XTA's flat CPU IDs as the wrong processor group's bit numbers.
+    """
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        self.ctypes = ctypes
+        self.kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+
+        class GroupAffinity(ctypes.Structure):
+            _fields_ = [('Mask', ctypes.c_size_t), ('Group', wintypes.WORD),
+                        ('Reserved', wintypes.WORD * 3)]
+
+        self.group_type = GroupAffinity
+        specs = {
+            'GetCurrentProcess': ([], wintypes.HANDLE),
+            'GetActiveProcessorGroupCount': ([], wintypes.WORD),
+            'GetProcessAffinityMask': ([wintypes.HANDLE, ctypes.POINTER(ctypes.c_size_t),
+                                        ctypes.POINTER(ctypes.c_size_t)], wintypes.BOOL),
+            'OpenThread': ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+            'GetThreadGroupAffinity': ([wintypes.HANDLE, ctypes.POINTER(GroupAffinity)], wintypes.BOOL),
+            'SetThreadAffinityMask': ([wintypes.HANDLE, ctypes.c_size_t], ctypes.c_size_t),
+            'CloseHandle': ([wintypes.HANDLE], wintypes.BOOL),
+        }
+        for name, (arguments, result) in specs.items():
+            function = getattr(self.kernel, name)
+            function.argtypes, function.restype = arguments, result
+
+    def process_masks(self) -> Tuple[int, int]:
+        if self.kernel.GetActiveProcessorGroupCount() != 1:
+            raise OSError('Windows affinity requires an unambiguous single processor group')
+        process, system = self.ctypes.c_size_t(), self.ctypes.c_size_t()
+        if not self.kernel.GetProcessAffinityMask(
+            self.kernel.GetCurrentProcess(), self.ctypes.byref(process), self.ctypes.byref(system),
+        ):
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+        return int(process.value), int(system.value)
+
+    def thread_mask(self, tid: int) -> Tuple[int, int]:
+        handle = self.kernel.OpenThread(0x0800, False, int(tid))  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+        try:
+            value = self.group_type()
+            if not self.kernel.GetThreadGroupAffinity(handle, self.ctypes.byref(value)):
+                raise self.ctypes.WinError(self.ctypes.get_last_error())
+            return int(value.Mask), int(value.Group)
+        finally:
+            self.kernel.CloseHandle(handle)
+
+    def restore_thread_mask(self, tid: int, mask: int) -> None:
+        handle = self.kernel.OpenThread(0x0820, False, int(tid))  # QUERY_LIMITED + SET_INFORMATION
+        if not handle:
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+        try:
+            if not self.kernel.SetThreadAffinityMask(handle, int(mask)):
+                raise self.ctypes.WinError(self.ctypes.get_last_error())
+        finally:
+            self.kernel.CloseHandle(handle)
+
+
+def _windows_setaffinity_all_threads(cpus: Sequence[int], *, _process=None, _api=None) -> bool:
+    """Set the Windows process/default mask and verify every surviving thread.
+
+    SetProcessAffinityMask (used by psutil) applies to the process's threads and
+    future children. GetThreadGroupAffinity verifies native/library threads too.
+    A denied live thread or any mismatched mask is failure, never partial success.
+    Existing process/thread masks are restored best-effort if verification fails.
+    """
+    import operator
+
+    try:
+        requested = {operator.index(cpu) for cpu in cpus}
+        if not requested or min(requested) < 0:
+            return False
+        import psutil
+        process = _process if _process is not None else psutil.Process()
+        api = _api if _api is not None else _WindowsAffinityApi()
+        original_mask, system_mask = api.process_masks()
+        if not original_mask or not system_mask or max(requested) >= system_mask.bit_length():
+            return False
+        mask = sum(1 << cpu for cpu in requested)
+        if mask & ~system_mask:
+            return False
+        original_cpus = [cpu for cpu in range(system_mask.bit_length()) if original_mask & (1 << cpu)]
+        originals = {}
+
+        def live_tids():
+            return {int(thread.id) for thread in process.threads()}
+
+        initial = live_tids()
+        if not initial:
+            return False
+        for tid in initial:
+            try:
+                old_mask, group = api.thread_mask(tid)
+            except OSError:
+                if tid not in live_tids():
+                    continue
+                raise
+            if group != 0 or not old_mask or old_mask & ~system_mask:
+                return False
+            originals[tid] = old_mask
+    except Exception:
+        return False
+
+    try:
+        process.cpu_affinity(sorted(requested))
+        # A second snapshot catches threads created during the first query.
+        # New threads inherit the process restriction even after this check.
+        for _ in range(3):
+            verified = set()
+            for tid in live_tids():
+                try:
+                    thread_mask, group = api.thread_mask(tid)
+                except OSError:
+                    if tid not in live_tids():
+                        continue
+                    raise
+                if group != 0 or thread_mask != mask:
+                    raise OSError(f'Windows thread {tid} did not accept the requested affinity')
+                verified.add(tid)
+            if live_tids().issubset(verified):
+                if set(process.cpu_affinity()) != requested or api.process_masks()[0] != mask:
+                    raise OSError('Windows process did not accept the requested affinity')
+                return True
+        raise OSError('Windows thread set did not stabilize during affinity verification')
+    except Exception:
+        try:
+            process.cpu_affinity(original_cpus)
+            for tid, old_mask in originals.items():
+                try:
+                    api.restore_thread_mask(tid, old_mask)
+                except OSError:
+                    pass  # A thread may have exited; do not hide the original failure.
+        except Exception:
+            pass
+        return False
+
+
 def _sched_setaffinity_all_threads(cpus: Sequence[int]) -> bool:
     """Apply a CPU mask to EVERY thread of this process (Linux affinity is per-thread;
  os.sched_setaffinity(0,...) alone would only move the calling thread)."""
+    if os.name == 'nt':
+        return _windows_setaffinity_all_threads(cpus)
     if not hasattr(os, 'sched_setaffinity'):
         return False
     cpu_set = {int(c) for c in cpus}
@@ -1308,17 +1454,17 @@ def gpu_worker_default_seconds_per_frame(view: 'ViewInfo') -> float:
     """Cold-start cost prior used until measured worker telemetry is available."""
     # Local import keeps the package dependency graph acyclic.
     from .geometry import (
-        is_radial_view,
-        is_tilted_radial_view,
+        is_azimuthal_view,
+        is_tilted_azimuthal_view,
         is_tilted_view,
     )
 
-    if is_tilted_radial_view(view):
+    if is_tilted_azimuthal_view(view):
         default = 0.060
-        env = 'YOLO_TTA_GPU_WORKER_DEFAULT_SEC_PER_FRAME_TILTED_RADIAL'
-    elif is_radial_view(view):
+        env = 'YOLO_TTA_GPU_WORKER_DEFAULT_SEC_PER_FRAME_TILTED_AZIMUTHAL'
+    elif is_azimuthal_view(view):
         default = 0.050
-        env = 'YOLO_TTA_GPU_WORKER_DEFAULT_SEC_PER_FRAME_RADIAL'
+        env = 'YOLO_TTA_GPU_WORKER_DEFAULT_SEC_PER_FRAME_AZIMUTHAL'
     elif is_tilted_view(view):
         default = 0.045
         env = 'YOLO_TTA_GPU_WORKER_DEFAULT_SEC_PER_FRAME_TILTED'
@@ -1338,8 +1484,8 @@ def gpu_worker_task_cost_key(task: Dict[str, object]) -> Tuple[object, ...]:
     # Local import keeps the package dependency graph acyclic.
     from .geometry import (
         ViewInfo,
-        is_radial_view,
-        radial_base_view_name,
+        is_azimuthal_view,
+        azimuthal_base_view_name,
         tilted_base_view_name,
     )
 
@@ -1350,29 +1496,30 @@ def gpu_worker_task_cost_key(task: Dict[str, object]) -> Tuple[object, ...]:
         str(task.get('kind', 'unknown')),
         str(task.get('result_mode', 'file')),
         str(view.family),
-        str(radial_base_view_name(view) if is_radial_view(view) else tilted_base_view_name(view)),
+        str(azimuthal_base_view_name(view) if is_azimuthal_view(view) else tilted_base_view_name(view)),
         int(task.get('out_size', 0)),
         int(getattr(view, 'src_h', 0)),
         int(getattr(view, 'src_w', 0)),
     )
 
 def cpu_inference_supports_view(view: object) -> bool:
-    """OpenVINO owns Cartesian and Tilted Cartesian work, never Radial work."""
+    """OpenVINO accepts Cartesian, Tilted Cartesian, and native Radial shell patches."""
     # Local import keeps the package dependency graph acyclic.
     from .geometry import (
         TILTED_VIEW_FAMILY,
+        RADIAL_VIEW_FAMILY,
         ViewInfo,
-        is_radial_view,
+        is_azimuthal_view,
     )
 
     return bool(
         isinstance(view, ViewInfo)
-        and not is_radial_view(view)
-        and str(view.family) in {'orthogonal', TILTED_VIEW_FAMILY}
+        and not is_azimuthal_view(view)
+        and str(view.family) in {'orthogonal', TILTED_VIEW_FAMILY, RADIAL_VIEW_FAMILY}
     )
 
 def cpu_inference_task_priority(task: Dict[str, object]) -> int:
-    """Cartesian first (right-angle TTA first), then Tilted Cartesian."""
+    """Cartesian first (right-angle TTA first), then Tilted Cartesian and Radial."""
     # Local import keeps the package dependency graph acyclic.
     from .geometry import ViewInfo
 
@@ -1485,11 +1632,11 @@ def _estimate_parent_view_postprocess_bytes(
     view_bytes = int(plane_bytes) * int(slices)
     name = str(getattr(view, 'name', '')).lower()
     family = str(getattr(view, 'family', '')).lower()
-    # Cleanup/cvol encoding is slice-bounded for Cartesian/Radial views.  Tilted
-    # projection can additionally own a source-geometry output; tilted-Radial can
+    # Cleanup/cvol encoding is slice-bounded for Cartesian/Azimuthal views.  Tilted
+    # projection can additionally own a source-geometry output; tilted-Azimuthal can
     # own both its reconstructed base stack and projected destination concurrently.
     estimate = max(1 * GIB, min(4 * GIB, int(view_bytes // 8) + 512 * 1024 * 1024))
-    if 'tilted' in name and family == 'radial':
+    if 'tilted' in name and family == 'azimuthal':
         estimate = max(int(estimate), int(view_bytes) * 2 + 4 * GIB)
     elif 'tilted' in name:
         estimate = max(int(estimate), int(view_bytes) + 4 * GIB)
@@ -3332,7 +3479,7 @@ def interpolate_view_volume_pass_maybe_process(
 ) -> Tuple[np.ndarray, Dict[str, object]]:
     """Run one interpolation pass with mandatory family-defined boundary semantics.
 
-    Radial and Tilted Radial views always wrap across their angular slice seam. Cartesian
+    Azimuthal and Tilted Azimuthal views always wrap across their angular slice seam. Cartesian
     and Tilted Cartesian views never wrap. This is derived from ``view`` and has no CLI or
     environment override. The returned array may be a new process-shareable memmap.
     """

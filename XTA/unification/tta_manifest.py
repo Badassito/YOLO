@@ -9,7 +9,7 @@ from typing import Any, Mapping, Sequence
 from .context import UnifiedLaunchContext
 
 
-TTA_RUN_MANIFEST_SCHEMA = "xta.v18.run_manifest/1"
+TTA_RUN_MANIFEST_SCHEMA = "xta.v20.run_manifest/1"
 TTA_VOXEL_COUNT_SCHEMA = "xta.v18.voxel_count/1"
 
 
@@ -39,13 +39,55 @@ _VIEW_FIELDS = (
     "horizontal_axis",
     "vertical_axis",
     "stack_axis",
-    "radial_base_view",
-    "radial_tilted_source",
-    "radial_source_view_name",
-    "radial_request_token",
+    "azimuthal_base_view",
+    "azimuthal_tilted_source",
+    "azimuthal_source_view_name",
+    "azimuthal_request_token",
     "tta_aug_id",
     "tta_angle_deg",
 )
+
+_RADIAL_VIEW_FIELDS = (
+    "radial_base_view", "radial_tilted_source", "radial_source_view_name",
+    "radial_request_token", "radial_min_radius", "radial_max_radius", "radial_step",
+    "radial_shell_start", "radial_radii", "radial_arc_origin", "radial_height_origin",
+    "radial_patch_size", "radial_patch_index", "radial_height_index",
+)
+
+
+def radial_view_manifest_record(view: Any) -> dict[str, Any] | None:
+    """Record the complete native shell trajectory without numerical imports."""
+    if str(getattr(view, "family", "")) != "radial":
+        return None
+    record = {}
+    for field in _RADIAL_VIEW_FIELDS:
+        value = getattr(view, field)
+        record[field] = list(value) if isinstance(value, tuple) else value
+    return {
+        **record,
+        "source_shape_t_y_x": [int(view.full_t), int(view.full_h), int(view.full_w)],
+        "center_x_y": [float(view.center_x), float(view.center_y)],
+        "native_patch_shape_h_w": [int(view.src_h), int(view.src_w)],
+        "tilt_angle_deg": float(view.tilt_angle_deg),
+        "tilt_direction": str(view.tilt_direction),
+        "slice_direction": "radius",
+        "input_axes": ["azimuth_arc_length", "height"],
+        "source_voxel_spacing": {"arc_length": 1.0, "height": 1.0},
+        "angular_boundary": "periodic_0_360_degrees_without_reflection",
+        "height_boundary": "unsheared_native_height_padding_zero",
+        "source_boundary": "zero_extended_trilinear_intensity; nearest_categorical_outside_zero",
+        "channel_boundary": "clamp_radius_within_patch_trajectory",
+        "patch_frame_mapping": "radial_radii[frame_index] at fixed arc and height origins",
+        "patch_is_tile": False,
+        "tile_parent": "native_periodic_patch",
+        "coverage_domain": "minimum_radius_to_largest_inscribed_cylinder; central_core_excluded",
+    }
+
+
+def radial_view_plan_metadata(view: Any) -> dict[str, Any]:
+    """Bind shell geometry into plan identity while retaining other-family metadata."""
+    record = radial_view_manifest_record(view)
+    return {} if record is None else {"radial_shell": record}
 
 
 def _sha256_file(path: Path) -> str:
@@ -213,6 +255,9 @@ def _view_record(view: Any) -> dict[str, Any]:
         if isinstance(value, tuple):
             value = list(value)
         record[field] = value
+    radial = radial_view_manifest_record(view)
+    if radial is not None:
+        record.update(radial)
     return record
 
 
@@ -223,7 +268,7 @@ def _channel_record(channel_format: Any) -> dict[str, Any]:
         "channel_count": int(channel_format.channel_count),
         "stride": int(channel_format.stride),
         "offsets": [int(value) for value in channel_format.offsets],
-        "boundary_policy": "radial_wrap_mirror_u_cartesian_edge_clamp",
+        "boundary_policy": "azimuthal_wrap_mirror_u_radial_radius_clamp_cartesian_edge_clamp",
         "prediction_assignment": "center_slice_only",
         "direction": "forward",
     }
@@ -243,15 +288,16 @@ def build_tta_run_manifest(
     angles: Sequence[float],
     channel_format: Any,
     tile_configs: Sequence[Any],
-    radial_requests: Sequence[Any],
-    radial_diameters: Sequence[int],
-    radial_azimuth_angles: Sequence[float],
+    azimuthal_requests: Sequence[Any],
+    azimuthal_diameters: Sequence[int],
+    azimuthal_azimuth_angles: Sequence[float],
     backend: Mapping[str, Any],
     forward_sampling: Mapping[str, Any],
     prediction_processing: Mapping[str, Any],
     requested_outputs: Sequence[str],
     output_paths: Mapping[str, str | Path],
     output_metadata: Mapping[str, Any] | None = None,
+    radial_requests: Sequence[Any] = (),
 ) -> dict[str, Any]:
     """Build the complete success manifest without importing numerical runtimes."""
 
@@ -260,15 +306,15 @@ def build_tta_run_manifest(
 
     physical_records = [_view_record(view) for view in physical_views]
     inference_records = [_view_record(view) for view in inference_views]
-    radial_groups: list[dict[str, Any]] = []
+    azimuthal_groups: list[dict[str, Any]] = []
     if not (
-        len(radial_requests)
-        == len(radial_diameters)
-        == len(radial_azimuth_angles)
+        len(azimuthal_requests)
+        == len(azimuthal_diameters)
+        == len(azimuthal_azimuth_angles)
     ):
-        raise ValueError("resolved radial request metadata has inconsistent lengths")
+        raise ValueError("resolved azimuthal request metadata has inconsistent lengths")
     for request, diameter, spacing in zip(
-        radial_requests, radial_diameters, radial_azimuth_angles
+        azimuthal_requests, azimuthal_diameters, azimuthal_azimuth_angles
     ):
         token = str(request.view)
         concrete = [
@@ -277,9 +323,9 @@ def build_tta_run_manifest(
                 "azimuths_deg": list(record["azimuths_deg"]),
             }
             for record in physical_records
-            if str(record["radial_request_token"]) == token
+            if str(record["azimuthal_request_token"]) == token
         ]
-        radial_groups.append(
+        azimuthal_groups.append(
             {
                 "view": token,
                 "requested_azimuth_angle_deg": (
@@ -292,6 +338,23 @@ def build_tta_run_manifest(
                 "concrete_azimuth_vectors": concrete,
             }
         )
+
+    radial_tokens = list(dict.fromkeys(
+        [str(request.view) for request in radial_requests]
+        + [str(record["radial_request_token"]) for record in physical_records
+           if str(record["family"]) == "radial"]
+    ))
+    radial_groups = [
+        {
+            "view": token,
+            "concrete_patch_trajectories": [
+                record for record in physical_records
+                if str(record["family"]) == "radial"
+                and str(record["radial_request_token"]) == token
+            ],
+        }
+        for token in radial_tokens
+    ]
 
     paths = {str(key): str(Path(value)) for key, value in output_paths.items()}
 
@@ -332,6 +395,7 @@ def build_tta_run_manifest(
             "physical_views": physical_records,
             "tta_angles_deg": [float(value) for value in angles],
             "inference_view_variants": inference_records,
+            "azimuthal_groups": azimuthal_groups,
             "radial_groups": radial_groups,
             "tiles": [
                 {
@@ -366,4 +430,6 @@ __all__ = (
     "assert_tta_artifacts_unchanged",
     "build_tta_run_manifest",
     "capture_tta_artifact_identities",
+    "radial_view_manifest_record",
+    "radial_view_plan_metadata",
 )

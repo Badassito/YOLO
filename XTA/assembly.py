@@ -53,12 +53,12 @@ from .geometry import (
     ViewInfo,
     coronal_block_cols,
     delayed_native_expansion_enabled,
-    is_radial_view,
-    is_tilted_radial_view,
+    is_azimuthal_view,
+    is_tilted_azimuthal_view,
     is_tilted_view,
     physical_view_name,
-    radial_base_view_name,
-    radial_sink_only_projection_supported,
+    azimuthal_base_view_name,
+    azimuthal_sink_only_projection_supported,
     view_output_token,
     view_processing_min_radius,
     view_processing_search_angle,
@@ -100,6 +100,7 @@ from .cuda_d1 import (
 )
 from .backprojection import (
     SinkOnlyProjectionResult,
+    backproject_azimuthal_volume_to_volume,
     backproject_radial_volume_to_volume,
     backproject_tilted_volume_to_volume,
 )
@@ -139,7 +140,7 @@ def project_view_volume_to_orthogonal_volume(
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
     sink_only: bool = False,
 ) -> np.ndarray | SinkOnlyProjectionResult:
-    """Project a Radial or Tilted view into orthogonal geometry.
+    """Project a Azimuthal or Tilted view into orthogonal geometry.
     
     Eligible transverse inputs may pass through without an extra copy."""
     source_shape = tuple(int(v) for v in np.asarray(view_mask_mm).shape)
@@ -154,7 +155,7 @@ def project_view_volume_to_orthogonal_volume(
     # reduced Cartesian stacks are axis-permuted without expansion. Their resulting
     # orthogonal grid is smaller on exactly the two axes represented by the YOLO plane;
     # the NRRD streamer/final union performs the sole restore to output geometry.
-    if reduced_processing and view.family != 'radial' and not is_tilted_view(view):
+    if reduced_processing and view.family not in ('azimuthal', 'radial') and not is_tilted_view(view):
         if physical_view_name(view) == 'transverse':
             t_dim, h_dim, w_dim = int(source_shape[0]), int(plane_h), int(plane_w)
         elif physical_view_name(view) == 'sagittal':
@@ -168,10 +169,10 @@ def project_view_volume_to_orthogonal_volume(
         h_dim = int(view.full_h) if int(view.full_h) > 0 else int(view.src_h)
         w_dim = int(view.full_w) if int(view.full_w) > 0 else int(view.src_w)
 
-    if view.family == 'radial':
-        return backproject_radial_volume_to_volume(
-            radial_mask_mm=view_mask_mm,
-            radial_view=view,
+    if view.family == 'azimuthal':
+        return backproject_azimuthal_volume_to_volume(
+            azimuthal_mask_mm=view_mask_mm,
+            azimuthal_view=view,
             out_path=out_path,
             desc=desc,
             prefer_memory=bool(prefer_memory),
@@ -184,8 +185,16 @@ def project_view_volume_to_orthogonal_volume(
             sink_only=bool(sink_only),
         )
 
+    if view.family == 'radial':
+        return backproject_radial_volume_to_volume(
+            radial_mask_mm=view_mask_mm, radial_view=view, out_path=out_path,
+            desc=desc, prefer_memory=prefer_memory, reserve_bytes=reserve_bytes,
+            workers=workers, out_shape_tyx=out_shape_tyx,
+            projection_block_callback=projection_block_callback, sink_only=sink_only,
+        )
+
     if bool(sink_only):
-        raise ValueError(f'{desc}: sink-only projection is supported only for radial views')
+        raise ValueError(f'{desc}: sink-only projection requires an Azimuthal or Radial view')
 
     if is_tilted_view(view):
         return backproject_tilted_volume_to_volume(
@@ -352,8 +361,8 @@ def materialize_nrrd_view_layer(
     transient_projection_in_memory = bool(
         bbox_store_enabled and not force_path_backed_store
     )
-    # projected radial/tilted layers directly into source geometry. keeps
-    # non-radial layers reduced: Cartesian layers are reduced axis permutations and Tilted
+    # projected azimuthal/tilted layers directly into source geometry. keeps
+    # non-azimuthal layers reduced: Cartesian layers are reduced axis permutations and Tilted
     # layers are reduced sheared orthogonal grids. Their sparse stores are therefore built at
     # inference pitch and the NRRD/final-union reader performs the one terminal restore.
     projection_out_shape: Optional[Tuple[int, int, int]] = None
@@ -362,24 +371,26 @@ def materialize_nrrd_view_layer(
         and tuple(int(v) for v in np.asarray(view_volume_mm).shape[-2:])
         != (int(view.src_h), int(view.src_w))
     )
-    if view.family == 'radial' or (is_tilted_view(view) and not reduced_view_layer):
+    if view.family in ('azimuthal', 'radial') or (is_tilted_view(view) and not reduced_view_layer):
         projection_out_shape = final_source_output_shape()
+    if view.family == 'radial' and projection_out_shape is None:
+        projection_out_shape = (int(view.full_t), int(view.full_h), int(view.full_w))
     incremental_writer: Optional[IncrementalRawBBoxMaskStoreWriter] = None
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None
     incremental_extra_meta = {
         'nrrd_layer_key': key,
         'source_raw_path': str(raw_path),
         'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',
-        'projection_payload_fusion': (
+        'projection_payload_fusion': ('cylindrical_shell_sink' if view.family == 'radial' else (
             (
-                f'{radial_base_view_name(view)}_tilted_radial_composed_sink'
-                if is_tilted_radial_view(view)
-                else f'{radial_base_view_name(view)}_radial_sink_only'
+                f'{azimuthal_base_view_name(view)}_tilted_azimuthal_composed_sink'
+                if is_tilted_azimuthal_view(view)
+                else f'{azimuthal_base_view_name(view)}_azimuthal_sink_only'
             )
-            if radial_sink_only_projection_supported(view) else 'dense_projection'
-        ),
+            if azimuthal_sink_only_projection_supported(view) else 'dense_projection'
+        )),
     }
-    if bool(bbox_store_enabled) and radial_sink_only_projection_supported(view):
+    if bool(bbox_store_enabled) and (view.family == 'radial' or azimuthal_sink_only_projection_supported(view)):
         expected_shape = (
             tuple(int(v) for v in projection_out_shape)
             if projection_out_shape is not None
@@ -396,7 +407,7 @@ def materialize_nrrd_view_layer(
             projection_block_callback = incremental_writer
         except Exception as exc:
             print(
-                f'Warning: NRRD layer {key}: incremental radial cvol writer unavailable '
+                f'Warning: NRRD layer {key}: incremental cvol writer unavailable '
                 f'({exc}); the completed projection will use the regular encoder.'
             )
             incremental_writer = None
@@ -419,7 +430,7 @@ def materialize_nrrd_view_layer(
             # transverse layers headed for a raw-bbox store are encoded straight
             # from the source volume (identity projection, synchronous encode) — no copy.
             allow_transverse_passthrough=bool(bbox_store_enabled),
-            # device-union row occupancy (radial views only; valid for the
+            # device-union row occupancy (azimuthal views only; valid for the
             # pre-interpolation layer, which is the only caller that supplies it).
             known_row_occupancy=known_row_occupancy,
             known_slice_bboxes=known_slice_bboxes,
@@ -447,7 +458,7 @@ def materialize_nrrd_view_layer(
         except Exception:
             pass
         print(
-            f'Warning: NRRD layer {key}: sink-only radial projection failed ({exc}); '
+            f'Warning: NRRD layer {key}: sink-only projection failed ({exc}); '
             'discarding the partial store and retrying with the dense fallback.'
         )
         projected = _project_layer(None, sink_only_mode=False)
@@ -473,7 +484,7 @@ def materialize_nrrd_view_layer(
             except Exception as exc:
                 incremental_writer.abort(exc)
                 incremental_writer.warn_failed_once(
-                    f'NRRD layer {key}: incremental radial cvol finalization failed ({exc})'
+                    f'NRRD layer {key}: incremental cvol finalization failed ({exc})'
                 )
                 incremental_writer.discard()
                 incremental_writer = None
@@ -483,7 +494,7 @@ def materialize_nrrd_view_layer(
                     # If it fails, rebuild once through the authoritative dense path rather
                     # than attempting to encode a SinkOnlyProjectionResult descriptor.
                     print(
-                        f'NRRD layer {key}: retrying dense radial projection after '
+                        f'NRRD layer {key}: retrying dense projection after '
                         'sink-only finalization failure.'
                     )
                     projected = _project_layer(None, sink_only_mode=False)
@@ -884,14 +895,14 @@ def _materialize_sparse_cartesian_component(
     return ref
 
 
-def _materialize_sparse_radial_component(
+def _materialize_sparse_azimuthal_component(
     component_store_path: Path, *, added_voxels: int, model_name: str, view: ViewInfo,
     source: str, pass_index: int, interpolation_walk_back_index: int,
     interpolation_candidate_index: int, tile_config_id: str, tile_acceptance: str,
     stage: str, description: str, temp_dir: Path, workers: int, keep_temp: bool,
 ) -> NrrdLayerRef:
-    """Keep Radial bridge deltas sparse through source-space publication."""
-    from .sparse_projection import project_radial_sparse_store
+    """Keep Azimuthal bridge deltas sparse through source-space publication."""
+    from .sparse_projection import project_azimuthal_sparse_store
 
     shape = final_source_output_shape() or (int(view.full_t), int(view.full_h), int(view.full_w))
     stage = (f'{stage}_walkback{int(interpolation_walk_back_index):02d}_'
@@ -901,8 +912,8 @@ def _materialize_sparse_radial_component(
                   tile_acceptance=str(tile_acceptance), stage=stage)
     key = _nrrd_layer_key(**common)
     path = Path(temp_dir) / 'nrrd_layers' / str(view.name) / f'{key}.orthogonal.cvol'
-    with runtime_telemetry().span('projection.sparse_radial_component.materialize'):
-        stats = project_radial_sparse_store(
+    with runtime_telemetry().span('projection.sparse_azimuthal_component.materialize'):
+        stats = project_azimuthal_sparse_store(
             Path(component_store_path), view, path, out_shape_tyx=shape, workers=int(workers),
         )
     ref = NrrdLayerRef(
@@ -913,7 +924,7 @@ def _materialize_sparse_radial_component(
         interpolation_walk_back_index=int(interpolation_walk_back_index),
         interpolation_candidate_index=int(interpolation_candidate_index), description=str(description),
         segment_extent_ijk=tuple(stats['segment_extent_ijk']), segment_extent_shape_tyx=tuple(shape),
-        segment_extent_source='sparse_radial_component', **common,
+        segment_extent_source='sparse_azimuthal_component', **common,
     )
     sink = nrrd_layer_sink()
     if sink is not None:
@@ -927,13 +938,13 @@ def _materialize_sparse_radial_component(
         # The replacement has closed and the sink owns its independent pathname.
         shutil.rmtree(component_store_path, ignore_errors=True)
     telemetry = runtime_telemetry()
-    telemetry.add('projection.sparse_radial_component.layers', 1)
+    telemetry.add('projection.sparse_azimuthal_component.layers', 1)
     for field in ('input_payload_bytes', 'input_foreground_samples', 'projected_contributions',
                   'raw_payload_bytes'):
-        telemetry.add(f'projection.sparse_radial_component.{field}', stats[field])
-    telemetry.gauge('projection.sparse_radial_component.last_map_bytes', stats['map_bytes'])
-    telemetry.gauge(f'projection.sparse_radial_component.{view.name}.last', stats)
-    print(f'Sparse Radial component {view.name}: input={stats["input_payload_bytes"]} bytes, '
+        telemetry.add(f'projection.sparse_azimuthal_component.{field}', stats[field])
+    telemetry.gauge('projection.sparse_azimuthal_component.last_map_bytes', stats['map_bytes'])
+    telemetry.gauge(f'projection.sparse_azimuthal_component.{view.name}.last', stats)
+    print(f'Sparse Azimuthal component {view.name}: input={stats["input_payload_bytes"]} bytes, '
           f'output={stats["raw_payload_bytes"]} bytes, seconds={stats["seconds"]:.6f}', flush=True)
     return ref
 
@@ -958,11 +969,11 @@ def materialize_interpolation_component_nrrd_view_layer(
 ) -> NrrdLayerRef:
     """Project one sparse interpolation component and submit its deterministic NRRD.
 
-    Cartesian and Radial components retain sparse backing through publication.
+    Cartesian and Azimuthal components retain sparse backing through publication.
     Other geometries, or unavailable compiled kernels, use a reusable dense
     workspace; empty combinations bypass that fallback decode.
     """
-    if str(view.family) == 'radial':
+    if str(view.family) == 'azimuthal':
         from .component_replay import capture_component_projection
         with runtime_telemetry().span('projection.component_replay_capture'):
             capture_component_projection(
@@ -1006,8 +1017,8 @@ def materialize_interpolation_component_nrrd_view_layer(
             # Failed transpose staging was discarded; the input store is intact.
             pass
 
-    if str(view.family) == 'radial' and str(source) == 'fullframe' and _numba is not None:
-        return _materialize_sparse_radial_component(
+    if str(view.family) == 'azimuthal' and str(source) == 'fullframe' and _numba is not None:
+        return _materialize_sparse_azimuthal_component(
             Path(component_store_path), added_voxels=int(added_voxels),
             model_name=str(model_name), view=view, source=str(source), pass_index=int(pass_index),
             interpolation_walk_back_index=int(interpolation_walk_back_index),
@@ -1023,7 +1034,7 @@ def materialize_interpolation_component_nrrd_view_layer(
         f'{str(stage)}_walkback{int(interpolation_walk_back_index):02d}_'
         f'candidate{int(interpolation_candidate_index):02d}'
     )
-    if int(added_voxels) <= 0:
+    if int(added_voxels) <= 0 and view.family != 'radial':
         try:
             shape = tuple(int(v) for v in store.shape)
             key = _nrrd_layer_key(
@@ -1371,11 +1382,11 @@ def materialize_nrrd_global_layer(
 def view_interpolation_wrap_axis(view: ViewInfo) -> bool:
     """Return the fixed interpolation boundary policy for one view family.
 
-    Radial and Tilted-Radial frame order is circular and always wraps. Cartesian and
+    Azimuthal and Tilted-Azimuthal frame order is circular and always wraps. Cartesian and
     Tilted-Cartesian stacks are linear and never wrap. v16.4.0 intentionally exposes no
     environment variable or CLI switch capable of changing this geometry contract.
     """
-    return bool(is_radial_view(view))
+    return bool(is_azimuthal_view(view))
 
 def prepare_view_volume_after_fullframe(
     *,
@@ -1402,7 +1413,7 @@ def prepare_view_volume_after_fullframe(
     precleaned_slice_cleanup: bool = False,
     hole_fill_done_on_device: bool = False,
     slice_meta: Optional[Dict[str, object]] = None,
-    fuse_radial_component_layers: bool = False,
+    fuse_azimuthal_component_layers: bool = False,
     parent_mask_ready_callback: Optional[Callable[[str, str, object], None]] = None,
     internal_final_layer_enabled: bool = False,
     preinterpolation_layer_already_published: bool = False,
@@ -1421,10 +1432,10 @@ def prepare_view_volume_after_fullframe(
     parent_bridge_support_mm: Optional[object] = None
     parent_mask_support_path: Optional[Path] = None
     parent_bridge_support_path: Optional[Path] = None
-    fused_radial_components = bool(
-        fuse_radial_component_layers
+    fused_azimuthal_components = bool(
+        fuse_azimuthal_component_layers
         and nrrd_layers_enabled
-        and str(view.family) == 'radial'
+        and str(view.family) == 'azimuthal'
         and not bool(dense_tiling_active)
         and not bool(preinterpolation_layer_already_published)
         and not (
@@ -1522,7 +1533,7 @@ def prepare_view_volume_after_fullframe(
         runtime_telemetry().add('d1.delta_continuation_volume_bytes', int(np.asarray(d1_additions_mm).nbytes))
 
     if bool(nrrd_layers_enabled) and not bool(preinterpolation_layer_already_published):
-        if not bool(fused_radial_components):
+        if not bool(fused_azimuthal_components):
             layer_ref = materialize_nrrd_view_layer(
                 baseline_native_volume,
                 model_name=str(model_name),
@@ -1535,11 +1546,11 @@ def prepare_view_volume_after_fullframe(
                 temp_dir=temp_dir,
                 workers=int(slice_workers),
                 # the device union already answered the foreground question and
-                # (for radial views) the per-row occupancy the backprojection would rescan.
+                # (for azimuthal views) the per-row occupancy the backprojection would rescan.
                 known_has_foreground=(bool(meta_slice_any.any()) if meta_valid and meta_slice_any is not None else None),
                 known_row_occupancy=(
                     np.ascontiguousarray(meta_row_occupancy.any(axis=0))
-                    if (meta_valid and meta_row_occupancy is not None and str(view.family) == 'radial')
+                    if (meta_valid and meta_row_occupancy is not None and str(view.family) == 'azimuthal')
                     else None
                 ),
                 known_slice_bboxes=(meta_slice_bboxes if meta_valid else None),
@@ -1590,14 +1601,14 @@ def prepare_view_volume_after_fullframe(
                 pass_delta_path: Optional[Path] = None
                 if (
                     bool(d1_delta_only)
-                    and not bool(fused_radial_components)
+                    and not bool(fused_azimuthal_components)
                     and not bool(d1_component_refs_only)
                 ):
                     pass_delta_path = temp_dir / 'nrrd_work' / view.name / f'fullframe_bridge_pass{int(pass_idx):02d}.u8.dat'
                 pass_component_dir: Optional[Path] = None
                 if (
                     bool(nrrd_layers_enabled)
-                    and not bool(fused_radial_components)
+                    and not bool(fused_azimuthal_components)
                     and int(interpolation_walk_back) > 0
                     and int(interpolation_candidates) > 0
                 ):
@@ -1778,11 +1789,11 @@ def prepare_view_volume_after_fullframe(
                         except Exception:
                             pass
 
-        if bool(fused_radial_components):
+        if bool(fused_azimuthal_components):
             # projection and positive-support restore distribute over binary OR, so the
             # cleaned YOLO mask and every accepted bridge can be kept in the already-mutated
             # baseline and projected once. This removes one source-store write and one complete
-            # Radial backprojection per bridge pass on the prioritized angle-variant path.
+            # Azimuthal backprojection per bridge pass on the prioritized angle-variant path.
             fused_added_voxels = sum(
                 max(0, int(item.get('added_voxels', 0) or 0))
                 for item in interpolation_stats
@@ -1818,7 +1829,7 @@ def prepare_view_volume_after_fullframe(
             if layer_ref is not None:
                 nrrd_layers.append(layer_ref)
                 print(
-                    f'v13.3.18 (C12): {model_name}/{view.name} emitted one Radial '
+                    f'v13.3.18 (C12): {model_name}/{view.name} emitted one Azimuthal '
                     f'{"YOLO+bridge union" if has_fused_bridges else "YOLO"} layer for one '
                     f'projection pass ({int(fused_added_voxels)} bridge voxel(s)).'
                 )

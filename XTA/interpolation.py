@@ -553,7 +553,7 @@ def _component_record_dilated_overlap_count(prev_record: SliceComponentRecord, c
 def _component_record_mirrored_u(record: SliceComponentRecord, width: int) -> SliceComponentRecord:
     """Mirror a component record along the u (x) axis of its full slice.
 
-    The radial angular domain is [0°, 180°) over full-diameter frames, so crossing
+    The azimuthal angular domain is [0°, 180°) over full-diameter frames, so crossing
     the angular seam reverses u. Mirroring one side puts overlap and continuation
     tests in a common coordinate frame.
     """
@@ -1215,7 +1215,7 @@ if _numba is not None:
 
         for step in range(1, max_steps + 1):
             s = s0 + direction_sign * step
-            # a projection step that crosses the radial 0°/180° wrap lands
+            # a projection step that crosses the azimuthal 0°/180° wrap lands
             # in a frame whose u axis is REVERSED relative to the projection cone, so read
             # (and report) the mirrored column there. max_steps <= num_slices-1 caps the
             # walk at a single crossing.
@@ -1516,7 +1516,7 @@ def _find_slice_projection_candidates_python(
         mirrored = False
         if bool(wrap_axis):
             s = int(s_raw % int(num_slices))
-            # a step across the radial 0°/180° wrap lands in a frame whose
+            # a step across the azimuthal 0°/180° wrap lands in a frame whose
             # u axis is REVERSED relative to the projection cone. max_steps <= num_slices-1
             # caps the walk at a single crossing.
             mirrored = bool(s_raw < 0 or s_raw >= int(num_slices))
@@ -1665,7 +1665,7 @@ def _collect_walkback_source_points(
             cmp_record = current_record
             cmp_anchor = current_anchor
             if wrap_crossed:
-                # continuation across the radial 0°/180° wrap matches at
+                # continuation across the azimuthal 0°/180° wrap matches at
                 # u -> width-1-u; mirror the near side into the far frame's coordinates.
                 cmp_record = _component_record_mirrored_u(current_record, slice_w)
                 cmp_anchor = (int(current_anchor[0]), int(slice_w - 1 - int(current_anchor[1])))
@@ -1713,7 +1713,7 @@ def _collect_walkback_source_points(
         cmp_component = current_component
         cmp_anchor = current_anchor
         if wrap_crossed:
-            # match across the radial 0°/180° wrap at u -> width-1-u.
+            # match across the azimuthal 0°/180° wrap at u -> width-1-u.
             cmp_component = current_component[:, ::-1]
             cmp_anchor = (int(current_anchor[0]), int(slice_w - 1 - int(current_anchor[1])))
         next_component, next_anchor = _follow_branch_component(next_slice_mask, cmp_component, cmp_anchor)
@@ -1759,7 +1759,7 @@ class SliceBridgeRenderPlan:
     source_point: Tuple[int, int, int]
     target_point: Tuple[int, int, int]
     source_anchor: Tuple[int, int]
-    # for a bridge crossing the radial 0°/180° wrap, target_anchor and
+    # for a bridge crossing the azimuthal 0°/180° wrap, target_anchor and
     # sdf1 are stored in source-side "unrolled" coordinates (u mirrored relative to the
     # target slice's own frame); the painter maps wrapped intermediate slices back.
     target_anchor: Tuple[int, int]
@@ -1836,7 +1836,7 @@ def _build_slice_endpoint_seeds(
 
     Each 2D connected component is evaluated independently for overlap continuation
     into the previous and next slice. Components without continuation become endpoint
-    seeds in that direction. Radial interpolation treats frame 0 and the final frame
+    seeds in that direction. Azimuthal interpolation treats frame 0 and the final frame
     as adjacent, with the horizontal axis mirrored across the seam.
     """
     # Local import keeps the package dependency graph acyclic.
@@ -2034,7 +2034,7 @@ def _paint_linear_slice_bridge_plan_onto_slice(
     center_y = (1.0 - alpha) * float(plan.source_anchor[0]) + alpha * float(plan.target_anchor[0])
     center_x = (1.0 - alpha) * float(plan.source_anchor[1]) + alpha * float(plan.target_anchor[1])
     # the morph runs in source-side "unrolled" coordinates. Intermediate
-    # slices beyond the radial 0°/180° boundary store the u-mirrored frame, so flip the
+    # slices beyond the azimuthal 0°/180° boundary store the u-mirrored frame, so flip the
     # section (the local canvas is centered, so a column flip mirrors it about its
     # center) and mirror the center's u there. Non-wrap plans never leave [0, num_slices).
     s_raw = int(plan.source_point[0]) + int(plan.sign) * int(step_idx)
@@ -2523,7 +2523,7 @@ def interpolate_view_volume_pass_inplace(
     added_voxels = 0
     bridge_delta_written = False
     # interpolation already visits every bridge-delta crop while it is hot.
-    # Preserve the exact per-azimuth bounds and per-t row occupancy here so radial
+    # Preserve the exact per-azimuth bounds and per-t row occupancy here so azimuthal
     # backprojection does not rediscover them by strided scans over the dense delta file.
     bridge_delta_slice_bboxes: Optional[np.ndarray] = None
     bridge_delta_rows_by_slice: Optional[np.ndarray] = None
@@ -3720,7 +3720,7 @@ class TileConsolidationResult:
     final_accumulator_mm: Optional[np.ndarray] = None
 
 def _view_uses_interpolation(view: ViewInfo, interpolate: int) -> bool:
-    return bool((view.family in ('orthogonal', 'radial') or is_tilted_view(view)) and int(interpolate) > 0)
+    return bool((view.family in ('orthogonal', 'azimuthal', 'radial') or is_tilted_view(view)) and int(interpolate) > 0)
 
 def _drain_volume_to_mmap(
     volume: np.ndarray,

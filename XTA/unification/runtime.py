@@ -10,19 +10,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence, Tuple
 
-from XTA.config import RadialViewRequest, TiltedViewGroup
-from XTA.geometry import ViewInfo, get_view_infos, radial_target_diameter
-from XTA.media import resolve_radial_azimuth_angles
+from XTA.config import AzimuthalViewRequest, RadialViewRequest, TiltedViewGroup
+from XTA.geometry import ViewInfo, get_view_infos, azimuthal_target_diameter
+from XTA.media import resolve_azimuthal_azimuth_angles
 
 
 @dataclass(frozen=True)
 class CompiledPhysicalViews:
-    """Resolved physical views plus the exact radial geometry they contain."""
+    """Resolved physical views plus the exact azimuthal geometry they contain."""
 
     views: Tuple[ViewInfo, ...]
-    radial_targets: Tuple[str, ...]
-    radial_diameters: Tuple[int, ...]
-    radial_azimuth_angles: Tuple[float, ...]
+    azimuthal_targets: Tuple[str, ...]
+    azimuthal_diameters: Tuple[int, ...]
+    azimuthal_azimuth_angles: Tuple[float, ...]
+    radial_targets: Tuple[str, ...] = ()
 
 
 def compile_physical_views(
@@ -31,27 +32,31 @@ def compile_physical_views(
     height: int,
     width: int,
     cartesian_views: Sequence[str],
-    radial_requests: Sequence[RadialViewRequest],
+    azimuthal_requests: Sequence[AzimuthalViewRequest],
     tilted_groups: Sequence[TiltedViewGroup],
-    radial_native_raster: int = 0,
+    azimuthal_native_raster: int = 0,
+    radial_requests: Sequence[RadialViewRequest] = (),
+    radial_min_radius: float | None = None,
+    radial_patch_size: int = 3072,
 ) -> CompiledPhysicalViews:
     """Compile grouped view requests through the authoritative TTA geometry.
 
-    The exact generated radial angle vectors live on the returned ``ViewInfo``
+    The exact generated azimuthal angle vectors live on the returned ``ViewInfo``
     objects.  The paired spacing and diameter tuples are retained separately so
     both modes can record the same planning facts in their manifests.
     """
 
+    azimuthal_targets = tuple(str(request.view) for request in azimuthal_requests)
     radial_targets = tuple(str(request.view) for request in radial_requests)
-    radial_diameters = tuple(
-        int(radial_target_diameter(target, int(t_dim), int(height), int(width)))
-        for target in radial_targets
+    azimuthal_diameters = tuple(
+        int(azimuthal_target_diameter(target, int(t_dim), int(height), int(width)))
+        for target in azimuthal_targets
     )
-    radial_angles = tuple(
+    azimuthal_angles = tuple(
         float(value)
-        for value in resolve_radial_azimuth_angles(
-            tuple(radial_requests),
-            diameters=radial_diameters,
+        for value in resolve_azimuthal_azimuth_angles(
+            tuple(azimuthal_requests),
+            diameters=azimuthal_diameters,
         )
     )
     views = tuple(
@@ -60,17 +65,21 @@ def compile_physical_views(
             H=int(height),
             W=int(width),
             cartesian_views=tuple(str(value) for value in cartesian_views),
-            radial_views=radial_targets,
-            radial_azimuth_angles=radial_angles,
+            azimuthal_views=azimuthal_targets,
+            azimuthal_azimuth_angles=azimuthal_angles,
             tilt_groups=tuple(tilted_groups),
-            radial_native_raster=int(radial_native_raster),
+            azimuthal_native_raster=int(azimuthal_native_raster),
+            radial_views=radial_targets,
+            radial_min_radius=radial_min_radius,
+            radial_patch_size=int(radial_patch_size),
         )
     )
     return CompiledPhysicalViews(
         views=views,
+        azimuthal_targets=azimuthal_targets,
+        azimuthal_diameters=azimuthal_diameters,
+        azimuthal_azimuth_angles=azimuthal_angles,
         radial_targets=radial_targets,
-        radial_diameters=radial_diameters,
-        radial_azimuth_angles=radial_angles,
     )
 
 

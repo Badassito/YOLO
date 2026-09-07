@@ -53,6 +53,7 @@ from .config import (
     resolve_channel_format,
     resolve_postprocessing_options,
     resolve_quantize,
+    resolve_azimuthal_view_requests,
     resolve_radial_view_requests,
     resolve_save_request,
     resolve_tilted_view_groups,
@@ -66,7 +67,7 @@ from .workspace import (
     _env_int,
     available_anon_work_bytes,
     configure_pipeline_modes,
-    radial_source_mode,
+    azimuthal_source_mode,
     v1613_d1_backprojection_overlap_enabled,
     v1613_d1_owner_requested,
     v1613_fast_bundle_requested,
@@ -182,8 +183,8 @@ from .geometry import (
     expand_views_into_tta_variants,
     gpu_input_staging_ahead_sources,
     gpu_input_staging_enabled,
-    is_radial_view,
-    is_tilted_radial_view,
+    is_azimuthal_view,
+    is_tilted_azimuthal_view,
     is_tilted_view,
     iter_aug_jobs_round_robin,
     make_dense_tile_channel_renderer,
@@ -196,14 +197,14 @@ from .geometry import (
     physical_view_name,
     pretty_view_name,
     queued_streaming_source_cpu_warmup_slots,
-    mirrored_radial_parent_crop,
-    radial_batch_padding_count,
-    radial_batch_padding_frame_specs,
-    radial_batch_padding_mirror_groups,
-    radial_batch_padding_tile_id,
-    radial_batch_padding_tile_result_ids,
-    radial_base_view_name,
-    radial_target_base_view,
+    mirrored_azimuthal_parent_crop,
+    azimuthal_batch_padding_count,
+    azimuthal_batch_padding_frame_specs,
+    azimuthal_batch_padding_mirror_groups,
+    azimuthal_batch_padding_tile_id,
+    azimuthal_batch_padding_tile_result_ids,
+    azimuthal_base_view_name,
+    azimuthal_target_base_view,
     resolve_prediction_render_workers,
     resolve_prediction_source_queue_slots,
     resolve_tile_configs,
@@ -289,7 +290,7 @@ from .backprojection import (
     _set_main_process_gpu_asset_retirement_pending,
     _set_main_process_gpu_pending_inference,
     _set_main_process_gpu_stage_wake_callback,
-    fused_angle_variant_radial_component_layer_enabled,
+    fused_angle_variant_azimuthal_component_layer_enabled,
     main_process_gpu_stage_inference_priority_enabled,
 )
 from .outputs import (
@@ -624,9 +625,9 @@ def _main_impl() -> None:
     configure_component_replay_capture(
         args.capture_component_replay,
         view_names=args.capture_component_views or (
-            'radial_tilted_transverse_vertical_p30*',
-            'radial_tilted_sagittal_vertical_p30*',
-            'radial_tilted_coronal_vertical_p30*',
+            'azimuthal_tilted_transverse_vertical_p30*',
+            'azimuthal_tilted_sagittal_vertical_p30*',
+            'azimuthal_tilted_coronal_vertical_p30*',
         ),
         max_captures=int(args.capture_component_limit),
     )
@@ -665,16 +666,16 @@ def _main_impl() -> None:
         f'[v{SCRIPT_VERSION}] every --angle value is an independent view variant through cleanup, '
         'interpolation, tile gating, NRRD decomposition, and final per-view union. Tile '
         'components are gated individually against their same-angle parent YOLO mask, then '
-        'only the residual components are re-gated against same-angle parent bridges. Radial '
+        'only the residual components are re-gated against same-angle parent bridges. Azimuthal '
         'interpolation wraps across its angular boundary. '
-        'View selection uses structured Radial, Tilted, and Tile groups; '
+        'View selection uses structured Azimuthal, Tilted, and Tile groups; '
         'interpolation flags use the interpolation_* names; and component-NRRD streaming '
-        'continues during topology. Radial channel stacks wrap across the angular seam and reverse '
-        'radial-u after odd 0°/180° crossings, C>=5 saved '
+        'continues during topology. Azimuthal channel stacks wrap across the angular seam and reverse '
+        'azimuthal-u after odd 0°/180° crossings, C>=5 saved '
         'view inputs use multi-page TIFF, and unified --save selection controls images, labels, '
         'binary, low_quality[:DOWNBIN], nrrd, voxel_volume, high_quality, and summary, while '
         '--postprocessing selects keep_objects, 3d_void_fill, and gaussian_smoothing. The retained '
-        'runtime set includes hardware-linear Radial texture sampling, bilinear in-plane Tilted '
+        'runtime set includes hardware-linear Azimuthal texture sampling, bilinear in-plane Tilted '
         'forward inputs with exact nearest mask backprojection, retried/loud-failing ffmpeg '
         'launches, dense-prefaulted native sparse final union, header-free D1 NVRTC preflight, '
         'geometry-safe fast-bundle initialization, bounded memfd direct-union windows, sparse '
@@ -684,7 +685,7 @@ def _main_impl() -> None:
         f'Model input channel format: {channel_format.token} '
         f'(kind={channel_format.kind}, channels={int(channel_format.channel_count)}, '
         f'stride={int(channel_format.stride)}, offsets={list(channel_format.offsets)}; '
-        'boundary=radial-wrap+mirror-u/cartesian-clamp; result=center slice N only).'
+        'boundary=azimuthal-wrap+mirror-u/cartesian-clamp; result=center slice N only).'
     )
 
     print(
@@ -959,7 +960,7 @@ def _main_impl() -> None:
     model_name = Path(str(gpu_model_path or cpu_model_path)).stem
 
     # Resolve the complete view request before model loading or volume decode. With no
-    # implicit Cartesian/Tilted/Radial defaults, a missing or self-disabling view request must
+    # implicit Cartesian/Tilted/Azimuthal defaults, a missing or self-disabling view request must
     # fail immediately rather than decode a multi-terabyte logical run and discover it later.
     angles = resolve_tta_angles(args.angle)
     angle_variant_streaming_cleanup_active = True
@@ -967,48 +968,54 @@ def _main_impl() -> None:
     try:
         enabled_cartesian_views = resolve_cartesian_views(args.enable_cartesian)
         tilt_groups = resolve_tilted_view_groups(args.enable_tilted)
+        azimuthal_requests = resolve_azimuthal_view_requests(args.enable_azimuthal)
         radial_requests = resolve_radial_view_requests(args.enable_radial)
         tile_configs = resolve_tile_configs(args.enable_tile)
     except ValueError as exc:
         parser.error(str(exc))
 
     # Concrete Tilted assembly uses the group associations directly so unrelated slots never
-    # form an accidental cross-product. The flattened base list is only for Radial eligibility.
+    # form an accidental cross-product. The flattened base list is only for Azimuthal eligibility.
     tilt_views = tilted_group_base_views(tilt_groups)
+    azimuthal_targets = [request.view for request in azimuthal_requests]
     radial_targets = [request.view for request in radial_requests]
-    if radial_requests and cpu_inference_enabled and not gpu_inference_enabled:
-        skipped_targets = ', '.join(radial_targets)
+    if azimuthal_requests and cpu_inference_enabled and not gpu_inference_enabled:
+        skipped_targets = ', '.join(azimuthal_targets)
         print(
-            'Warning: CPU-only inference does not support Radial or Tilted-Radial views; '
+            'Warning: CPU-only inference does not support Azimuthal or Tilted-Azimuthal views; '
             f'the following requests will be skipped: {skipped_targets}'
         )
-        radial_requests = []
-        radial_targets = []
-    elif radial_requests and cpu_inference_enabled and gpu_inference_enabled:
+        azimuthal_requests = []
+        azimuthal_targets = []
+    elif azimuthal_requests and cpu_inference_enabled and gpu_inference_enabled:
         print(
-            'Warning: OpenVINO CPU workers do not process Radial or Tilted-Radial views. '
+            'Warning: OpenVINO CPU workers do not process Azimuthal or Tilted-Azimuthal views. '
             'Those enabled views remain active and will be processed exclusively by GPU workers.'
         )
 
     concrete_tilt_requested = bool(tilt_groups)
-    active_radial_request = any(
-        (not str(radial_target).startswith('tilted_'))
-        or radial_target_base_view(radial_target) in tilt_views
-        for radial_target in radial_targets
+    active_azimuthal_request = any(
+        (not str(azimuthal_target).startswith('tilted_'))
+        or azimuthal_target_base_view(azimuthal_target) in tilt_views
+        for azimuthal_target in azimuthal_targets
     )
-    if not (enabled_cartesian_views or concrete_tilt_requested or active_radial_request):
-        for radial_target in radial_targets:
-            if str(radial_target).startswith('tilted_'):
-                radial_base = radial_target_base_view(radial_target)
-                if radial_base not in tilt_views:
+    active_radial_request = any(
+        not target.startswith('tilted_') or target.removeprefix('tilted_') in tilt_views
+        for target in radial_targets
+    )
+    if not (enabled_cartesian_views or concrete_tilt_requested or active_azimuthal_request or active_radial_request):
+        for azimuthal_target in azimuthal_targets:
+            if str(azimuthal_target).startswith('tilted_'):
+                azimuthal_base = azimuthal_target_base_view(azimuthal_target)
+                if azimuthal_base not in tilt_views:
                     print(
-                        f'Radial target {radial_target!r} skipped: no {radial_base} Tilted '
+                        f'Azimuthal target {azimuthal_target!r} skipped: no {azimuthal_base} Tilted '
                         'variants are enabled.'
                     )
         raise ValueError(
             'No inference views are active. Enable at least one view with --enable_cartesian, '
             '--enable_tilted VIEW[:TILT_ANGLE[:TILT_DIRECTION]], or '
-            '--enable_radial VIEWS[:AZIMUTH_ANGLE]. A tilted_* Radial target requires '
+            '--enable_azimuthal VIEWS[:AZIMUTH_ANGLE], or --enable_radial VIEWS. A tilted_* target requires '
             'a matching --enable_tilted base.'
         )
 
@@ -1281,7 +1288,7 @@ def _main_impl() -> None:
     # one downbinned single-layer NRRD per spec under low_quality/<token>/nrrd/ on the same
     # view-completion schedule as the full-quality layers (the tail no longer writes a combined
     # low-quality NRRD).
-    # record the final source output geometry so radial/tilted
+    # record the final source output geometry so azimuthal/tilted
     # NRRD layer projections and the final backprojection queue target it directly (one resample).
     set_final_source_output_shape((input_T, input_H, input_W))
 
@@ -1442,7 +1449,7 @@ def _main_impl() -> None:
         # D1 supersedes the 25-39 GiB host direct-union workspace entirely.
         gpu_worker_direct_union_active = False
         print(
-            'v16.1.8 fast bundle active: hardware-linear Radial texture sampling, B1 sparse '
+            'v16.1.8 fast bundle active: hardware-linear Azimuthal texture sampling, B1 sparse '
             'slice metadata, D3 resident-proto closing, C1 runtime-sized leases, C2 '
             'compute/publication credit separation, C3 predicted-cost scheduling, and D1 '
             'project -> infer -> proto-close -> immediate owner-GPU backprojection -> '
@@ -1455,7 +1462,7 @@ def _main_impl() -> None:
         print(
             'v16.1.8 fast bundle active with D1 disabled by '
             'YOLO_TTA_V1613_D1_OWNER_PIPELINE=0: '
-            'hardware-linear Radial texture sampling, B1/D3, and C1-C3 remain active; the '
+            'hardware-linear Azimuthal texture sampling, B1/D3, and C1-C3 remain active; the '
             'dense direct-union compatibility path is retained.'
         )
     elif v1613_fast_bundle_requested():
@@ -1489,18 +1496,21 @@ def _main_impl() -> None:
         height=int(H),
         width=int(W),
         cartesian_views=enabled_cartesian_views,
-        radial_requests=radial_requests,
+        azimuthal_requests=azimuthal_requests,
         tilted_groups=tilt_groups,
-        radial_native_raster=int(args.imgsz),
+        azimuthal_native_raster=int(args.imgsz),
+        radial_requests=radial_requests,
+        radial_min_radius=args.radial_min_radius,
+        radial_patch_size=int(args.imgsz),
     )
-    radial_diameters = list(compiled_physical_views.radial_diameters)
-    resolved_azimuth_angles = list(compiled_physical_views.radial_azimuth_angles)
+    azimuthal_diameters = list(compiled_physical_views.azimuthal_diameters)
+    resolved_azimuth_angles = list(compiled_physical_views.azimuthal_azimuth_angles)
     for request, diameter, spacing in zip(
-        radial_requests, radial_diameters, resolved_azimuth_angles,
+        azimuthal_requests, azimuthal_diameters, resolved_azimuth_angles,
     ):
         if request.azimuth_angle is None:
             print(
-                f'Radial azimuth default [{request.view}]: using full-coverage spacing '
+                f'Azimuthal azimuth default [{request.view}]: using full-coverage spacing '
                 f'{float(spacing):.8g}° for projected-plane diameter {int(diameter)}'
             )
 
@@ -1518,7 +1528,7 @@ def _main_impl() -> None:
             'model_input_channels': int(channel_format.channel_count),
             'model_channel_stride': int(channel_format.stride),
             'model_channel_offsets': [int(v) for v in channel_format.offsets],
-            'model_channel_boundary_policy': 'radial_wrap_mirror_u_cartesian_edge_clamp',
+            'model_channel_boundary_policy': 'azimuthal_wrap_mirror_u_cartesian_edge_clamp',
             'model_prediction_slice_policy': 'center_N_only',
             'fps': fps,
             'enable_cartesian': list(enabled_cartesian_views),
@@ -1543,10 +1553,13 @@ def _main_impl() -> None:
                 }
                 for group in tilt_groups
             ],
+            'enable_azimuthal': list(azimuthal_targets),
             'enable_radial': list(radial_targets),
-            'radial_diameters': [int(v) for v in radial_diameters],
+            'radial_min_radius': args.radial_min_radius,
+            'radial_patch_size': int(args.imgsz),
+            'azimuthal_diameters': [int(v) for v in azimuthal_diameters],
             'azimuth_angles_deg': [float(v) for v in resolved_azimuth_angles],
-            'enable_radial_groups': [
+            'enable_azimuthal_groups': [
                 {
                     'view': request.view,
                     'requested_azimuth_angle_deg': (
@@ -1556,7 +1569,7 @@ def _main_impl() -> None:
                     'resolved_azimuth_angle_deg': float(spacing),
                 }
                 for request, diameter, spacing in zip(
-                    radial_requests, radial_diameters, resolved_azimuth_angles,
+                    azimuthal_requests, azimuthal_diameters, resolved_azimuth_angles,
                 )
             ],
             'enable_tile': [
@@ -1569,16 +1582,16 @@ def _main_impl() -> None:
         }, indent=2)
     )
 
-    # Fold each Radial transformed stack/diameter to the requested model raster.
-    radial_fold_raster = int(args.imgsz)
-    if int(radial_fold_raster) != int(args.imgsz):  # pragma: no cover - defensive alias guard
-        raise RuntimeError("radial fold raster changed after physical-view compilation")
+    # Fold each Azimuthal transformed stack/diameter to the requested model raster.
+    azimuthal_fold_raster = int(args.imgsz)
+    if int(azimuthal_fold_raster) != int(args.imgsz):  # pragma: no cover - defensive alias guard
+        raise RuntimeError("azimuthal fold raster changed after physical-view compilation")
     physical_views = list(compiled_physical_views.views)
     if not physical_views:
         raise ValueError(
             'No inference views are active. Enable at least one view with --enable_cartesian, '
             '--enable_tilted VIEW[:TILT_ANGLE[:TILT_DIRECTION]], or '
-            '--enable_radial VIEWS[:AZIMUTH_ANGLE]. A tilted_* Radial target is skipped '
+            '--enable_azimuthal VIEWS[:AZIMUTH_ANGLE], or --enable_radial VIEWS. A tilted_* target is skipped '
             'when its matching Tilted base is not enabled.'
         )
 
@@ -1588,53 +1601,63 @@ def _main_impl() -> None:
     # TTA collapse/backprojection as soon as all variants of that view become immutable.
     views = expand_views_into_tta_variants(physical_views, angles)
     # Reserve the second resident allocation only for runs that actually contain a
-    # Radial task. This keeps Cartesian/Tilted-only runs from losing GPU residency merely
+    # Azimuthal task. This keeps Cartesian/Tilted-only runs from losing GPU residency merely
     # because the variant supports a lazily-created hardware texture.
-    radial_texture_required = bool(
-        radial_source_mode() == 'texture_linear'
-        and any(is_radial_view(view) for view in physical_views)
+    azimuthal_texture_required = bool(
+        azimuthal_source_mode() == 'texture_linear'
+        and any(is_azimuthal_view(view) for view in physical_views)
     )
     cartesian_views = orthogonal_views_only(physical_views)
     inference_views = list(views)
     interpolating_views = [v for v in inference_views if _view_uses_interpolation(v, int(args.interpolation_distance))]
 
-    # A tilted_* Radial token expands to every concrete signed/directional Tilted variant.
+    # A tilted_* Azimuthal token expands to every concrete signed/directional Tilted variant.
     # Print the physical workload and the expanded TTA-variant workload separately.
-    radial_concrete_views = [v for v in physical_views if is_radial_view(v)]
-    tilted_radial_concrete_views = [v for v in radial_concrete_views if is_tilted_radial_view(v)]
-    upright_radial_concrete_views = [v for v in radial_concrete_views if not is_tilted_radial_view(v)]
+    azimuthal_concrete_views = [v for v in physical_views if is_azimuthal_view(v)]
+    tilted_azimuthal_concrete_views = [v for v in azimuthal_concrete_views if is_tilted_azimuthal_view(v)]
+    upright_azimuthal_concrete_views = [v for v in azimuthal_concrete_views if not is_tilted_azimuthal_view(v)]
     upright_tilted_views = [v for v in physical_views if is_tilted_view(v)]
+    radial_concrete_views = [v for v in physical_views if v.family == 'radial']
     source_frames_per_angle = int(sum(int(v.num_slices) for v in physical_views))
-    radial_frames_per_angle = int(sum(int(v.num_slices) for v in radial_concrete_views))
-    tilted_radial_frames_per_angle = int(sum(int(v.num_slices) for v in tilted_radial_concrete_views))
-    radial_expansion_counts = Counter(
-        str(v.radial_request_token or radial_base_view_name(v))
-        for v in radial_concrete_views
+    azimuthal_frames_per_angle = int(sum(int(v.num_slices) for v in azimuthal_concrete_views))
+    tilted_azimuthal_frames_per_angle = int(sum(int(v.num_slices) for v in tilted_azimuthal_concrete_views))
+    azimuthal_expansion_counts = Counter(
+        str(v.azimuthal_request_token or azimuthal_base_view_name(v))
+        for v in azimuthal_concrete_views
     )
-    radial_expansion_note = ', '.join(
+    azimuthal_expansion_note = ', '.join(
         f'{token}=>{int(count)} concrete view(s)'
-        for token, count in radial_expansion_counts.items()
+        for token, count in azimuthal_expansion_counts.items()
     ) or 'none'
     print(
         'Concrete view workload: '
         f'{len(physical_views)} physical view(s) = {len(cartesian_views)} Cartesian + '
-        f'{len(upright_tilted_views)} Tilted + {len(upright_radial_concrete_views)} upright Radial + '
-        f'{len(tilted_radial_concrete_views)} tilted-Radial; '
+        f'{len(upright_tilted_views)} Tilted + {len(upright_azimuthal_concrete_views)} upright Azimuthal + '
+        f'{len(tilted_azimuthal_concrete_views)} tilted-Azimuthal + '
+        f'{len(radial_concrete_views)} Radial intrinsic patch trajectories; '
         f'{source_frames_per_angle} source frame(s)/--angle, '
         f'{len(inference_views)} independent view-angle variant(s), and '
         f'{source_frames_per_angle * max(1, len(angles))} total model frame(s) across '
         f'{max(1, len(angles))} TTA angle(s).'
     )
+    if azimuthal_concrete_views:
+        print(
+            'Azimuthal concrete expansion: '
+            f'{azimuthal_expansion_note}; azimuthal={azimuthal_frames_per_angle} frame(s)/angle, '
+            f'tilted-Azimuthal={tilted_azimuthal_frames_per_angle} frame(s)/angle.'
+        )
     if radial_concrete_views:
         print(
-            'Radial concrete expansion: '
-            f'{radial_expansion_note}; radial={radial_frames_per_angle} frame(s)/angle, '
-            f'tilted-Radial={tilted_radial_frames_per_angle} frame(s)/angle.'
+            'Radial shell workload: '
+            f'{sum(v.num_slices for v in radial_concrete_views)} intrinsic patch frames/angle; '
+            f'{int(args.imgsz)}x{int(args.imgsz)} patches preserve unit arc/height spacing, '
+            'periodic angular samples, and a clamped radius trajectory. '
+            'Optional Tiles operate inside these patches.'
         )
-    if tilted_radial_concrete_views:
+    if tilted_azimuthal_concrete_views:
         print(
-            'Tilted-Radial resident CUDA rendering is enabled '
-            '(YOLO_TTA_GPU_TILTED_RADIAL_RENDER=0 selects the CPU fallback). '
+            'Tilted-Azimuthal resident CUDA rendering is enabled '
+            '(YOLO_TTA_GPU_TILTED_AZIMUTHAL_RENDER=0 selects the CPU fallback). '
             'A worker that cannot admit the source volume to VRAM will still use the completed-cube CPU path.'
         )
     if low_quality_downbin_warnings:
@@ -1947,7 +1970,7 @@ def _main_impl() -> None:
     native_view_support_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
     parent_mask_support_by_model: Dict[str, Dict[str, object]] = {model_name: {} for model_name, _ in yolo_models}
     parent_bridge_support_by_model: Dict[str, Dict[str, object]] = {model_name: {} for model_name, _ in yolo_models}
-    radial_native_output_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
+    azimuthal_native_output_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
     tilted_native_output_by_model: Dict[str, Dict[str, np.ndarray]] = {model_name: {} for model_name, _ in yolo_models}
     nrrd_layer_refs: List[NrrdLayerRef] = []
     view_volume_locks: Dict[Tuple[str, str], threading.Lock] = {
@@ -2030,11 +2053,11 @@ def _main_impl() -> None:
             expected_for_variant = int(sum(len(jobs) for jobs in jobs_by_config.values()))
             if expected_for_variant <= 0:
                 continue
-            # A radial partial batch publishes its seam-wrapped predictions as a second,
+            # A azimuthal partial batch publishes its seam-wrapped predictions as a second,
             # mirrored tile result.  It must cross the same cleanup and P/B gates before
             # the parent or any configured tile set is allowed to consolidate.
             tile_result_factor = len(
-                radial_batch_padding_tile_result_ids(
+                azimuthal_batch_padding_tile_result_ids(
                     '__count_only__',
                     view,
                     int(view.num_slices),
@@ -2593,9 +2616,9 @@ def _main_impl() -> None:
         view = kwargs['view']
         source_shape = (int(input_T), int(input_H), int(input_W))
         source_volume_bytes = math.prod(source_shape)
-        if int(kwargs.get('added_voxels', 0)) <= 0:
+        if int(kwargs.get('added_voxels', 0)) <= 0 and view.family != 'radial':
             working_bytes = 64 * 1024 * 1024
-        elif (str(view.family) == 'radial' and str(kwargs.get('source')) == 'fullframe'
+        elif (str(view.family) == 'azimuthal' and str(kwargs.get('source')) == 'fullframe'
               and _numba is not None):
             # Source bitset plus inverse-map construction, packed output crops,
             # and bounded input slabs. No view-sized uint8 decode is retained.
@@ -2653,7 +2676,7 @@ def _main_impl() -> None:
         source_bytes = int(array_nbytes((int(input_T), int(input_H), int(input_W)), np.uint8))
         view_name_lower = str(view.name).lower()
         transient_bytes = 2 * GIB
-        if 'radial_tilted' in view_name_lower or ('tilted' in view_name_lower and str(view.family) == 'radial'):
+        if 'azimuthal_tilted' in view_name_lower or ('tilted' in view_name_lower and str(view.family) == 'azimuthal'):
             # v16.1.3 D2 writes the final source destination directly and no longer owns a
             # processing-sized tilted base stack in addition to that destination.
             transient_bytes = int(source_bytes) + 4 * GIB
@@ -2706,9 +2729,9 @@ def _main_impl() -> None:
                         precleaned_slice_cleanup=bool(angle_variant_streaming_cleanup_active),
                         hole_fill_done_on_device=bool(hole_fill_done_on_device),
                         slice_meta=slice_meta_holder,
-                        fuse_radial_component_layers=bool(
+                        fuse_azimuthal_component_layers=bool(
                             angle_variant_gpu_fastpath_active
-                            and fused_angle_variant_radial_component_layer_enabled()
+                            and fused_angle_variant_azimuthal_component_layer_enabled()
                         ),
                         parent_mask_ready_callback=(
                             _publish_parent_mask_ready if bool(dense_tiling_active) else None
@@ -2862,16 +2885,16 @@ def _main_impl() -> None:
 
     def _parent_destination_ready(model_name: str, view_name: str) -> bool:
         view = view_infos_by_name[str(view_name)]
-        if view.family == 'radial':
-            return str(view_name) in radial_native_output_by_model.get(str(model_name), {})
+        if view.family in ('azimuthal', 'radial'):
+            return str(view_name) in azimuthal_native_output_by_model.get(str(model_name), {})
         if is_tilted_view(view):
             return str(view_name) in tilted_native_output_by_model.get(str(model_name), {})
         return str(view_name) in view_volumes_by_model.get(str(model_name), {})
 
     def _parent_destination_volume(model_name: str, view_name: str) -> np.ndarray:
         view = view_infos_by_name[str(view_name)]
-        if view.family == 'radial':
-            return radial_native_output_by_model[str(model_name)][str(view_name)]
+        if view.family in ('azimuthal', 'radial'):
+            return azimuthal_native_output_by_model[str(model_name)][str(view_name)]
         if is_tilted_view(view):
             return tilted_native_output_by_model[str(model_name)][str(view_name)]
         return view_volumes_by_model[str(model_name)][str(view_name)]
@@ -2961,8 +2984,8 @@ def _main_impl() -> None:
                 and str(getattr(ref, 'layer_role', 'additive_component')) == 'additive_component'
                 and str(getattr(ref, 'recomposition_op', 'union')) == 'union'
             )
-            if view.family == 'radial':
-                primary = radial_native_output_by_model[str(model_name)].get(runtime_name)
+            if view.family in ('azimuthal', 'radial'):
+                primary = azimuthal_native_output_by_model[str(model_name)].get(runtime_name)
             elif is_tilted_view(view):
                 primary = tilted_native_output_by_model[str(model_name)].get(runtime_name)
             else:
@@ -2970,12 +2993,12 @@ def _main_impl() -> None:
             fallback = native_view_support_by_model[str(model_name)].get(runtime_name)
 
             # Match the established tail's contribution choice. Projected component refs
-            # supersede retained Radial/Tilted canvases. Cartesian dense volumes remain
+            # supersede retained Azimuthal/Tilted canvases. Cartesian dense volumes remain
             # authoritative, except that a D1 source-space base ref accompanies a dense
             # orthogonal-additions continuation.
             refs_are_authoritative = bool(
                 view_refs and (
-                    view.family == 'radial'
+                    view.family in ('azimuthal', 'radial')
                     or is_tilted_view(view)
                     or primary is None
                 )
@@ -2987,7 +3010,7 @@ def _main_impl() -> None:
                     selected_refs.setdefault(str(ref.key), ref)
             else:
                 dense_owner = primary
-                if dense_owner is None and (view.family == 'radial' or is_tilted_view(view)):
+                if dense_owner is None and (view.family in ('azimuthal', 'radial') or is_tilted_view(view)):
                     dense_owner = fallback
                 d1_ref = d1_layer_ref_by_parent.get((str(model_name), runtime_name))
                 if dense_owner is not None and d1_ref is not None:
@@ -2996,7 +3019,7 @@ def _main_impl() -> None:
             detached: List[object] = []
             for registry in (
                 native_view_support_by_model,
-                radial_native_output_by_model,
+                azimuthal_native_output_by_model,
                 tilted_native_output_by_model,
                 view_volumes_by_model,
             ):
@@ -3049,7 +3072,7 @@ def _main_impl() -> None:
         physical_view = physical_view_infos_by_name[str(physical_name)]
         projection_bytes = (
             int(array_nbytes((int(input_T), int(input_H), int(input_W)), np.uint8))
-            if physical_view.family == 'radial' or is_tilted_view(physical_view)
+            if physical_view.family in ('azimuthal', 'radial') or is_tilted_view(physical_view)
             else 1
         )
 
@@ -3117,7 +3140,7 @@ def _main_impl() -> None:
         candidates: List[object] = list(extra_arrays)
         for registry in (
             native_view_support_by_model,
-            radial_native_output_by_model,
+            azimuthal_native_output_by_model,
             tilted_native_output_by_model,
             view_volumes_by_model,
         ):
@@ -3553,7 +3576,7 @@ def _main_impl() -> None:
         fut = prediction_join_executor.submit(handle.wait)
         prediction_accumulation_futures[fut] = dict(context)
 
-    def _submit_radial_padding_tile_cleanups(
+    def _submit_azimuthal_padding_tile_cleanups(
         *,
         model_name: str,
         view: ViewInfo,
@@ -3582,7 +3605,7 @@ def _main_impl() -> None:
         if len(compact_shape) != 3 or int(compact_shape[0]) != int(len(padding_frames)):
             _retire_compact_sink()
             raise ValueError(
-                f'{model_name}/{view.name}/{tile_job.tile_id}: compact radial padding '
+                f'{model_name}/{view.name}/{tile_job.tile_id}: compact azimuthal padding '
                 f'shape {compact_shape} does not match {len(padding_frames)} frame specs'
             )
         threshold_shape = tuple(int(value) for value in threshold_plane_shape)
@@ -3596,14 +3619,14 @@ def _main_impl() -> None:
             destination = int(frame.get('destination', -1))
             if ordinal < 0 or ordinal >= int(compact_shape[0]):
                 _retire_compact_sink()
-                raise IndexError(f'Radial padding ordinal {ordinal} is outside {compact_shape}')
+                raise IndexError(f'Azimuthal padding ordinal {ordinal} is outside {compact_shape}')
             if destination < 0 or destination >= int(view.num_slices):
                 _retire_compact_sink()
                 raise IndexError(
-                    f'Radial padding destination {destination} is outside '
+                    f'Azimuthal padding destination {destination} is outside '
                     f'{view.name} ({int(view.num_slices)} slices)'
                 )
-            grouped_frames.setdefault(bool(frame.get('mirror_radial_u', False)), []).append(
+            grouped_frames.setdefault(bool(frame.get('mirror_azimuthal_u', False)), []).append(
                 dict(frame)
             )
 
@@ -3629,16 +3652,16 @@ def _main_impl() -> None:
                             pass
 
         try:
-            for mirror_radial_u in (True, False):
-                frames = grouped_frames.get(bool(mirror_radial_u), [])
+            for mirror_azimuthal_u in (True, False):
+                frames = grouped_frames.get(bool(mirror_azimuthal_u), [])
                 if not frames:
                     continue
-                auxiliary_id = radial_batch_padding_tile_id(
-                    str(tile_job.tile_id), mirror_radial_u=bool(mirror_radial_u),
+                auxiliary_id = azimuthal_batch_padding_tile_id(
+                    str(tile_job.tile_id), mirror_azimuthal_u=bool(mirror_azimuthal_u),
                 )
                 auxiliary_crop = (
-                    mirrored_radial_parent_crop(original_crop, int(threshold_shape[1]))
-                    if bool(mirror_radial_u) else original_crop
+                    mirrored_azimuthal_parent_crop(original_crop, int(threshold_shape[1]))
+                    if bool(mirror_azimuthal_u) else original_crop
                 )
                 declared_crops = {
                     tuple(int(value) for value in frame.get('parent_crop', auxiliary_crop))
@@ -3646,7 +3669,7 @@ def _main_impl() -> None:
                 }
                 if declared_crops != {tuple(auxiliary_crop)}:
                     raise ValueError(
-                        f'{model_name}/{view.name}/{auxiliary_id}: inconsistent radial '
+                        f'{model_name}/{view.name}/{auxiliary_id}: inconsistent azimuthal '
                         f'padding crops {sorted(declared_crops)}; expected {auxiliary_crop}'
                     )
                 full_shape = (
@@ -3668,7 +3691,7 @@ def _main_impl() -> None:
                         shape=full_shape,
                         dtype=np.uint8,
                         path=auxiliary_mask_path,
-                        desc=f'{model_name}/{view.name}/{auxiliary_id} radial seam tile volume',
+                        desc=f'{model_name}/{view.name}/{auxiliary_id} azimuthal seam tile volume',
                         prefer_memory=True,
                         initialize_zero=True,
                     )
@@ -3678,7 +3701,7 @@ def _main_impl() -> None:
                             dtype=np.uint8,
                             path=auxiliary_conf_path,
                             desc=(
-                                f'{model_name}/{view.name}/{auxiliary_id} radial seam '
+                                f'{model_name}/{view.name}/{auxiliary_id} azimuthal seam '
                                 'tile confidence workspace'
                             ),
                             prefer_memory=True,
@@ -3775,16 +3798,16 @@ def _main_impl() -> None:
                 yolo_obj = context.get('yolo')
                 if offload_between_jobs_enabled() and yolo_obj is not None:
                     offload_yolo_from_gpu(yolo_obj)
-                expected_padding_count = radial_batch_padding_count(
+                expected_padding_count = azimuthal_batch_padding_count(
                     view, int(view.num_slices), max(1, int(pred_cfg.batch)),
                 )
                 processed_padding_count = int(
-                    pred_stats.get('radial_padding_processed', 0) or 0
+                    pred_stats.get('azimuthal_padding_processed', 0) or 0
                 )
                 if processed_padding_count != int(expected_padding_count):
                     raise RuntimeError(
                         f'{model_name}/{view.name}: async full-frame inference processed '
-                        f'{processed_padding_count}/{expected_padding_count} radial batch seam slots'
+                        f'{processed_padding_count}/{expected_padding_count} azimuthal batch seam slots'
                     )
                 view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(pred_stats.get('prediction_count', 0))
                 remaining_key = (model_name, view.name)
@@ -3811,24 +3834,24 @@ def _main_impl() -> None:
                 tile_inference_done.add(ready_key)
                 view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(pred_stats.get('prediction_count', 0))
 
-                padding_frames_raw = context.get('radial_padding_frames', ())
+                padding_frames_raw = context.get('azimuthal_padding_frames', ())
                 if isinstance(padding_frames_raw, (list, tuple)) and padding_frames_raw:
                     expected_padding_count = int(len(padding_frames_raw))
                     processed_padding_count = int(
-                        pred_stats.get('radial_padding_processed', 0) or 0
+                        pred_stats.get('azimuthal_padding_processed', 0) or 0
                     )
                     if processed_padding_count != expected_padding_count:
                         for array_obj in (
-                            context.get('radial_padding_conf_mm'),
-                            context.get('radial_padding_mask_mm'),
+                            context.get('azimuthal_padding_conf_mm'),
+                            context.get('azimuthal_padding_mask_mm'),
                             tile_conf_mm,
                             tile_mask_mm,
                         ):
                             close_memmap_array_without_flush(array_obj)
                         if not keep_temp_artifacts:
                             for raw_path in (
-                                context.get('radial_padding_conf_path'),
-                                context.get('radial_padding_mask_path'),
+                                context.get('azimuthal_padding_conf_path'),
+                                context.get('azimuthal_padding_mask_path'),
                                 tile_conf_path,
                                 tile_mask_path,
                             ):
@@ -3840,15 +3863,15 @@ def _main_impl() -> None:
                         raise RuntimeError(
                             f'{model_name}/{view.name}/{tile_job.tile_id}: async inference '
                             f'processed {processed_padding_count}/{expected_padding_count} '
-                            'radial batch seam slots'
+                            'azimuthal batch seam slots'
                         )
-                    padding_mask_mm = context.get('radial_padding_mask_mm')
+                    padding_mask_mm = context.get('azimuthal_padding_mask_mm')
                     if padding_mask_mm is None:
-                        raise RuntimeError('Async radial tile result has no compact mask sink')
-                    padding_conf_obj = context.get('radial_padding_conf_mm')
-                    padding_mask_path = Path(context['radial_padding_mask_path'])
-                    padding_conf_path_obj = context.get('radial_padding_conf_path')
-                    _submit_radial_padding_tile_cleanups(
+                        raise RuntimeError('Async azimuthal tile result has no compact mask sink')
+                    padding_conf_obj = context.get('azimuthal_padding_conf_mm')
+                    padding_mask_path = Path(context['azimuthal_padding_mask_path'])
+                    padding_conf_path_obj = context.get('azimuthal_padding_conf_path')
+                    _submit_azimuthal_padding_tile_cleanups(
                         model_name=str(model_name),
                         view=view,
                         tile_job=tile_job,
@@ -3864,10 +3887,10 @@ def _main_impl() -> None:
                             int(value) for value in context['threshold_plane_shape']
                         ),
                     )
-                elif int(pred_stats.get('radial_padding_processed', 0) or 0) > 0:
+                elif int(pred_stats.get('azimuthal_padding_processed', 0) or 0) > 0:
                     raise RuntimeError(
                         f'{model_name}/{view.name}/{tile_job.tile_id}: async inference '
-                        'returned unexpected radial padding results'
+                        'returned unexpected azimuthal padding results'
                     )
 
                 if int(pred_stats.get('frames_with_predictions', 0)) <= 0:
@@ -3966,8 +3989,8 @@ def _main_impl() -> None:
 
             view_info = view_infos_by_name[result.view_name]
             if result.final_view_volume_mm is not None and not retire_completed_non_tiled_view:
-                if view_info.family == 'radial':
-                    radial_native_output_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
+                if view_info.family in ('azimuthal', 'radial'):
+                    azimuthal_native_output_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
                 elif is_tilted_view(view_info):
                     tilted_native_output_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
                 else:
@@ -4324,8 +4347,8 @@ def _main_impl() -> None:
             ),
             memfd_workspace_enabled=memfd_workspace_enabled,
             preflight_multiprocessing_payload=preflight_multiprocessing_payload,
-            radial_batch_padding_count=radial_batch_padding_count,
-            radial_batch_padding_mirror_groups=radial_batch_padding_mirror_groups,
+            azimuthal_batch_padding_count=azimuthal_batch_padding_count,
+            azimuthal_batch_padding_mirror_groups=azimuthal_batch_padding_mirror_groups,
             runtime_telemetry=runtime_telemetry,
             tile_dense_worker_result_warn_seconds=tile_dense_worker_result_warn_seconds,
             view_processing_volume_shape=view_processing_volume_shape,
@@ -4333,7 +4356,7 @@ def _main_impl() -> None:
         ),
     )
 
-    _tile_task_radial_padding_count = scheduler.tile_task_radial_padding_count
+    _tile_task_azimuthal_padding_count = scheduler.tile_task_azimuthal_padding_count
     _tile_dense_result_task_bytes = scheduler.tile_dense_result_task_bytes
     _tile_dense_result_task_admissible = scheduler.tile_dense_result_task_admissible
     _tile_parent_mask_ready_for_task = scheduler.tile_parent_mask_ready_for_task
@@ -4582,7 +4605,7 @@ def _main_impl() -> None:
                 f'streams={cpu_streams_requested or "auto"}, '
                 f'infer_requests={cpu_infer_requests_requested or "auto"}, '
                 f'render_workers/instance={cpu_render_workers}. '
-                'Cartesian work is preferred, Tilted Cartesian follows, and Radial work is never claimed.'
+                'Cartesian work is preferred, Tilted Cartesian follows, and Azimuthal work is never claimed.'
             )
 
         # Warm GPU workers double as interpolation hosts whenever their targeted inference queue is idle.
@@ -4675,7 +4698,7 @@ def _main_impl() -> None:
         if not source_volume_ready_async:
             source_volume_path, source_volume_shape, source_volume_dtype = _ensure_source_volume_file_backed()
         # Split each full-frame volume into contiguous slice-range chunks so multiple GPUs can work
-        # the SAME (often huge, e.g. full-coverage Radial) volume in parallel, instead of one GPU per
+        # the SAME (often huge, e.g. full-coverage Azimuthal) volume in parallel, instead of one GPU per
         # whole volume leaving the other GPUs idle at the tail. The chunk is large relative to the
         # render prefetch window so per-chunk render ramp-up stays amortized. Tiles are gated/
         # consolidated as whole volumes, so they are never slice-split.
@@ -4779,8 +4802,8 @@ def _main_impl() -> None:
                     cpu_worker_process_active and cpu_inference_supports_view(view)
                 )
                 gpu_eligible = bool(gpu_worker_process_active)
-                radial_parent_requires_seam_union = bool(
-                    radial_batch_padding_count(
+                azimuthal_parent_requires_seam_union = bool(
+                    azimuthal_batch_padding_count(
                         view,
                         int(n_slices),
                         max(1, int(args.gpu_batch)),
@@ -4788,11 +4811,12 @@ def _main_impl() -> None:
                 )
                 hybrid_deferred = bool(
                     str(kind) == 'fullframe'
+                    and view.family != 'radial'
                     and v1613_d1_owner_active
                     and worker_direct_union_active
                     and cpu_eligible
                     and gpu_eligible
-                    and not radial_parent_requires_seam_union
+                    and not azimuthal_parent_requires_seam_union
                 )
                 if hybrid_deferred:
                     # First claim resolves the whole view: OpenVINO -> shared direct union;
@@ -4803,9 +4827,10 @@ def _main_impl() -> None:
                     result_mode = HYBRID_DEFERRED_RESULT_MODE
                 elif (
                     str(kind) == 'fullframe'
+                    and view.family != 'radial'
                     and v1613_d1_owner_active
                     and not cpu_eligible
-                    and not radial_parent_requires_seam_union
+                    and not azimuthal_parent_requires_seam_union
                 ):
                     # D1 retains only a task-local device union and one persistent source-space
                     # bitset on the owner GPU. No host result path or dense per-view workspace exists.
@@ -4857,7 +4882,7 @@ def _main_impl() -> None:
                     'slice_start': int(s0), 'slice_count': int(count),
                     'source_volume_path': source_volume_path, 'source_shape': list(source_volume_shape),
                     'source_dtype': source_volume_dtype,
-                    'radial_texture_required': bool(radial_texture_required),
+                    'azimuthal_texture_required': bool(azimuthal_texture_required),
                     # native-volume residency spec + cube-ready sentinel
                     # (None when the cube gated enqueue synchronously, as before).
                     'native_resize': native_resize_task_spec,
@@ -4865,7 +4890,7 @@ def _main_impl() -> None:
                     'result_conf_path': (str(rconf) if rconf is not None else None),
                     'result_mode': str(result_mode), 'union_num_slices': int(n_slices),
                     'prediction_batch': max(1, int(args.gpu_batch)),
-                    'radial_padding_dir': str(gpu_worker_result_dir / 'radial_batch_padding'),
+                    'azimuthal_padding_dir': str(gpu_worker_result_dir / 'azimuthal_batch_padding'),
                     'hybrid_cpu_eligible_origin': bool(hybrid_deferred),
                     'render_workers': int(render_workers), 'prefetch_frames': int(prefetch_frames),
                     'postprocess_workers': int(per_worker_workers),
@@ -4907,7 +4932,7 @@ def _main_impl() -> None:
                     parent_key = (str(model_name), str(view.name))
                     fullframe_task_ids_by_parent.setdefault(parent_key, []).append(int(next_task_id))
                 if str(kind) == 'tile':
-                    result_ids = radial_batch_padding_tile_result_ids(
+                    result_ids = azimuthal_batch_padding_tile_result_ids(
                         str(job_id),
                         view,
                         int(count),
@@ -5155,24 +5180,24 @@ def _main_impl() -> None:
             f'tracked after {dynamic_splits} claim-time split(s) (hard full-frame chunk cap={slice_chunk}; '
             f'{", ".join(lease_details)}).{hybrid_policy}'
         )
-    pending_radial_padding_by_parent: Dict[
+    pending_azimuthal_padding_by_parent: Dict[
         Tuple[str, str], List[Tuple[Dict[str, object], Dict[str, object]]]
     ] = {}
 
-    def _merge_pending_radial_padding_for_parent(model_name_s: str, view: ViewInfo) -> None:
+    def _merge_pending_azimuthal_padding_for_parent(model_name_s: str, view: ViewInfo) -> None:
         parent_key = (str(model_name_s), str(view.name))
-        pending = pending_radial_padding_by_parent.pop(parent_key, [])
+        pending = pending_azimuthal_padding_by_parent.pop(parent_key, [])
         if not pending:
             return
         _ensure_baseline_workspaces(str(model_name_s), view)
         dst_mask = baseline_union_by_model_view[parent_key]
         dst_conf = baseline_confmap_by_model_view.get(parent_key)
         for task_obj, stats_obj in pending:
-            pad_count = int(stats_obj.get('radial_padding_count', 0) or 0)
-            mask_path_raw = str(stats_obj.get('radial_padding_mask_path', '') or '')
+            pad_count = int(stats_obj.get('azimuthal_padding_count', 0) or 0)
+            mask_path_raw = str(stats_obj.get('azimuthal_padding_mask_path', '') or '')
             if pad_count <= 0 or not mask_path_raw:
                 raise RuntimeError(
-                    f'{model_name_s}/{view.name}: worker reported processed radial '
+                    f'{model_name_s}/{view.name}: worker reported processed azimuthal '
                     'padding without a positive count and mask path'
                 )
             proc_shape = tuple(int(v) for v in task_obj.get(
@@ -5180,21 +5205,21 @@ def _main_impl() -> None:
                 view_processing_volume_shape(view, int(task_obj.get('out_size', args.imgsz))),
             ))
             pad_shape = tuple(int(value) for value in stats_obj.get(
-                'radial_padding_shape',
+                'azimuthal_padding_shape',
                 (int(pad_count), int(proc_shape[1]), int(proc_shape[2])),
             ))
             if len(pad_shape) != 3 or int(pad_shape[0]) < int(pad_count):
                 raise ValueError(
-                    f'{model_name_s}/{view.name}: invalid radial padding result shape '
+                    f'{model_name_s}/{view.name}: invalid azimuthal padding result shape '
                     f'{pad_shape} for {pad_count} wrapped slice(s)'
                 )
-            conf_path_raw = str(stats_obj.get('radial_padding_conf_path', '') or '')
+            conf_path_raw = str(stats_obj.get('azimuthal_padding_conf_path', '') or '')
             destinations = tuple(
-                int(v) for v in stats_obj.get('radial_padding_destinations', tuple(range(pad_count)))
+                int(v) for v in stats_obj.get('azimuthal_padding_destinations', tuple(range(pad_count)))
             )
             if len(destinations) != int(pad_count):
                 raise ValueError(
-                    f'{model_name_s}/{view.name}: radial padding returned '
+                    f'{model_name_s}/{view.name}: azimuthal padding returned '
                     f'{len(destinations)} destinations for {pad_count} slots'
                 )
             pad_mask: Optional[np.ndarray] = None
@@ -5210,7 +5235,7 @@ def _main_impl() -> None:
                 for pad_index, destination in enumerate(destinations):
                     if destination < 0 or destination >= int(view.num_slices):
                         raise IndexError(
-                            f'{model_name_s}/{view.name}: radial padding destination '
+                            f'{model_name_s}/{view.name}: azimuthal padding destination '
                             f'{destination} is outside {int(view.num_slices)} slices'
                         )
                     union_conf_volume_into_volume_inplace(
@@ -5226,7 +5251,7 @@ def _main_impl() -> None:
                         ),
                         workers=1,
                         desc=(
-                            f'Union {view.name} radial batch seam padding '
+                            f'Union {view.name} azimuthal batch seam padding '
                             f'into slice {int(destination)}'
                         ),
                     )
@@ -5245,7 +5270,7 @@ def _main_impl() -> None:
         remaining_key = (str(model_name_s), str(view.name))
         fullframe_remaining[remaining_key] = int(fullframe_remaining.get(remaining_key, 0)) - 1
         if int(fullframe_remaining.get(remaining_key, 0)) == 0:
-            _merge_pending_radial_padding_for_parent(str(model_name_s), view)
+            _merge_pending_azimuthal_padding_for_parent(str(model_name_s), view)
             _submit_view_prepare(str(model_name_s), view)
 
     def _accumulate_fullframe_slice_metadata(
@@ -5300,31 +5325,31 @@ def _main_impl() -> None:
             key_fill = (model_name_s, str(view.name))
             view_device_hole_filled_slices[key_fill] = int(view_device_hole_filled_slices.get(key_fill, 0)) + _filled
         meta_key = (model_name_s, str(view.name))
-        expected_radial_padding = radial_batch_padding_count(
+        expected_azimuthal_padding = azimuthal_batch_padding_count(
             view,
             int(task.get('slice_count', view.num_slices)),
             max(1, int(task.get('prediction_batch', args.batch))),
             slice_offset=int(task.get('slice_start', 0)),
         )
-        processed_radial_padding = int(stats.get('radial_padding_processed', 0) or 0)
-        if int(processed_radial_padding) != int(expected_radial_padding):
+        processed_azimuthal_padding = int(stats.get('azimuthal_padding_processed', 0) or 0)
+        if int(processed_azimuthal_padding) != int(expected_azimuthal_padding):
             raise RuntimeError(
                 f'{model_name_s}/{view.name}: worker processed '
-                f'{processed_radial_padding}/{expected_radial_padding} radial batch seam slots'
+                f'{processed_azimuthal_padding}/{expected_azimuthal_padding} azimuthal batch seam slots'
             )
-        if int(processed_radial_padding) > 0:
-            declared_radial_padding = int(stats.get('radial_padding_count', 0) or 0)
-            if declared_radial_padding != int(expected_radial_padding):
+        if int(processed_azimuthal_padding) > 0:
+            declared_azimuthal_padding = int(stats.get('azimuthal_padding_count', 0) or 0)
+            if declared_azimuthal_padding != int(expected_azimuthal_padding):
                 raise RuntimeError(
                     f'{model_name_s}/{view.name}: worker declared '
-                    f'{declared_radial_padding}/{expected_radial_padding} radial padding slots'
+                    f'{declared_azimuthal_padding}/{expected_azimuthal_padding} azimuthal padding slots'
                 )
             if str(task.get('result_mode', 'file')) == 'd1_owner':
                 raise RuntimeError(
-                    f'{model_name_s}/{view.name}: radial batch seam padding cannot enter '
+                    f'{model_name_s}/{view.name}: azimuthal batch seam padding cannot enter '
                     'the source-space D1 owner result; this parent must use direct/file union'
                 )
-            pending_radial_padding_by_parent.setdefault(meta_key, []).append((task, stats))
+            pending_azimuthal_padding_by_parent.setdefault(meta_key, []).append((task, stats))
         _accumulate_fullframe_slice_metadata(task, stats, view)
         if str(task.get('result_mode', 'file')) == 'd1_owner':
             complete = bool(stats.get('d1_view_complete', False))
@@ -5425,30 +5450,30 @@ def _main_impl() -> None:
         assert isinstance(tile_job, DenseTileJob)
         view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(stats.get('prediction_count', 0))
         tile_inference_done.add((model_name_s, str(view.name), str(tile_job.tile_id)))
-        expected_padding_count = int(_tile_task_radial_padding_count(task))
-        processed_padding_count = int(stats.get('radial_padding_processed', 0) or 0)
+        expected_padding_count = int(_tile_task_azimuthal_padding_count(task))
+        processed_padding_count = int(stats.get('azimuthal_padding_processed', 0) or 0)
         if expected_padding_count > 0:
             if int(processed_padding_count) != int(expected_padding_count):
                 raise RuntimeError(
                     f'{model_name_s}/{view.name}/{tile_job.tile_id}: worker processed '
-                    f'{processed_padding_count}/{expected_padding_count} radial batch seam slots'
+                    f'{processed_padding_count}/{expected_padding_count} azimuthal batch seam slots'
                 )
             padding_shape = tuple(int(value) for value in stats.get(
-                'radial_padding_shape',
+                'azimuthal_padding_shape',
                 (
                     int(expected_padding_count),
                     int(task['processing_shape'][1]),
                     int(task['processing_shape'][2]),
                 ),
             ))
-            padding_mask_path_raw = str(stats.get('radial_padding_mask_path', '') or '')
+            padding_mask_path_raw = str(stats.get('azimuthal_padding_mask_path', '') or '')
             if not padding_mask_path_raw:
                 raise RuntimeError(
                     f'{model_name_s}/{view.name}/{tile_job.tile_id}: worker returned no '
-                    'radial padding mask path'
+                    'azimuthal padding mask path'
                 )
             padding_mask_path = Path(padding_mask_path_raw)
-            padding_conf_path_raw = str(stats.get('radial_padding_conf_path', '') or '')
+            padding_conf_path_raw = str(stats.get('azimuthal_padding_conf_path', '') or '')
             padding_conf_path = Path(padding_conf_path_raw) if padding_conf_path_raw else None
             padding_mask_mm: Optional[np.ndarray] = None
             padding_conf_mm: Optional[np.ndarray] = None
@@ -5464,15 +5489,15 @@ def _main_impl() -> None:
                 close_memmap_array(padding_conf_mm)
                 close_memmap_array(padding_mask_mm)
                 raise
-            padding_frames_raw = stats.get('radial_padding_frames')
+            padding_frames_raw = stats.get('azimuthal_padding_frames')
             if not isinstance(padding_frames_raw, (list, tuple)):
                 close_memmap_array(padding_conf_mm)
                 close_memmap_array(padding_mask_mm)
                 raise TypeError(
                     f'{model_name_s}/{view.name}/{tile_job.tile_id}: worker returned invalid '
-                    'radial padding frame metadata'
+                    'azimuthal padding frame metadata'
                 )
-            _submit_radial_padding_tile_cleanups(
+            _submit_azimuthal_padding_tile_cleanups(
                 model_name=model_name_s,
                 view=view,
                 tile_job=tile_job,
@@ -5488,7 +5513,7 @@ def _main_impl() -> None:
             )
         elif processed_padding_count > 0:
             raise RuntimeError(
-                f'{model_name_s}/{view.name}/{tile_job.tile_id}: unexpected radial '
+                f'{model_name_s}/{view.name}/{tile_job.tile_id}: unexpected azimuthal '
                 f'padding result ({processed_padding_count} slot(s))'
             )
         if int(stats.get('frames_with_predictions', 0)) <= 0:
@@ -5777,19 +5802,19 @@ def _main_impl() -> None:
                             )
                             if offload_between_jobs_enabled():
                                 offload_yolo_from_gpu(yolo)
-                            expected_padding_count = radial_batch_padding_count(
+                            expected_padding_count = azimuthal_batch_padding_count(
                                 view,
                                 int(view.num_slices),
                                 max(1, int(pred_cfg.batch)),
                             )
                             processed_padding_count = int(
-                                pred_stats.get('radial_padding_processed', 0) or 0
+                                pred_stats.get('azimuthal_padding_processed', 0) or 0
                             )
                             if processed_padding_count != int(expected_padding_count):
                                 raise RuntimeError(
                                     f'{model_name}/{view.name}: full-frame inference processed '
                                     f'{processed_padding_count}/{expected_padding_count} '
-                                    'radial batch seam slots'
+                                    'azimuthal batch seam slots'
                                 )
                             view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(pred_stats.get('prediction_count', 0))
 
@@ -5827,18 +5852,18 @@ def _main_impl() -> None:
                 tile_conf_path = temp_dir / 'tile_volumes' / model_name / view.name / f'{tile_job.tile_id}.confmap.u8.dat'
                 tile_mask_path.parent.mkdir(parents=True, exist_ok=True)
 
-                tile_radial_specs = radial_batch_padding_frame_specs(
+                tile_azimuthal_specs = azimuthal_batch_padding_frame_specs(
                     view,
                     int(view.num_slices),
                     max(1, int(pred_cfg.batch)),
                 )
-                radial_padding_mask_path = (
+                azimuthal_padding_mask_path = (
                     temp_dir / 'tile_volumes' / model_name / view.name /
-                    f'{tile_job.tile_id}.radial_batch_padding.u8.dat'
+                    f'{tile_job.tile_id}.azimuthal_batch_padding.u8.dat'
                 )
-                radial_padding_conf_path = (
+                azimuthal_padding_conf_path = (
                     temp_dir / 'tile_volumes' / model_name / view.name /
-                    f'{tile_job.tile_id}.radial_batch_padding.confmap.u8.dat'
+                    f'{tile_job.tile_id}.azimuthal_batch_padding.confmap.u8.dat'
                 )
 
                 tile_mask_mm = allocate_workspace_array(
@@ -5861,31 +5886,31 @@ def _main_impl() -> None:
                     tile_conf_mm = None
                     tile_conf_store_path = None
 
-                if tile_radial_specs:
+                if tile_azimuthal_specs:
                     compact_padding_shape = (
-                        int(len(tile_radial_specs)), int(tile_shape[1]), int(tile_shape[2]),
+                        int(len(tile_azimuthal_specs)), int(tile_shape[1]), int(tile_shape[2]),
                     )
-                    radial_padding_mask_mm: Optional[np.ndarray] = None
-                    radial_padding_conf_mm: Optional[np.ndarray] = None
+                    azimuthal_padding_mask_mm: Optional[np.ndarray] = None
+                    azimuthal_padding_conf_mm: Optional[np.ndarray] = None
                     try:
-                        radial_padding_mask_mm = allocate_workspace_array(
+                        azimuthal_padding_mask_mm = allocate_workspace_array(
                             shape=compact_padding_shape,
                             dtype=np.uint8,
-                            path=radial_padding_mask_path,
+                            path=azimuthal_padding_mask_path,
                             desc=(
-                                f'{model_name}/{view.name}/{tile_job.tile_id} compact radial '
+                                f'{model_name}/{view.name}/{tile_job.tile_id} compact azimuthal '
                                 'batch seam tile volume'
                             ),
                             prefer_memory=True,
                             initialize_zero=True,
                         )
-                        radial_padding_conf_mm = (
+                        azimuthal_padding_conf_mm = (
                             allocate_workspace_array(
                                 shape=compact_padding_shape,
                                 dtype=np.uint8,
-                                path=radial_padding_conf_path,
+                                path=azimuthal_padding_conf_path,
                                 desc=(
-                                    f'{model_name}/{view.name}/{tile_job.tile_id} compact radial '
+                                    f'{model_name}/{view.name}/{tile_job.tile_id} compact azimuthal '
                                     'batch seam confidence workspace'
                                 ),
                                 prefer_memory=True,
@@ -5894,13 +5919,13 @@ def _main_impl() -> None:
                             if tile_conf_mm is not None else None
                         )
                     except BaseException:
-                        close_memmap_array_without_flush(radial_padding_conf_mm)
-                        close_memmap_array_without_flush(radial_padding_mask_mm)
+                        close_memmap_array_without_flush(azimuthal_padding_conf_mm)
+                        close_memmap_array_without_flush(azimuthal_padding_mask_mm)
                         close_memmap_array_without_flush(tile_conf_mm)
                         close_memmap_array_without_flush(tile_mask_mm)
                         if not keep_temp_artifacts:
                             for failed_path in (
-                                radial_padding_conf_path, radial_padding_mask_path,
+                                azimuthal_padding_conf_path, azimuthal_padding_mask_path,
                                 tile_conf_store_path, tile_mask_path,
                             ):
                                 if failed_path is not None:
@@ -5913,13 +5938,13 @@ def _main_impl() -> None:
                         )
                         _pump_prediction_volume_build_queue()
                         raise
-                    radial_padding_conf_store_path: Optional[Path] = (
-                        radial_padding_conf_path if radial_padding_conf_mm is not None else None
+                    azimuthal_padding_conf_store_path: Optional[Path] = (
+                        azimuthal_padding_conf_path if azimuthal_padding_conf_mm is not None else None
                     )
                 else:
-                    radial_padding_mask_mm = None
-                    radial_padding_conf_mm = None
-                    radial_padding_conf_store_path = None
+                    azimuthal_padding_mask_mm = None
+                    azimuthal_padding_conf_mm = None
+                    azimuthal_padding_conf_store_path = None
 
                 yolo = yolo_by_model_name[str(model_name)]
                 try:
@@ -5939,8 +5964,8 @@ def _main_impl() -> None:
                             streaming_cleanup_enabled=bool(angle_variant_streaming_cleanup_active),
                             streaming_cleanup_min_conf=float(args.min_conf),
                             streaming_cleanup_min_radius=float(tile_processing_min_radius),
-                            radial_padding_union_mm=radial_padding_mask_mm,
-                            radial_padding_confmap_mm=radial_padding_conf_mm,
+                            azimuthal_padding_union_mm=azimuthal_padding_mask_mm,
+                            azimuthal_padding_confmap_mm=azimuthal_padding_conf_mm,
                         )
                         _submit_prediction_accumulation_join(handle, {
                             'kind': 'tile',
@@ -5952,15 +5977,15 @@ def _main_impl() -> None:
                             'tile_mask_path': tile_mask_path,
                             'tile_conf_path': tile_conf_store_path,
                             'threshold_plane_shape': tile_threshold_plane_shape,
-                            'radial_padding_mask_mm': radial_padding_mask_mm,
-                            'radial_padding_conf_mm': radial_padding_conf_mm,
-                            'radial_padding_mask_path': radial_padding_mask_path,
-                            'radial_padding_conf_path': radial_padding_conf_store_path,
-                            'radial_padding_frames': tuple({
-                                'ordinal': int(spec.radial_padding_ordinal or 0),
+                            'azimuthal_padding_mask_mm': azimuthal_padding_mask_mm,
+                            'azimuthal_padding_conf_mm': azimuthal_padding_conf_mm,
+                            'azimuthal_padding_mask_path': azimuthal_padding_mask_path,
+                            'azimuthal_padding_conf_path': azimuthal_padding_conf_store_path,
+                            'azimuthal_padding_frames': tuple({
+                                'ordinal': int(spec.azimuthal_padding_ordinal or 0),
                                 'destination': int(spec.global_destination_index),
-                                'mirror_radial_u': bool(spec.mirror_radial_u),
-                            } for spec in tile_radial_specs),
+                                'mirror_azimuthal_u': bool(spec.mirror_azimuthal_u),
+                            } for spec in tile_azimuthal_specs),
                             'yolo': yolo,
                         })
                     else:
@@ -5979,27 +6004,27 @@ def _main_impl() -> None:
                             streaming_cleanup_enabled=bool(angle_variant_streaming_cleanup_active),
                             streaming_cleanup_min_conf=float(args.min_conf),
                             streaming_cleanup_min_radius=float(tile_processing_min_radius),
-                            radial_padding_union_mm=radial_padding_mask_mm,
-                            radial_padding_confmap_mm=radial_padding_conf_mm,
+                            azimuthal_padding_union_mm=azimuthal_padding_mask_mm,
+                            azimuthal_padding_confmap_mm=azimuthal_padding_conf_mm,
                         )
                         if offload_between_jobs_enabled():
                             offload_yolo_from_gpu(yolo)
                         tile_inference_done.add(ready_key)
                         view_prediction_stats[str(view.summary_family)] = int(view_prediction_stats.get(str(view.summary_family), 0)) + int(pred_stats.get('prediction_count', 0))
 
-                        if tile_radial_specs:
-                            if int(pred_stats.get('radial_padding_processed', 0) or 0) != int(len(tile_radial_specs)):
+                        if tile_azimuthal_specs:
+                            if int(pred_stats.get('azimuthal_padding_processed', 0) or 0) != int(len(tile_azimuthal_specs)):
                                 for array_obj in (
-                                    radial_padding_conf_mm,
-                                    radial_padding_mask_mm,
+                                    azimuthal_padding_conf_mm,
+                                    azimuthal_padding_mask_mm,
                                     tile_conf_mm,
                                     tile_mask_mm,
                                 ):
                                     close_memmap_array_without_flush(array_obj)
                                 if not keep_temp_artifacts:
                                     for raw_path in (
-                                        radial_padding_conf_store_path,
-                                        radial_padding_mask_path,
+                                        azimuthal_padding_conf_store_path,
+                                        azimuthal_padding_mask_path,
                                         tile_conf_store_path,
                                         tile_mask_path,
                                     ):
@@ -6010,23 +6035,23 @@ def _main_impl() -> None:
                                                 pass
                                 raise RuntimeError(
                                     f'{model_name}/{view.name}/{tile_job.tile_id}: in-process '
-                                    f'inference processed {int(pred_stats.get("radial_padding_processed", 0) or 0)}/'
-                                    f'{len(tile_radial_specs)} radial batch seam slots'
+                                    f'inference processed {int(pred_stats.get("azimuthal_padding_processed", 0) or 0)}/'
+                                    f'{len(tile_azimuthal_specs)} azimuthal batch seam slots'
                                 )
-                            assert radial_padding_mask_mm is not None
-                            _submit_radial_padding_tile_cleanups(
+                            assert azimuthal_padding_mask_mm is not None
+                            _submit_azimuthal_padding_tile_cleanups(
                                 model_name=str(model_name),
                                 view=view,
                                 tile_job=tile_job,
-                                padding_mask_mm=radial_padding_mask_mm,
-                                padding_conf_mm=radial_padding_conf_mm,
-                                padding_mask_path=radial_padding_mask_path,
-                                padding_conf_path=radial_padding_conf_store_path,
+                                padding_mask_mm=azimuthal_padding_mask_mm,
+                                padding_conf_mm=azimuthal_padding_conf_mm,
+                                padding_mask_path=azimuthal_padding_mask_path,
+                                padding_conf_path=azimuthal_padding_conf_store_path,
                                 padding_frames=[{
-                                    'ordinal': int(spec.radial_padding_ordinal or 0),
+                                    'ordinal': int(spec.azimuthal_padding_ordinal or 0),
                                     'destination': int(spec.global_destination_index),
-                                    'mirror_radial_u': bool(spec.mirror_radial_u),
-                                } for spec in tile_radial_specs],
+                                    'mirror_azimuthal_u': bool(spec.mirror_azimuthal_u),
+                                } for spec in tile_azimuthal_specs],
                                 threshold_plane_shape=tile_threshold_plane_shape,
                             )
 
@@ -6387,7 +6412,7 @@ def _main_impl() -> None:
         if int(swept_mkvs) > 0:
             print(f'Final legacy temporary MKV sweep removed {int(swept_mkvs)} leftover file(s).')
 
-    # radial/tilted results are backprojected DIRECTLY into the
+    # azimuthal/tilted results are backprojected DIRECTLY into the
     # original source geometry (single resample) instead of the working geometry.
     source_output_shape_tyx = (int(input_T), int(input_H), int(input_W))
     final_backprojection_jobs: List[ViewBackprojectionQueueJob] = []
@@ -6407,7 +6432,7 @@ def _main_impl() -> None:
             if d1_base_ref is not None and d1_dense_orthogonal_additions_present:
                 # Orthogonal dense D1 continuation contains additions only and takes the early
                 # dense-view branch below. Contribute the already-source-space base exactly once.
-                # Radial/Tilted D1 views instead reach the component-ref branch, which already
+                # Azimuthal/Tilted D1 views instead reach the component-ref branch, which already
                 # includes both this base and every projected addition layer.
                 fused_projected_layer_refs.append(d1_base_ref)
             if view.name in view_volumes_by_model[model_name]:
@@ -6429,10 +6454,10 @@ def _main_impl() -> None:
                 fused_projected_layer_refs.extend(view_projected_layer_refs)
                 continue
 
-            if (view.family != 'radial' and not is_tilted_view(view)):
+            if (view.family not in ('azimuthal', 'radial') and not is_tilted_view(view)):
                 continue
-            if view.family == 'radial':
-                native_source = radial_native_output_by_model[model_name].get(view.name)
+            if view.family in ('azimuthal', 'radial'):
+                native_source = azimuthal_native_output_by_model[model_name].get(view.name)
             else:
                 native_source = tilted_native_output_by_model[model_name].get(view.name)
             if native_source is None:
@@ -6451,7 +6476,7 @@ def _main_impl() -> None:
             ))
 
     if final_backprojection_jobs:
-        # Run one set at a time with the full CPU fallback budget. Transverse Radial may use
+        # Run one set at a time with the full CPU fallback budget. Transverse Azimuthal may use
         # GPU backprojection; all upright bases can use orientation-aware sink-only projection.
         per_backproject_workers = max(1, int(tail_slice_workers))
         final_backprojection_jobs = [
@@ -6468,7 +6493,7 @@ def _main_impl() -> None:
             for job in final_backprojection_jobs
         ]
         print(
-            f'Final radial/tilted backprojection queue: tasks={len(final_backprojection_jobs)}, '
+            f'Final azimuthal/tilted backprojection queue: tasks={len(final_backprojection_jobs)}, '
             f'max_active=1 CPU-only, per-set CPU workers={int(per_backproject_workers)}'
         )
         backproject_queue = HybridBackprojectionQueue(
@@ -6493,7 +6518,7 @@ def _main_impl() -> None:
     release_unretained_volume_maps(
         (
             native_view_support_by_model,
-            radial_native_output_by_model,
+            azimuthal_native_output_by_model,
             tilted_native_output_by_model,
         ),
         view_volumes_by_model,
@@ -6503,7 +6528,7 @@ def _main_impl() -> None:
     print('\n=== Building final single-model view union after physical-view TTA collapse ===')
     # the union is assembled at ORIGINAL SOURCE dimensions.
     # Cartesian working stacks are restored working->source with one resample while merging;
-    # radial/tilted volumes arrive already backprojected to source geometry. Void fill,
+    # azimuthal/tilted volumes arrive already backprojected to source geometry. Void fill,
     # Gaussian smoothing (sigma in SOURCE voxels) and postprocessing keep_objects run at source dimensions.
     streamed_final_union_mm = streaming_final_union_holder.get(str(model_name))
     if streamed_final_union_mm is None:
@@ -6859,9 +6884,10 @@ def _main_impl() -> None:
             angles=angles,
             channel_format=channel_format,
             tile_configs=tile_configs,
+            azimuthal_requests=azimuthal_requests,
+            azimuthal_diameters=azimuthal_diameters,
+            azimuthal_azimuth_angles=resolved_azimuth_angles,
             radial_requests=radial_requests,
-            radial_diameters=radial_diameters,
-            radial_azimuth_angles=resolved_azimuth_angles,
             backend={
                 'inference_devices': list(inference_devices),
                 'gpu_worker_process_active': bool(gpu_worker_process_active),
@@ -6965,7 +6991,7 @@ def _main_impl() -> None:
                 'processing_volume_mode': str(processing_mode),
                 'streaming_preprocess': bool(preprocess_streaming_active),
                 'cube_t_axis_resize_backend': str(_cube_t_axis_resize_backend()),
-                'radial_source_mode': str(radial_source_mode()),
+                'azimuthal_source_mode': str(azimuthal_source_mode()),
                 'image_capture': (
                     'canonical_render_batch_tee'
                     if bool(save_images_enabled)
@@ -7031,7 +7057,7 @@ def _main_impl() -> None:
         final_output_mask_mm=final_output_mask_mm,
         final_union_mm=final_union_mm,
         native_view_support_by_model=native_view_support_by_model,
-        radial_native_output_by_model=radial_native_output_by_model,
+        azimuthal_native_output_by_model=azimuthal_native_output_by_model,
         tilted_native_output_by_model=tilted_native_output_by_model,
         view_volumes_by_model=view_volumes_by_model,
         parent_mask_support_by_model=parent_mask_support_by_model,

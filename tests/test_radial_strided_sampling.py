@@ -12,10 +12,10 @@ install_stubs()
 from XTA import geometry
 
 
-class RadialStridedSamplingTests(unittest.TestCase):
+class AzimuthalStridedSamplingTests(unittest.TestCase):
     def tearDown(self) -> None:
-        with geometry._RADIAL_SAMPLER_CACHE_LOCK:
-            geometry._RADIAL_SAMPLER_CACHE.clear()
+        with geometry._AZIMUTHAL_SAMPLER_CACHE_LOCK:
+            geometry._AZIMUTHAL_SAMPLER_CACHE.clear()
 
     def test_sagittal_and_coronal_match_contiguous_reference_without_plane_copy(self) -> None:
         rng = np.random.default_rng(20260830)
@@ -25,27 +25,27 @@ class RadialStridedSamplingTests(unittest.TestCase):
             23,
             29,
             cartesian_views=(),
-            radial_views=("sagittal", "coronal"),
-            radial_azimuth_angles=(17.0, 19.0),
-            radial_native_raster=0,
+            azimuthal_views=("sagittal", "coronal"),
+            azimuthal_azimuth_angles=(17.0, 19.0),
+            azimuthal_native_raster=0,
         )
 
         for view in views:
-            with self.subTest(base=geometry.radial_base_view_name(view)):
-                oriented = geometry.radial_oriented_stack_view(volume, view)
+            with self.subTest(base=geometry.azimuthal_base_view_name(view)):
+                oriented = geometry.azimuthal_oriented_stack_view(volume, view)
                 self.assertFalse(bool(oriented.flags["C_CONTIGUOUS"]))
-                sampler = geometry.get_radial_sampler(view, view.azimuths_deg[2])
-                contiguous_reference = geometry.extract_radial_slice_frame(
+                sampler = geometry.get_azimuthal_sampler(view, view.azimuths_deg[2])
+                contiguous_reference = geometry.extract_azimuthal_slice_frame(
                     np.ascontiguousarray(oriented),
                     sampler,
                     out_rows=int(view.src_h),
                 )
                 with mock.patch.object(
                     geometry,
-                    "_radial_selected_samples_from_strided_block",
-                    wraps=geometry._radial_selected_samples_from_strided_block,
+                    "_azimuthal_selected_samples_from_strided_block",
+                    wraps=geometry._azimuthal_selected_samples_from_strided_block,
                 ) as selected_gather:
-                    actual = geometry.extract_radial_slice_frame(
+                    actual = geometry.extract_azimuthal_slice_frame(
                         oriented,
                         sampler,
                         out_rows=int(view.src_h),
@@ -61,14 +61,14 @@ class RadialStridedSamplingTests(unittest.TestCase):
             17,
             19,
             cartesian_views=(),
-            radial_views=("sagittal",),
-            radial_azimuth_angles=(30.0,),
-            radial_native_raster=0,
+            azimuthal_views=("sagittal",),
+            azimuthal_azimuth_angles=(30.0,),
+            azimuthal_native_raster=0,
         )[0]
-        oriented = geometry.radial_oriented_stack_view(volume, view)
-        sampler = geometry.get_radial_sampler(view, view.azimuths_deg[1])
+        oriented = geometry.azimuthal_oriented_stack_view(volume, view)
+        sampler = geometry.get_azimuthal_sampler(view, view.azimuths_deg[1])
         block = oriented[:5]
-        selected = geometry._radial_selected_samples_from_strided_block(block, sampler)
+        selected = geometry._azimuthal_selected_samples_from_strided_block(block, sampler)
 
         tap_count = int(sampler.x_idx.shape[1]) * int(sampler.y_idx.shape[1])
         self.assertEqual(selected.shape, (5, int(sampler.diameter), tap_count))
@@ -82,21 +82,21 @@ class RadialStridedSamplingTests(unittest.TestCase):
             23,
             29,
             cartesian_views=(),
-            radial_views=("sagittal", "coronal"),
-            radial_azimuth_angles=(23.0, 29.0),
-            radial_native_raster=11,
+            azimuthal_views=("sagittal", "coronal"),
+            azimuthal_azimuth_angles=(23.0, 29.0),
+            azimuthal_native_raster=11,
         )
 
         for view in views:
-            with self.subTest(base=geometry.radial_base_view_name(view)):
-                oriented = geometry.radial_oriented_stack_view(volume, view)
-                sampler = geometry.get_radial_sampler(view, view.azimuths_deg[3])
-                expected = geometry.extract_radial_slice_frame(
+            with self.subTest(base=geometry.azimuthal_base_view_name(view)):
+                oriented = geometry.azimuthal_oriented_stack_view(volume, view)
+                sampler = geometry.get_azimuthal_sampler(view, view.azimuths_deg[3])
+                expected = geometry.extract_azimuthal_slice_frame(
                     np.ascontiguousarray(oriented),
                     sampler,
                     out_rows=int(view.src_h),
                 )
-                actual = geometry.extract_radial_slice_frame(
+                actual = geometry.extract_azimuthal_slice_frame(
                     oriented,
                     sampler,
                     out_rows=int(view.src_h),
@@ -104,22 +104,22 @@ class RadialStridedSamplingTests(unittest.TestCase):
                 self.assertEqual(actual.shape, (11, 11))
                 np.testing.assert_array_equal(actual, expected)
 
-    def test_radial_sampler_cache_is_bounded(self) -> None:
+    def test_azimuthal_sampler_cache_is_bounded(self) -> None:
         view = geometry.get_view_infos(
             13,
             17,
             19,
             cartesian_views=(),
-            radial_views=("transverse",),
-            radial_azimuth_angles=(1.0,),
-            radial_native_raster=0,
+            azimuthal_views=("transverse",),
+            azimuthal_azimuth_angles=(1.0,),
+            azimuthal_native_raster=0,
         )[0]
-        with mock.patch.dict(os.environ, {"YOLO_TTA_RADIAL_SAMPLER_CACHE": "16"}):
+        with mock.patch.dict(os.environ, {"YOLO_TTA_AZIMUTHAL_SAMPLER_CACHE": "16"}):
             for angle in view.azimuths_deg[:40]:
-                geometry.get_radial_sampler(view, angle)
+                geometry.get_azimuthal_sampler(view, angle)
 
-        with geometry._RADIAL_SAMPLER_CACHE_LOCK:
-            self.assertLessEqual(len(geometry._RADIAL_SAMPLER_CACHE), 16)
+        with geometry._AZIMUTHAL_SAMPLER_CACHE_LOCK:
+            self.assertLessEqual(len(geometry._AZIMUTHAL_SAMPLER_CACHE), 16)
 
 
 if __name__ == "__main__":

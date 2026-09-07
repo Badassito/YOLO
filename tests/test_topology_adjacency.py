@@ -114,7 +114,7 @@ class TopologyAdjacencyTests(unittest.TestCase):
             (full_previous[::-1, ::-1], full_current[::-1, ::-1]),
             (full_previous.T, full_current.T),
             (np.asfortranarray(full_previous), np.asfortranarray(full_current)),
-            (full_previous, full_current[:, ::-1]),  # mirrored Radial first-slice seam
+            (full_previous, full_current[:, ::-1]),  # mirrored Azimuthal first-slice seam
         ]
         for index, (previous, current) in enumerate(variants):
             previous.flags.writeable = False

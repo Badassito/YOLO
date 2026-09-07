@@ -29,13 +29,15 @@ def forward_sampling_policy() -> ForwardSamplingPolicy:
 
     return ForwardSamplingPolicy(
         policy_id="xta.forward_sampling",
-        policy_version=18,
+        policy_version=20,
         coordinate_convention=(
             "gray8_t_y_x_frame_index; destination-pixel-center to source; "
-            "radial [0,180) index wrap with odd-crossing radial-u mirror"
+            "azimuthal [0,180) index wrap with odd-crossing radius-axis mirror; "
+            "radial radius stacks at fixed patch origins with periodic azimuth"
         ),
         stage_order=(
             "physical_view_extraction",
+            "radial_periodic_patch_extraction",
             "in_plane_affine_and_output_resize",
             "channel_addressing",
             "dense_tile_transform",
@@ -53,7 +55,9 @@ def forward_sampling_policy() -> ForwardSamplingPolicy:
         role_boundaries=(
             (
                 DataRole.INTENSITY,
-                "TTA family-specific boundary; radial seam index-wrap+mirror-u",
+                "TTA family-specific boundary; azimuthal seam index-wrap+mirror-u; "
+                "radial periodic azimuth, radius channel clamp, unsheared height padding zero "
+                "and zero-extended source taps",
             ),
             (
                 DataRole.CATEGORICAL_GROUND_TRUTH,
@@ -65,7 +69,7 @@ def forward_sampling_policy() -> ForwardSamplingPolicy:
                 backend="cpu",
                 implementation=(
                     "XTA.geometry.render_intensity_frame_on_grid@v18; "
-                    "OpenCV linear affine/resize and TTA hardware-linear radial tables"
+                    "OpenCV linear affine/resize and TTA hardware-linear azimuthal tables"
                 ),
                 roles=(DataRole.INTENSITY,),
                 exact=True,

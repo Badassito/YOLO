@@ -5238,9 +5238,9 @@ class CanonicalRenderImageSink:
 
     def __call__(self, batch: RenderBatch) -> None:
         for item in batch.items:
-            # Cartesian tail repeats and Radial seam-extension slots are model batch
+            # Cartesian tail repeats and Azimuthal seam-extension slots are model batch
             # bookkeeping, not distinct canonical center rasters.
-            if bool(item.synthetic_padding) or bool(item.radial_padding):
+            if bool(item.synthetic_padding) or bool(item.azimuthal_padding):
                 continue
             if item.center_index is None:
                 continue
@@ -5412,7 +5412,7 @@ def write_summary_file(
     lines.append('View statistics:')
     total_prediction_count = 0
     labels = dict(view_prediction_labels or {})
-    ordered_keys: List[str] = [k for k in ('transverse', 'sagittal', 'coronal', 'radial_transverse') if k in view_prediction_stats]
+    ordered_keys: List[str] = [k for k in ('transverse', 'sagittal', 'coronal', 'azimuthal_transverse') if k in view_prediction_stats]
     tilted_keys = [k for k in view_prediction_stats.keys() if str(k).startswith('tilted_')]
     other_keys = [k for k in view_prediction_stats.keys() if k not in set(ordered_keys) and k not in set(tilted_keys)]
     for view_key in ordered_keys + sorted(tilted_keys, key=lambda k: labels.get(k, k)) + sorted(other_keys):

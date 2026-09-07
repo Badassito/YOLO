@@ -40,7 +40,7 @@ from .config import (
     ChannelFormat,
     DEFAULT_CHANNEL_FORMAT,
     GIB,
-    RADIAL_VIEW_TOKENS,
+    AZIMUTHAL_VIEW_TOKENS,
     TiltedViewGroup,
     _parse_comma_slot,
     _resolve_unique_view_tokens,
@@ -156,7 +156,7 @@ def build_affine(
 ) -> AffineSpec:
     """Build one source-to-model affine for padding, rotation, and scaling.
     
-    Cartesian and Tilted views clamp to their source canvas; Radial views expand onto a black-padded canvas."""
+    Cartesian and Tilted views clamp to their source canvas; Azimuthal views expand onto a black-padded canvas."""
     if pad_mode not in ("clamp", "pad"):
         raise ValueError("pad_mode must be 'clamp' or 'pad'")
 
@@ -231,8 +231,8 @@ def view_uses_inference_processing_grid(view: 'ViewInfo', out_size: int) -> bool
         return False
     if size * size >= int(view.src_h) * int(view.src_w):
         return False
-    if is_radial_view(view) and (size > int(view.src_h) or size > int(view.src_w)):
-        # Radial terminal projection consumes compact monotone row/diameter lookups.  Do
+    if is_azimuthal_view(view) and (size > int(view.src_h) or size > int(view.src_w)):
+        # Azimuthal terminal projection consumes compact monotone row/diameter lookups.  Do
         # not turn either axis into an expansion, which could introduce unmapped processing
         # rows between adjacent native coordinates and invalidate bounded row-range staging.
         return False
@@ -255,8 +255,8 @@ def output_to_view_processing_affine(
     """Map one YOLO output raster into the view's accumulation grid.
 
     Delayed views compose output-to-native with native-to-canonical; angle zero reduces
-    to identity within tolerance. Radial interpolation remains in this canonical raster,
-    and terminal backprojection maps native radial row/diameter coordinates into it.
+    to identity within tolerance. Azimuthal interpolation remains in this canonical raster,
+    and terminal backprojection maps native azimuthal row/diameter coordinates into it.
     """
     M_native = np.asarray(M_out_to_native, dtype=np.float64).reshape(2, 3)
     if not view_uses_inference_processing_grid(view, int(out_size)):
@@ -393,6 +393,8 @@ def view_processing_search_angle(
 
 TILTED_VIEW_FAMILY = 'tilted'
 
+AZIMUTHAL_VIEW_FAMILY = 'azimuthal'
+
 RADIAL_VIEW_FAMILY = 'radial'
 
 @dataclass(frozen=True)
@@ -421,13 +423,28 @@ class ViewInfo:
     horizontal_axis: str = ''
     vertical_axis: str = ''
     stack_axis: str = ''
-    # Radial orientation/source metadata. ``radial_base_view`` names the
+    # Azimuthal orientation/source metadata. ``azimuthal_base_view`` names the
     # Cartesian coordinate system whose in-plane circle is transformed. A tilted
-    # Radial view carries the selected concrete Tilted variant in the remaining fields.
+    # Azimuthal view carries the selected concrete Tilted variant in the remaining fields.
+    azimuthal_base_view: str = ''
+    azimuthal_tilted_source: bool = False
+    azimuthal_source_view_name: str = ''
+    azimuthal_request_token: str = ''
+    # Cylindrical shell patches are independent radius-stack trajectories.
     radial_base_view: str = ''
     radial_tilted_source: bool = False
     radial_source_view_name: str = ''
     radial_request_token: str = ''
+    radial_min_radius: float = 0.0
+    radial_max_radius: float = 0.0
+    radial_step: float = 0.0
+    radial_shell_start: int = 0
+    radial_radii: Tuple[float, ...] = ()
+    radial_arc_origin: float = 0.0
+    radial_height_origin: int = 0
+    radial_patch_size: int = 0
+    radial_patch_index: int = 0
+    radial_height_index: int = 0
     # v16.4.0 TTA identity. ``name`` is the unique runtime variant name;
     # ``physical_view_name`` retains the underlying projection geometry name.
     physical_view_name: str = ''
@@ -475,30 +492,46 @@ def is_tilted_view(view: ViewInfo) -> bool:
     """Return True for a concrete member of the Tilted view family."""
     return str(view.family) == TILTED_VIEW_FAMILY
 
+def is_azimuthal_view(view: ViewInfo) -> bool:
+    return str(view.family) == AZIMUTHAL_VIEW_FAMILY
+
 def is_radial_view(view: ViewInfo) -> bool:
     return str(view.family) == RADIAL_VIEW_FAMILY
 
-def is_tilted_radial_view(view: ViewInfo) -> bool:
-    return bool(is_radial_view(view) and bool(view.radial_tilted_source))
+def radial_base_view_name(view: ViewInfo) -> str:
+    if not is_radial_view(view):
+        raise ValueError(f'Radial base requested for non-radial view {view.name!r}')
+    return str(view.radial_base_view)
+
+def radial_global_radii(view: ViewInfo) -> Tuple[float, ...]:
+    from .cylindrical_geometry import global_radii
+    return global_radii(view)
+
+def radial_shell_coordinates(view: ViewInfo, index: int, x=None, y=None):
+    from .cylindrical_geometry import shell_coordinates
+    return shell_coordinates(view, index, x=x, y=y)
+
+def is_tilted_azimuthal_view(view: ViewInfo) -> bool:
+    return bool(is_azimuthal_view(view) and bool(view.azimuthal_tilted_source))
 
 def tilted_base_view_name(view: ViewInfo) -> str:
     if str(view.tilt_base_view):
         return str(view.tilt_base_view)
     return str(view.name)
 
-def radial_base_view_name(view: ViewInfo) -> str:
-    if not is_radial_view(view):
-        raise ValueError(f'Radial base requested for non-radial view {view.name!r}')
-    base = str(view.radial_base_view or view.tilt_base_view or 'transverse').strip().lower()
+def azimuthal_base_view_name(view: ViewInfo) -> str:
+    if not is_azimuthal_view(view):
+        raise ValueError(f'Azimuthal base requested for non-azimuthal view {view.name!r}')
+    base = str(view.azimuthal_base_view or view.tilt_base_view or 'transverse').strip().lower()
     if base not in CARTESIAN_VIEW_TOKENS:
-        raise ValueError(f'Unsupported Radial base view: {base!r}')
+        raise ValueError(f'Unsupported Azimuthal base view: {base!r}')
     return base
 
-def radial_target_base_view(token: str) -> str:
+def azimuthal_target_base_view(token: str) -> str:
     target = str(token).strip().lower()
     base = target[len('tilted_'):] if target.startswith('tilted_') else target
     if base not in CARTESIAN_VIEW_TOKENS:
-        raise ValueError(f'Unsupported Radial target {token!r}')
+        raise ValueError(f'Unsupported Azimuthal target {token!r}')
     return base
 
 def cartesian_view_axis_spec(base_view: str, T: int, H: int, W: int) -> Dict[str, object]:
@@ -541,63 +574,63 @@ def cartesian_view_axis_spec(base_view: str, T: int, H: int, W: int) -> Dict[str
         }
     raise ValueError(f'Unsupported Cartesian base view: {base_view}')
 
-def radial_plane_shape(view: ViewInfo) -> Tuple[int, int]:
-    """Physical working-grid (plane_h, plane_w) containing this Radial circle."""
+def azimuthal_plane_shape(view: ViewInfo) -> Tuple[int, int]:
+    """Physical working-grid (plane_h, plane_w) containing this Azimuthal circle."""
     spec = cartesian_view_axis_spec(
-        radial_base_view_name(view), int(view.full_t), int(view.full_h), int(view.full_w),
+        azimuthal_base_view_name(view), int(view.full_t), int(view.full_h), int(view.full_w),
     )
     return int(spec['src_h']), int(spec['src_w'])
 
-def radial_stack_length(view: ViewInfo) -> int:
+def azimuthal_stack_length(view: ViewInfo) -> int:
     spec = cartesian_view_axis_spec(
-        radial_base_view_name(view), int(view.full_t), int(view.full_h), int(view.full_w),
+        azimuthal_base_view_name(view), int(view.full_t), int(view.full_h), int(view.full_w),
     )
     return int(spec['num_slices'])
 
-def radial_target_diameter(token: str, T: int, H: int, W: int) -> int:
-    base = radial_target_base_view(str(token))
+def azimuthal_target_diameter(token: str, T: int, H: int, W: int) -> int:
+    base = azimuthal_target_base_view(str(token))
     spec = cartesian_view_axis_spec(base, int(T), int(H), int(W))
     return int(min(int(spec['src_h']), int(spec['src_w'])))
 
-def tilted_radial_resident_gpu_render_enabled() -> bool:
-    """Render tilted-Radial frames directly from a resident CUDA source volume."""
-    return _env_flag('YOLO_TTA_GPU_TILTED_RADIAL_RENDER', True)
+def tilted_azimuthal_resident_gpu_render_enabled() -> bool:
+    """Render tilted-Azimuthal frames directly from a resident CUDA source volume."""
+    return _env_flag('YOLO_TTA_GPU_TILTED_AZIMUTHAL_RENDER', True)
 
-def radial_resident_gpu_render_supported(view: ViewInfo) -> bool:
-    """Resident rendering supports upright Radial plus tilted-Radial transforms."""
-    if not is_radial_view(view):
+def azimuthal_resident_gpu_render_supported(view: ViewInfo) -> bool:
+    """Resident rendering supports upright Azimuthal plus tilted-Azimuthal transforms."""
+    if not is_azimuthal_view(view):
         return False
-    if not is_tilted_radial_view(view):
+    if not is_tilted_azimuthal_view(view):
         return True
-    return bool(tilted_radial_resident_gpu_render_enabled())
+    return bool(tilted_azimuthal_resident_gpu_render_enabled())
 
-def radial_streaming_gpu_render_supported(view: ViewInfo) -> bool:
-    """Return whether logical-stack streaming prerender supports this upright Radial view."""
+def azimuthal_streaming_gpu_render_supported(view: ViewInfo) -> bool:
+    """Return whether logical-stack streaming prerender supports this upright Azimuthal view."""
     return bool(
-        is_radial_view(view)
-        and not is_tilted_radial_view(view)
-        and radial_base_view_name(view) in CARTESIAN_VIEW_TOKENS
+        is_azimuthal_view(view)
+        and not is_tilted_azimuthal_view(view)
+        and azimuthal_base_view_name(view) in CARTESIAN_VIEW_TOKENS
     )
 
-def radial_fused_render_supported(view: ViewInfo) -> bool:
-    """Direct-to-binding support for every upright and enabled tilted-Radial base."""
+def azimuthal_fused_render_supported(view: ViewInfo) -> bool:
+    """Direct-to-binding support for every upright and enabled tilted-Azimuthal base."""
     return bool(
         (
-            is_radial_view(view)
-            and not is_tilted_radial_view(view)
-            and radial_base_view_name(view) in CARTESIAN_VIEW_TOKENS
+            is_azimuthal_view(view)
+            and not is_tilted_azimuthal_view(view)
+            and azimuthal_base_view_name(view) in CARTESIAN_VIEW_TOKENS
         )
         or (
-            is_tilted_radial_view(view)
-            and tilted_radial_resident_gpu_render_enabled()
+            is_tilted_azimuthal_view(view)
+            and tilted_azimuthal_resident_gpu_render_enabled()
         )
     )
 
-def radial_sink_only_projection_supported(view: ViewInfo) -> bool:
-    """Block-sink projection supports every upright and tilted Radial orientation."""
+def azimuthal_sink_only_projection_supported(view: ViewInfo) -> bool:
+    """Block-sink projection supports every upright and tilted Azimuthal orientation."""
     return bool(
-        is_radial_view(view)
-        and radial_base_view_name(view) in CARTESIAN_VIEW_TOKENS
+        is_azimuthal_view(view)
+        and azimuthal_base_view_name(view) in CARTESIAN_VIEW_TOKENS
     )
 
 def tilted_stack_axis_length(view: ViewInfo) -> int:
@@ -612,7 +645,7 @@ def tilted_stack_axis_length(view: ViewInfo) -> int:
         return int(view.full_w)
     raise ValueError(f'Unsupported Tilted View stacking axis: {axis}')
 
-def build_radial_azimuths(azimuth_angle: float) -> List[float]:
+def build_azimuthal_azimuths(azimuth_angle: float) -> List[float]:
     if float(azimuth_angle) <= 0.0:
         return []
     out: List[float] = []
@@ -647,14 +680,22 @@ def view_output_token(view: ViewInfo) -> str:
         token = f'Tilted{base}_{direction}_{_format_signed_angle_token(float(view.tilt_angle_deg))}'
     elif is_radial_view(view):
         base = str(radial_base_view_name(view)).capitalize()
-        if is_tilted_radial_view(view):
+        if view.radial_tilted_source:
+            token = (f'RadialTilted{base}_{str(view.tilt_direction).capitalize()}_'
+                     f'{_format_signed_angle_token(float(view.tilt_angle_deg))}')
+        else:
+            token = f'Radial{base}'
+        token += f'_PatchU{view.radial_patch_index}_H{view.radial_height_index}'
+    elif is_azimuthal_view(view):
+        base = str(azimuthal_base_view_name(view)).capitalize()
+        if is_tilted_azimuthal_view(view):
             direction = str(view.tilt_direction or 'vertical').capitalize()
             token = (
-                f'RadialTilted{base}_{direction}_'
+                f'AzimuthalTilted{base}_{direction}_'
                 f'{_format_signed_angle_token(float(view.tilt_angle_deg))}'
             )
         else:
-            token = 'Transverse_Radial' if base == 'Transverse' else f'Radial{base}'
+            token = 'Transverse_Azimuthal' if base == 'Transverse' else f'Azimuthal{base}'
     else:
         token = str(view.display_name).split(' / TTA ', 1)[0].replace(' ', '_')
     if is_tta_view_variant(view):
@@ -753,14 +794,14 @@ def _build_tilted_view_infos_from_groups(
             out.append(view)
     return out
 
-def _build_radial_view_info(
+def _build_azimuthal_view_info(
     T: int,
     H: int,
     W: int,
     *,
     base_view: str,
     azimuth_angle: float,
-    radial_native_raster: int,
+    azimuthal_native_raster: int,
     request_token: str,
     tilted_source: Optional[ViewInfo] = None,
 ) -> ViewInfo:
@@ -770,37 +811,37 @@ def _build_radial_view_info(
     stack_len = int(spec['num_slices'])
     diameter = int(min(plane_w, plane_h))
     roi_radius = float(max(0.0, (diameter - 1) / 2.0))
-    raster = int(radial_native_raster)
-    radial_rows = int(min(stack_len, raster)) if raster > 0 else int(stack_len)
-    radial_u = int(min(diameter, raster)) if raster > 0 else int(diameter)
-    azimuths = tuple(build_radial_azimuths(float(azimuth_angle)))
+    raster = int(azimuthal_native_raster)
+    azimuthal_rows = int(min(stack_len, raster)) if raster > 0 else int(stack_len)
+    azimuthal_u = int(min(diameter, raster)) if raster > 0 else int(diameter)
+    azimuths = tuple(build_azimuthal_azimuths(float(azimuth_angle)))
 
     if tilted_source is None:
-        name = f'radial_{base_view}'
+        name = f'azimuthal_{base_view}'
         display_name = (
-            'Transverse Radial'
+            'Transverse Azimuthal'
             if str(base_view) == 'transverse'
-            else f'Radial {str(spec["display_name"])}'
+            else f'Azimuthal {str(spec["display_name"])}'
         )
         tilt_angle = 0.0
         tilt_direction = ''
         source_name = ''
-        radial_tilted = False
+        azimuthal_tilted = False
     else:
-        name = f'radial_{tilted_source.name}'
-        display_name = f'Radial {pretty_view_name(tilted_source)}'
+        name = f'azimuthal_{tilted_source.name}'
+        display_name = f'Azimuthal {pretty_view_name(tilted_source)}'
         tilt_angle = float(tilted_source.tilt_angle_deg)
         tilt_direction = str(tilted_source.tilt_direction)
         source_name = str(tilted_source.name)
-        radial_tilted = True
+        azimuthal_tilted = True
 
     return ViewInfo(
         name=name,
         num_slices=len(azimuths),
-        src_h=int(radial_rows),
-        src_w=int(radial_u),
+        src_h=int(azimuthal_rows),
+        src_w=int(azimuthal_u),
         pad_mode='pad',
-        family=RADIAL_VIEW_FAMILY,
+        family=AZIMUTHAL_VIEW_FAMILY,
         summary_family=name,
         display_name=display_name,
         full_t=int(T),
@@ -819,20 +860,20 @@ def _build_radial_view_info(
         horizontal_axis='r',
         vertical_axis=str(spec['stack_axis']),
         stack_axis='azimuth',
-        radial_base_view=str(base_view),
-        radial_tilted_source=bool(radial_tilted),
-        radial_source_view_name=str(source_name),
-        radial_request_token=str(request_token),
+        azimuthal_base_view=str(base_view),
+        azimuthal_tilted_source=bool(azimuthal_tilted),
+        azimuthal_source_view_name=str(source_name),
+        azimuthal_request_token=str(request_token),
     )
 
-def radial_source_tilted_view(view: ViewInfo) -> ViewInfo:
-    """Reconstruct the concrete Tilted view underlying a tilted Radial transform."""
-    if not is_tilted_radial_view(view):
-        raise ValueError(f'{view.name!r} is not a tilted Radial view')
-    base = radial_base_view_name(view)
+def azimuthal_source_tilted_view(view: ViewInfo) -> ViewInfo:
+    """Reconstruct the concrete Tilted view underlying a tilted Azimuthal transform."""
+    if not is_tilted_azimuthal_view(view):
+        raise ValueError(f'{view.name!r} is not a tilted Azimuthal view')
+    base = azimuthal_base_view_name(view)
     spec = cartesian_view_axis_spec(base, int(view.full_t), int(view.full_h), int(view.full_w))
     token = _format_signed_angle_token(float(view.tilt_angle_deg))
-    name = str(view.radial_source_view_name or f'tilted_{base}_{view.tilt_direction}_{token}')
+    name = str(view.azimuthal_source_view_name or f'tilted_{base}_{view.tilt_direction}_{token}')
     return ViewInfo(
         name=name,
         num_slices=int(spec['num_slices']),
@@ -864,27 +905,30 @@ def get_view_infos(
     W: int,
     *,
     cartesian_views: Optional[Sequence[str]] = None,
-    radial_views: Optional[Sequence[str]] = None,
-    radial_azimuth_angles: Optional[Sequence[float]] = None,
+    azimuthal_views: Optional[Sequence[str]] = None,
+    azimuthal_azimuth_angles: Optional[Sequence[float]] = None,
     tilt_groups: Optional[Sequence[TiltedViewGroup]] = None,
-    radial_native_raster: int = 0,
+    azimuthal_native_raster: int = 0,
+    radial_views: Optional[Sequence[str]] = None,
+    radial_min_radius: Optional[float] = None,
+    radial_patch_size: int = 3072,
 ) -> List[ViewInfo]:
     """Build the complete view set without changing any view-family geometry."""
     enabled_cartesian = resolve_cartesian_views(cartesian_views)
-    enabled_radial = _resolve_unique_view_tokens(
-        radial_views,
-        valid=RADIAL_VIEW_TOKENS,
-        flag_name='Radial view assembly',
+    enabled_azimuthal = _resolve_unique_view_tokens(
+        azimuthal_views,
+        valid=AZIMUTHAL_VIEW_TOKENS,
+        flag_name='Azimuthal view assembly',
     )
     resolved_tilt_groups = list(tilt_groups or ())
-    azimuths = [float(v) for v in (radial_azimuth_angles or [])]
-    if len(azimuths) != len(enabled_radial):
+    azimuths = [float(v) for v in (azimuthal_azimuth_angles or [])]
+    if len(azimuths) != len(enabled_azimuthal):
         raise ValueError(
-            f'get_view_infos received {len(azimuths)} radial azimuth value(s) for '
-            f'{len(enabled_radial)} Radial target(s)'
+            f'get_view_infos received {len(azimuths)} azimuthal azimuth value(s) for '
+            f'{len(enabled_azimuthal)} Azimuthal target(s)'
         )
     if any((not math.isfinite(float(value))) or float(value) <= 0.0 for value in azimuths):
-        raise ValueError('get_view_infos requires one finite positive azimuth spacing per Radial target')
+        raise ValueError('get_view_infos requires one finite positive azimuth spacing per Azimuthal target')
 
     orthogonal = [
         _build_cartesian_view(base, int(T), int(H), int(W))
@@ -897,16 +941,16 @@ def get_view_infos(
         tilt_groups=resolved_tilt_groups,
     )
 
-    radial_cartesian: List[ViewInfo] = []
-    radial_tilted: List[ViewInfo] = []
-    for target, angle in zip(enabled_radial, azimuths):
-        base = radial_target_base_view(target)
+    azimuthal_cartesian: List[ViewInfo] = []
+    azimuthal_tilted: List[ViewInfo] = []
+    for target, angle in zip(enabled_azimuthal, azimuths):
+        base = azimuthal_target_base_view(target)
         if not str(target).startswith('tilted_'):
-            radial_cartesian.append(_build_radial_view_info(
+            azimuthal_cartesian.append(_build_azimuthal_view_info(
                 int(T), int(H), int(W),
                 base_view=base,
                 azimuth_angle=float(angle),
-                radial_native_raster=int(radial_native_raster),
+                azimuthal_native_raster=int(azimuthal_native_raster),
                 request_token=str(target),
                 tilted_source=None,
             ))
@@ -915,29 +959,35 @@ def get_view_infos(
         matching = [v for v in tilted if tilted_base_view_name(v) == base]
         if not matching:
             print(
-                f'Radial target {target!r} skipped: no {base} Tilted variants are enabled. '
+                f'Azimuthal target {target!r} skipped: no {base} Tilted variants are enabled. '
                 f'Add --enable_tilted {base}:30:both (or another valid group) to generate it.'
             )
             continue
         for source_view in matching:
-            radial_tilted.append(_build_radial_view_info(
+            azimuthal_tilted.append(_build_azimuthal_view_info(
                 int(T), int(H), int(W),
                 base_view=base,
                 azimuth_angle=float(angle),
-                radial_native_raster=int(radial_native_raster),
+                azimuthal_native_raster=int(azimuthal_native_raster),
                 request_token=str(target),
                 tilted_source=source_view,
             ))
 
-    # Scheduling order is unchanged: upright Cartesian, upright Radial, concrete Tilted,
-    # then Radial transforms of concrete Tilted variants.
-    return orthogonal + radial_cartesian + tilted + radial_tilted
+    # Scheduling order is unchanged: upright Cartesian, upright Azimuthal, concrete Tilted,
+    # then Azimuthal transforms of concrete Tilted variants.
+    from .cylindrical_geometry import build_radial_view_infos
+    shells = build_radial_view_infos(
+        int(T), int(H), int(W), targets=tuple(radial_views or ()),
+        min_radius=radial_min_radius, patch_size=int(radial_patch_size),
+        tilted_views=tilted,
+    )
+    return orthogonal + azimuthal_cartesian + tilted + azimuthal_tilted + shells
 
 def orthogonal_views_only(views: Sequence[ViewInfo]) -> List[ViewInfo]:
     return [v for v in views if v.family == 'orthogonal']
 
 @dataclass(frozen=True)
-class RadialSampler:
+class AzimuthalSampler:
     angle_deg: float
     diameter: int
     x_idx: np.ndarray
@@ -947,46 +997,46 @@ class RadialSampler:
     nn_x: np.ndarray
     nn_y: np.ndarray
 
-_RADIAL_SAMPLER_CACHE: 'OrderedDict[Tuple[object, ...], RadialSampler]' = OrderedDict()
+_AZIMUTHAL_SAMPLER_CACHE: 'OrderedDict[Tuple[object, ...], AzimuthalSampler]' = OrderedDict()
 
-_RADIAL_SAMPLER_CACHE_LOCK = threading.Lock()
+_AZIMUTHAL_SAMPLER_CACHE_LOCK = threading.Lock()
 
-RADIAL_FILTER_MODE = 'hardware_linear'
+AZIMUTHAL_FILTER_MODE = 'hardware_linear'
 
-RADIAL_FILTER_LABEL = 'pure hardware-linear sampling'
+AZIMUTHAL_FILTER_LABEL = 'pure hardware-linear sampling'
 
-RADIAL_FILTER_TAP_COUNT = 2
+AZIMUTHAL_FILTER_TAP_COUNT = 2
 
-def _radial_filter_offsets() -> np.ndarray:
-    """Integer support offsets around floor(sample) for the active radial filter."""
+def _azimuthal_filter_offsets() -> np.ndarray:
+    """Integer support offsets around floor(sample) for the active azimuthal filter."""
     return np.asarray((0, 1), dtype=np.int32)
 
-def _radial_filter_kernel(x: np.ndarray) -> np.ndarray:
+def _azimuthal_filter_kernel(x: np.ndarray) -> np.ndarray:
     """Two-tap triangle kernel used by the CPU/streaming hardware-linear fallback."""
     return np.maximum(
         np.float32(0.0),
         np.float32(1.0) - np.abs(np.asarray(x, dtype=np.float32)),
     ).astype(np.float32, copy=False)
 
-def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
-    if not is_radial_view(view):
-        raise ValueError('Radial sampler requested for a non-radial view')
+def get_azimuthal_sampler(view: ViewInfo, angle_deg: float) -> AzimuthalSampler:
+    if not is_azimuthal_view(view):
+        raise ValueError('Azimuthal sampler requested for a non-azimuthal view')
 
     # The circle lives in the selected Cartesian/Tilted projected plane rather than
     # unconditionally in global XY. The active reconstruction filter is therefore
     # evaluated in that base plane's (horizontal, vertical) coordinate system.
-    plane_h, plane_w = radial_plane_shape(view)
+    plane_h, plane_w = azimuthal_plane_shape(view)
     n_u = int(view.src_w) if int(view.src_w) > 0 else int(view.diameter)
     key = (
-        RADIAL_FILTER_MODE, radial_base_view_name(view), int(plane_h), int(plane_w),
+        AZIMUTHAL_FILTER_MODE, azimuthal_base_view_name(view), int(plane_h), int(plane_w),
         int(view.diameter), int(n_u), round(float(view.center_x), 6),
         round(float(view.center_y), 6), round(float(view.roi_radius), 6),
         round(float(angle_deg), 6),
     )
-    with _RADIAL_SAMPLER_CACHE_LOCK:
-        cached = _RADIAL_SAMPLER_CACHE.get(key)
+    with _AZIMUTHAL_SAMPLER_CACHE_LOCK:
+        cached = _AZIMUTHAL_SAMPLER_CACHE.get(key)
         if cached is not None:
-            _RADIAL_SAMPLER_CACHE.move_to_end(key)
+            _AZIMUTHAL_SAMPLER_CACHE.move_to_end(key)
             return cached
 
     diameter = int(n_u)
@@ -995,13 +1045,13 @@ def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
     xs = np.asarray(float(view.center_x) + coords * math.cos(theta), dtype=np.float32)
     ys = np.asarray(float(view.center_y) + coords * math.sin(theta), dtype=np.float32)
 
-    offsets = _radial_filter_offsets()
+    offsets = _azimuthal_filter_offsets()
     x0 = np.floor(xs).astype(np.int32, copy=False)
     y0 = np.floor(ys).astype(np.int32, copy=False)
     x_idx_raw = x0[:, None] + offsets[None, :]
     y_idx_raw = y0[:, None] + offsets[None, :]
-    x_w = _radial_filter_kernel(xs[:, None] - x_idx_raw)
-    y_w = _radial_filter_kernel(ys[:, None] - y_idx_raw)
+    x_w = _azimuthal_filter_kernel(xs[:, None] - x_idx_raw)
+    y_w = _azimuthal_filter_kernel(ys[:, None] - y_idx_raw)
 
     # Preserve the established boundary contract: invalid taps are removed and the
     # remaining one-dimensional weights are renormalized independently on each axis.
@@ -1016,7 +1066,7 @@ def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
 
     x_idx = np.clip(x_idx_raw, 0, int(plane_w) - 1).astype(np.int32, copy=False)
     y_idx = np.clip(y_idx_raw, 0, int(plane_h) - 1).astype(np.int32, copy=False)
-    sampler = RadialSampler(
+    sampler = AzimuthalSampler(
         angle_deg=float(angle_deg), diameter=diameter,
         x_idx=x_idx, y_idx=y_idx,
         x_w=x_w.astype(np.float32, copy=False),
@@ -1024,24 +1074,24 @@ def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
         nn_x=np.clip(np.rint(xs).astype(np.int32, copy=False), 0, int(plane_w) - 1),
         nn_y=np.clip(np.rint(ys).astype(np.int32, copy=False), 0, int(plane_h) - 1),
     )
-    with _RADIAL_SAMPLER_CACHE_LOCK:
-        cached = _RADIAL_SAMPLER_CACHE.get(key)
+    with _AZIMUTHAL_SAMPLER_CACHE_LOCK:
+        cached = _AZIMUTHAL_SAMPLER_CACHE.get(key)
         if cached is not None:
-            _RADIAL_SAMPLER_CACHE.move_to_end(key)
+            _AZIMUTHAL_SAMPLER_CACHE.move_to_end(key)
             return cached
-        _RADIAL_SAMPLER_CACHE[key] = sampler
-        _RADIAL_SAMPLER_CACHE.move_to_end(key)
+        _AZIMUTHAL_SAMPLER_CACHE[key] = sampler
+        _AZIMUTHAL_SAMPLER_CACHE.move_to_end(key)
         # A coverage-default sweep visits thousands of azimuths. Retaining
         # every sampler indefinitely costs roughly 100 KiB per angle at a
         # 3K raster and provides little reuse after neighboring image/mask
         # renders finish. Keep a bounded working set instead.
-        cache_limit = max(16, _env_int('YOLO_TTA_RADIAL_SAMPLER_CACHE', 512))
-        while len(_RADIAL_SAMPLER_CACHE) > cache_limit:
-            _RADIAL_SAMPLER_CACHE.popitem(last=False)
+        cache_limit = max(16, _env_int('YOLO_TTA_AZIMUTHAL_SAMPLER_CACHE', 512))
+        while len(_AZIMUTHAL_SAMPLER_CACHE) > cache_limit:
+            _AZIMUTHAL_SAMPLER_CACHE.popitem(last=False)
         return sampler
 
-def choose_radial_exact_block_frames(diameter: int, target_bytes: int = 256 * 1024 * 1024) -> int:
-    env = os.environ.get('YOLO_TTA_RADIAL_EXACT_BLOCK_FRAMES', '').strip()
+def choose_azimuthal_exact_block_frames(diameter: int, target_bytes: int = 256 * 1024 * 1024) -> int:
+    env = os.environ.get('YOLO_TTA_AZIMUTHAL_EXACT_BLOCK_FRAMES', '').strip()
     if env:
         try:
             return max(1, int(env))
@@ -1049,13 +1099,13 @@ def choose_radial_exact_block_frames(diameter: int, target_bytes: int = 256 * 10
             pass
     bytes_per_frame = max(
         1,
-        int(diameter) * int(RADIAL_FILTER_TAP_COUNT) * np.dtype(np.float32).itemsize,
+        int(diameter) * int(AZIMUTHAL_FILTER_TAP_COUNT) * np.dtype(np.float32).itemsize,
     )
     block = max(1, int(target_bytes // bytes_per_frame))
     return max(1, min(256, block))
 
-def _radial_sampler_flat_taps(sampler: RadialSampler, image_w: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Return flattened active-filter tap indices and separable weights for one radial line."""
+def _azimuthal_sampler_flat_taps(sampler: AzimuthalSampler, image_w: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Return flattened active-filter tap indices and separable weights for one azimuthal line."""
     u_len = int(sampler.diameter)
     flat_idx = (
         sampler.y_idx.astype(np.int64)[:, :, None] * int(image_w)
@@ -1067,12 +1117,12 @@ def _radial_sampler_flat_taps(sampler: RadialSampler, image_w: int) -> Tuple[np.
     ).reshape(u_len, -1)
     return flat_idx, w2d
 
-def radial_oriented_stack_view(volume_rgb: np.ndarray, view: ViewInfo) -> np.ndarray:
-    """Return a logical ``(stack, plane_v, plane_u)`` view for a Cartesian Radial base."""
+def azimuthal_oriented_stack_view(volume_rgb: np.ndarray, view: ViewInfo) -> np.ndarray:
+    """Return a logical ``(stack, plane_v, plane_u)`` view for a Cartesian Azimuthal base."""
     arr = np.asarray(volume_rgb)
     if arr.ndim != 3:
-        raise ValueError(f'Radial source volume must be 3D, got {arr.shape}')
-    base = radial_base_view_name(view)
+        raise ValueError(f'Azimuthal source volume must be 3D, got {arr.shape}')
+    base = azimuthal_base_view_name(view)
     if base == 'transverse':
         return arr
     if base == 'sagittal':
@@ -1081,19 +1131,19 @@ def radial_oriented_stack_view(volume_rgb: np.ndarray, view: ViewInfo) -> np.nda
     if base == 'coronal':
         # stack X; in-plane axes (t, Y)
         return np.transpose(arr, (2, 0, 1))
-    raise ValueError(f'Unsupported Radial base: {base}')
+    raise ValueError(f'Unsupported Azimuthal base: {base}')
 
 
-def _radial_selected_samples_from_strided_block(
+def _azimuthal_selected_samples_from_strided_block(
     block: np.ndarray,
-    sampler: RadialSampler,
+    sampler: AzimuthalSampler,
 ) -> np.ndarray:
-    """Gather only active radial taps from a noncontiguous logical stack.
+    """Gather only active azimuthal taps from a noncontiguous logical stack.
 
-    Sagittal and coronal radial stacks are transposed views of ``(T,Y,X)``.
+    Sagittal and coronal azimuthal stacks are transposed views of ``(T,Y,X)``.
     Materializing ``block`` would copy every voxel in the selected stack
     range for every azimuth. This gather has the same tap order as
-    ``_radial_sampler_flat_taps`` but allocates only ``rows * diameter * 4``
+    ``_azimuthal_sampler_flat_taps`` but allocates only ``rows * diameter * 4``
     source samples for the hardware-linear filter.
     """
 
@@ -1114,9 +1164,9 @@ def _radial_selected_samples_from_strided_block(
             tap_index += 1
     return selected
 
-def extract_radial_slice_frame(
+def extract_azimuthal_slice_frame(
     volume_rgb: np.ndarray,
-    sampler: RadialSampler,
+    sampler: AzimuthalSampler,
     out_rows: Optional[int] = None,
 ) -> np.ndarray:
     """Extract one diameter frame from a logical ``(stack, plane_v, plane_u)`` volume."""
@@ -1126,8 +1176,8 @@ def extract_radial_slice_frame(
     fold_stack = int(rows) != int(stack_dim)
 
     image_w = int(volume_rgb.shape[2])
-    flat_idx, w2d = _radial_sampler_flat_taps(sampler, image_w)
-    block_frames = choose_radial_exact_block_frames(u_len)
+    flat_idx, w2d = _azimuthal_sampler_flat_taps(sampler, image_w)
+    block_frames = choose_azimuthal_exact_block_frames(u_len)
 
     plane_len = int(volume_rgb.shape[1]) * image_w
     proj = np.empty((stack_dim, u_len), dtype=np.float32) if fold_stack else None
@@ -1144,7 +1194,7 @@ def extract_radial_slice_frame(
             # A sagittal/coronal logical stack is a transposed view. Copying
             # the full block here makes each azimuth scan the entire volume;
             # gather only the four active samples per output pixel instead.
-            selected = _radial_selected_samples_from_strided_block(block, sampler)
+            selected = _azimuthal_selected_samples_from_strided_block(block, sampler)
         samples = selected.astype(np.float32, copy=False)
         acc = np.einsum('tuk,uk->tu', samples, w2d)
         if fold_stack:
@@ -1155,7 +1205,7 @@ def extract_radial_slice_frame(
     if not fold_stack:
         return out
 
-    # Center-aligned linear reduction of the selected Radial base's stack axis.
+    # Center-aligned linear reduction of the selected Azimuthal base's stack axis.
     rf = (np.arange(rows, dtype=np.float64) + 0.5) * (float(stack_dim) / float(rows)) - 0.5
     r0 = np.clip(np.floor(rf).astype(np.int64), 0, stack_dim - 1)
     r1 = np.minimum(r0 + 1, stack_dim - 1)
@@ -1182,20 +1232,20 @@ def _center_aligned_nearest_fold_indices(source_rows: int, output_rows: int) -> 
     return np.clip(indices, 0, source_count - 1)
 
 
-def extract_radial_categorical_slice_frame(
+def extract_azimuthal_categorical_slice_frame(
     mask_u8: np.ndarray,
-    sampler: RadialSampler,
+    sampler: AzimuthalSampler,
     out_rows: Optional[int] = None,
 ) -> np.ndarray:
-    """Extract one upright Radial categorical frame with nearest-only sampling.
+    """Extract one upright Azimuthal categorical frame with nearest-only sampling.
 
-    In-plane coordinates come from the authoritative Radial sampler's
-    precomputed nearest taps. If TTA's native Radial raster folds the selected
+    In-plane coordinates come from the authoritative Azimuthal sampler's
+    precomputed nearest taps. If TTA's native Azimuthal raster folds the selected
     base stack, output-row centers select their nearest source-row centers.
     """
     arr = np.asarray(mask_u8)
     if arr.ndim != 3:
-        raise ValueError(f'Radial categorical source volume must be 3D, got {arr.shape}')
+        raise ValueError(f'Azimuthal categorical source volume must be 3D, got {arr.shape}')
     stack_len = int(arr.shape[0])
     rows = int(out_rows) if out_rows is not None and int(out_rows) > 0 else stack_len
     row_indices = _center_aligned_nearest_fold_indices(stack_len, rows)
@@ -1207,7 +1257,7 @@ def extract_radial_categorical_slice_frame(
     return np.ascontiguousarray(np.asarray(sampled) > 0, dtype=np.uint8)
 
 
-def _tilted_radial_row_centers(stack_len: int, rows: int) -> np.ndarray:
+def _tilted_azimuthal_row_centers(stack_len: int, rows: int) -> np.ndarray:
     if int(rows) == int(stack_len):
         return np.arange(int(stack_len), dtype=np.float32)
     coords = (np.arange(int(rows), dtype=np.float64) + 0.5) * (
@@ -1215,28 +1265,28 @@ def _tilted_radial_row_centers(stack_len: int, rows: int) -> np.ndarray:
     ) - 0.5
     return np.clip(coords, 0.0, float(max(0, int(stack_len) - 1))).astype(np.float32)
 
-def extract_tilted_radial_slice_frame(
+def extract_tilted_azimuthal_slice_frame(
     volume_rgb: np.ndarray,
     view: ViewInfo,
-    sampler: RadialSampler,
+    sampler: AzimuthalSampler,
     out_rows: Optional[int] = None,
 ) -> np.ndarray:
-    """Render one Radial transform of a concrete Tilted view directly from the volume.
+    """Render one Azimuthal transform of a concrete Tilted view directly from the volume.
 
  The output is circular in the Tilted projected plane. For every diameter tap, the
  same signed stacking-axis shear used by the underlying Tilted view is applied before
  a two-tap stack interpolation. The active in-plane reconstruction taps are accumulated without
  materializing thousands of full Tilted frames."""
-    if not is_tilted_radial_view(view):
-        raise ValueError('Tilted Radial renderer requires a tilted Radial view')
+    if not is_tilted_azimuthal_view(view):
+        raise ValueError('Tilted Azimuthal renderer requires a tilted Azimuthal view')
     arr = np.asarray(volume_rgb)
     if arr.ndim != 3:
-        raise ValueError(f'Tilted Radial source volume must be 3D, got {arr.shape}')
+        raise ValueError(f'Tilted Azimuthal source volume must be 3D, got {arr.shape}')
 
-    base = radial_base_view_name(view)
-    stack_len = int(radial_stack_length(view))
+    base = azimuthal_base_view_name(view)
+    stack_len = int(azimuthal_stack_length(view))
     rows = int(out_rows) if out_rows is not None and int(out_rows) > 0 else stack_len
-    row_centers = _tilted_radial_row_centers(stack_len, rows)
+    row_centers = _tilted_azimuthal_row_centers(stack_len, rows)
     u_len = int(sampler.diameter)
     tap_count = int(sampler.x_idx.shape[1]) * int(sampler.y_idx.shape[1])
 
@@ -1259,10 +1309,10 @@ def extract_tilted_radial_slice_frame(
     elif str(view.tilt_direction) == 'horizontal':
         tap_offsets = x_taps.astype(np.float32, copy=False) - np.float32(view.center_x)
     else:
-        raise ValueError(f'Unsupported Tilted Radial direction: {view.tilt_direction!r}')
+        raise ValueError(f'Unsupported Tilted Azimuthal direction: {view.tilt_direction!r}')
 
     out = np.empty((rows, u_len), dtype=np.uint8)
-    block_rows = max(1, _env_int('YOLO_TTA_TILTED_RADIAL_ROW_BLOCK', 16))
+    block_rows = max(1, _env_int('YOLO_TTA_TILTED_AZIMUTHAL_ROW_BLOCK', 16))
     for row0 in range(0, rows, block_rows):
         row1 = min(rows, row0 + block_rows)
         centers = row_centers[row0:row1, None]
@@ -1291,7 +1341,7 @@ def extract_tilted_radial_slice_frame(
                 f0 = arr[py[None, :], px[None, :], s0].astype(np.float32, copy=False)
                 f1 = arr[py[None, :], px[None, :], s1].astype(np.float32, copy=False)
             else:  # pragma: no cover
-                raise ValueError(f'Unsupported Tilted Radial base: {base}')
+                raise ValueError(f'Unsupported Tilted Azimuthal base: {base}')
 
             values = f0 + alpha * (f1 - f0)
             values *= valid.astype(np.float32, copy=False)
@@ -1300,33 +1350,33 @@ def extract_tilted_radial_slice_frame(
     return out
 
 
-def extract_tilted_radial_categorical_slice_frame(
+def extract_tilted_azimuthal_categorical_slice_frame(
     mask_u8: np.ndarray,
     view: ViewInfo,
-    sampler: RadialSampler,
+    sampler: AzimuthalSampler,
     out_rows: Optional[int] = None,
 ) -> np.ndarray:
-    """Render one tilted-Radial categorical frame without intensity filtering.
+    """Render one tilted-Azimuthal categorical frame without intensity filtering.
 
     The in-plane circle uses one nearest coordinate per diameter position. The
     selected concrete Tilted view's stack shear and two-slice blend remain
     unchanged, after which categorical occupancy is thresholded at ``>= 0.5``.
     """
-    if not is_tilted_radial_view(view):
-        raise ValueError('Tilted Radial categorical renderer requires a tilted Radial view')
+    if not is_tilted_azimuthal_view(view):
+        raise ValueError('Tilted Azimuthal categorical renderer requires a tilted Azimuthal view')
     arr = np.asarray(mask_u8)
     if arr.ndim != 3:
-        raise ValueError(f'Tilted Radial categorical source volume must be 3D, got {arr.shape}')
+        raise ValueError(f'Tilted Azimuthal categorical source volume must be 3D, got {arr.shape}')
 
-    base = radial_base_view_name(view)
-    stack_len = int(radial_stack_length(view))
+    base = azimuthal_base_view_name(view)
+    stack_len = int(azimuthal_stack_length(view))
     rows = int(out_rows) if out_rows is not None and int(out_rows) > 0 else stack_len
-    row_centers = _tilted_radial_row_centers(stack_len, rows)
+    row_centers = _tilted_azimuthal_row_centers(stack_len, rows)
     px = np.asarray(sampler.nn_x, dtype=np.intp)
     py = np.asarray(sampler.nn_y, dtype=np.intp)
     u_len = int(px.size)
     if int(py.size) != u_len:
-        raise ValueError('Tilted Radial categorical sampler has mismatched nearest coordinates')
+        raise ValueError('Tilted Azimuthal categorical sampler has mismatched nearest coordinates')
 
     tan_alpha = np.float32(math.tan(math.radians(float(view.tilt_angle_deg))))
     if str(view.tilt_direction) == 'vertical':
@@ -1334,10 +1384,10 @@ def extract_tilted_radial_categorical_slice_frame(
     elif str(view.tilt_direction) == 'horizontal':
         tap_offsets = px.astype(np.float32, copy=False) - np.float32(view.center_x)
     else:
-        raise ValueError(f'Unsupported Tilted Radial direction: {view.tilt_direction!r}')
+        raise ValueError(f'Unsupported Tilted Azimuthal direction: {view.tilt_direction!r}')
 
     out = np.zeros((rows, u_len), dtype=np.uint8)
-    block_rows = max(1, _env_int('YOLO_TTA_TILTED_RADIAL_ROW_BLOCK', 16))
+    block_rows = max(1, _env_int('YOLO_TTA_TILTED_AZIMUTHAL_ROW_BLOCK', 16))
     for row0 in range(0, rows, block_rows):
         row1 = min(rows, row0 + block_rows)
         stack_src = row_centers[row0:row1, None] + tan_alpha * tap_offsets[None, :]
@@ -1358,7 +1408,7 @@ def extract_tilted_radial_categorical_slice_frame(
             f0 = np.asarray(arr[py[None, :], px[None, :], s0] > 0, dtype=np.float32)
             f1 = np.asarray(arr[py[None, :], px[None, :], s1] > 0, dtype=np.float32)
         else:  # pragma: no cover
-            raise ValueError(f'Unsupported Tilted Radial base: {base}')
+            raise ValueError(f'Unsupported Tilted Azimuthal base: {base}')
 
         values = f0 + alpha * (f1 - f0)
         out[row0:row1] = np.asarray(valid & (values >= 0.5), dtype=np.uint8)
@@ -1386,6 +1436,7 @@ def write_aug_job_meta(
     view: ViewInfo,
     channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
 ) -> None:
+    from .unification.tta_manifest import radial_view_manifest_record
     fmt = resolve_channel_format(channel_format)
     job.meta_path.parent.mkdir(parents=True, exist_ok=True)
     job.meta_path.write_text(
@@ -1405,10 +1456,11 @@ def write_aug_job_meta(
                 'horizontal_axis': str(view.horizontal_axis),
                 'vertical_axis': str(view.vertical_axis),
                 'stack_axis': str(view.stack_axis),
-                'radial_base_view': str(view.radial_base_view),
-                'radial_tilted_source': bool(view.radial_tilted_source),
-                'radial_source_view_name': str(view.radial_source_view_name),
-                'radial_request_token': str(view.radial_request_token),
+                'azimuthal_base_view': str(view.azimuthal_base_view),
+                'azimuthal_tilted_source': bool(view.azimuthal_tilted_source),
+                'azimuthal_source_view_name': str(view.azimuthal_source_view_name),
+                'azimuthal_request_token': str(view.azimuthal_request_token),
+                'radial_shell': radial_view_manifest_record(view),
                 'tilt_frame_start': int(view.tilt_frame_start),
                 'tilt_frame_stop': int(view.tilt_frame_stop),
                 'out_size': int(job.aff.out_size),
@@ -1424,7 +1476,8 @@ def write_aug_job_meta(
                 'model_input_channels': int(fmt.channel_count),
                 'channel_stride': int(fmt.stride),
                 'channel_offsets': [int(v) for v in fmt.offsets],
-                'channel_boundary_policy': 'radial_wrap_mirror_u_cartesian_edge_clamp',
+                'channel_boundary_policy': ('radial_radius_edge_clamp_periodic_arc'
+                    if is_radial_view(view) else 'azimuthal_wrap_mirror_u_cartesian_edge_clamp'),
                 'prediction_slice_policy': 'center_N_only',
             },
             indent=2,
@@ -1534,14 +1587,14 @@ class DenseTileJob:
 def channel_view_slice_source(view: ViewInfo, index: int) -> Tuple[int, bool]:
     """Resolve one contextual channel source as ``(slice_index, mirror_u)``.
 
-    Radial frames cover the unoriented angular domain ``[0, 180)``. Crossing either
-    end therefore reuses the modulo-resolved frame with its radial ``u`` coordinate
+    Azimuthal frames cover the unoriented angular domain ``[0, 180)``. Crossing either
+    end therefore reuses the modulo-resolved frame with its azimuthal ``u`` coordinate
     reversed. Multiple-period custom strides retain the reversal only after an odd
     number of seam crossings. Cartesian view families continue to edge-clamp.
     """
     count = max(1, int(view.num_slices))
     requested = int(index)
-    if is_radial_view(view):
+    if is_azimuthal_view(view):
         wraps, source_idx = divmod(requested, int(count))
         return int(source_idx), bool(int(wraps) % 2)
     return max(0, min(int(count) - 1, requested)), False
@@ -1556,60 +1609,60 @@ def channel_view_slice_index(view: ViewInfo, index: int) -> int:
 class BatchResultFrameSpec:
     """Logical destination for one result emitted by a fixed-batch source.
 
-    Ordinary frames retain their task-local index. A final-batch Radial extension is a
+    Ordinary frames retain their task-local index. A final-batch Azimuthal extension is a
     real seam augmentation: its global destination wraps within the view and its native
-    radial-u coordinate is reversed again only after an odd number of seam crossings.
+    azimuthal-u coordinate is reversed again only after an odd number of seam crossings.
     Cartesian extensions deliberately return no spec and retain the legacy discard policy.
     """
 
     result_index: int
     task_index: int
     global_destination_index: int
-    mirror_radial_u: bool
-    radial_padding_ordinal: Optional[int] = None
+    mirror_azimuthal_u: bool
+    azimuthal_padding_ordinal: Optional[int] = None
 
     @property
-    def is_radial_padding(self) -> bool:
-        return self.radial_padding_ordinal is not None
+    def is_azimuthal_padding(self) -> bool:
+        return self.azimuthal_padding_ordinal is not None
 
 
-RADIAL_BATCH_PADDING_TILE_SUFFIX = '__radial_batch_seam'
+AZIMUTHAL_BATCH_PADDING_TILE_SUFFIX = '__azimuthal_batch_seam'
 
 
-def radial_batch_padding_tile_id(tile_id: str, *, mirror_radial_u: bool = True) -> str:
+def azimuthal_batch_padding_tile_id(tile_id: str, *, mirror_azimuthal_u: bool = True) -> str:
     """Return the scheduler identity for one tile's seam-augmentation result."""
-    parity = 'mirrored' if bool(mirror_radial_u) else 'unmirrored'
-    return f'{str(tile_id)}{RADIAL_BATCH_PADDING_TILE_SUFFIX}_{parity}'
+    parity = 'mirrored' if bool(mirror_azimuthal_u) else 'unmirrored'
+    return f'{str(tile_id)}{AZIMUTHAL_BATCH_PADDING_TILE_SUFFIX}_{parity}'
 
 
-def mirrored_radial_parent_crop(
+def mirrored_azimuthal_parent_crop(
     parent_crop: Sequence[int], parent_width: int,
 ) -> Tuple[int, int, int, int]:
-    """Mirror a crop footprint along the native radial-u (parent-x) axis."""
+    """Mirror a crop footprint along the native azimuthal-u (parent-x) axis."""
     py0, py1, px0, px1 = (int(value) for value in parent_crop)
     width = int(parent_width)
     if not (0 <= px0 <= px1 <= width):
         raise ValueError(
-            f'Cannot mirror radial parent crop {(py0, py1, px0, px1)} '
+            f'Cannot mirror azimuthal parent crop {(py0, py1, px0, px1)} '
             f'across width {width}'
         )
     return (int(py0), int(py1), int(width - px1), int(width - px0))
 
 
-def radial_batch_padding_count(
+def azimuthal_batch_padding_count(
     view: Optional[ViewInfo],
     num_frames: int,
     batch_size: int,
     *,
     slice_offset: int = 0,
 ) -> int:
-    """Return final fixed-batch slots that cross a Radial view's 0/180 seam."""
+    """Return final fixed-batch slots that cross a Azimuthal view's 0/180 seam."""
 
     count = max(0, int(num_frames))
     batch = max(1, int(batch_size))
     if (
         view is None
-        or not is_radial_view(view)
+        or not is_azimuthal_view(view)
         or count <= 0
         or int(slice_offset) + count != int(view.num_slices)
     ):
@@ -1637,9 +1690,9 @@ def batch_result_frame_spec_for_view(
             result_index=index,
             task_index=index,
             global_destination_index=offset + index,
-            mirror_radial_u=False,
+            mirror_azimuthal_u=False,
         )
-    padding_count = radial_batch_padding_count(
+    padding_count = azimuthal_batch_padding_count(
         view, count, int(batch_size), slice_offset=offset,
     )
     padding_ordinal = int(index) - int(count)
@@ -1650,21 +1703,21 @@ def batch_result_frame_spec_for_view(
         result_index=index,
         task_index=index,
         global_destination_index=int(destination),
-        mirror_radial_u=bool(mirror_u),
-        radial_padding_ordinal=int(padding_ordinal),
+        mirror_azimuthal_u=bool(mirror_u),
+        azimuthal_padding_ordinal=int(padding_ordinal),
     )
 
 
-def radial_batch_padding_frame_specs(
+def azimuthal_batch_padding_frame_specs(
     view: Optional[ViewInfo],
     num_frames: int,
     batch_size: int,
     *,
     slice_offset: int = 0,
 ) -> Tuple[BatchResultFrameSpec, ...]:
-    """Describe every real Radial seam-extension slot in final-batch order."""
+    """Describe every real Azimuthal seam-extension slot in final-batch order."""
 
-    padding_count = radial_batch_padding_count(
+    padding_count = azimuthal_batch_padding_count(
         view, int(num_frames), int(batch_size), slice_offset=int(slice_offset),
     )
     specs: List[BatchResultFrameSpec] = []
@@ -1676,26 +1729,26 @@ def radial_batch_padding_frame_specs(
             batch_size=int(batch_size),
             slice_offset=int(slice_offset),
         )
-        if spec is None or not bool(spec.is_radial_padding):
+        if spec is None or not bool(spec.is_azimuthal_padding):
             raise RuntimeError(
-                f'Radial padding slot {ordinal}/{padding_count} produced no frame mapping'
+                f'Azimuthal padding slot {ordinal}/{padding_count} produced no frame mapping'
             )
         specs.append(spec)
     return tuple(specs)
 
 
-def radial_batch_padding_mirror_groups(
+def azimuthal_batch_padding_mirror_groups(
     view: Optional[ViewInfo],
     num_frames: int,
     batch_size: int,
     *,
     slice_offset: int = 0,
 ) -> Tuple[bool, ...]:
-    """Return the ordered radial-u parity groups needed by auxiliary tile results."""
+    """Return the ordered azimuthal-u parity groups needed by auxiliary tile results."""
 
     parities = {
-        bool(spec.mirror_radial_u)
-        for spec in radial_batch_padding_frame_specs(
+        bool(spec.mirror_azimuthal_u)
+        for spec in azimuthal_batch_padding_frame_specs(
             view,
             int(num_frames),
             int(batch_size),
@@ -1706,7 +1759,7 @@ def radial_batch_padding_mirror_groups(
     return tuple(parity for parity in (True, False) if parity in parities)
 
 
-def radial_batch_padding_tile_result_ids(
+def azimuthal_batch_padding_tile_result_ids(
     tile_id: str,
     view: Optional[ViewInfo],
     num_frames: int,
@@ -1723,10 +1776,10 @@ def radial_batch_padding_tile_result_ids(
 
     result_ids = [str(tile_id)]
     result_ids.extend(
-        radial_batch_padding_tile_id(
-            str(tile_id), mirror_radial_u=bool(parity),
+        azimuthal_batch_padding_tile_id(
+            str(tile_id), mirror_azimuthal_u=bool(parity),
         )
-        for parity in radial_batch_padding_mirror_groups(
+        for parity in azimuthal_batch_padding_mirror_groups(
             view,
             int(num_frames),
             int(batch_size),
@@ -1755,16 +1808,16 @@ def prediction_result_frame_spec(
             result_index=int(result_index),
             task_index=int(result_index),
             global_destination_index=int(result_index),
-            mirror_radial_u=False,
+            mirror_azimuthal_u=False,
         )
     return None
 
 
-def mirror_radial_u_output_to_native_affine(
+def mirror_azimuthal_u_output_to_native_affine(
     M_out_to_native: np.ndarray,
     native_width: int,
 ) -> np.ndarray:
-    """Compose output-to-native sampling with a destination-space radial-u reversal."""
+    """Compose output-to-native sampling with a destination-space azimuthal-u reversal."""
 
     matrix = np.asarray(M_out_to_native, dtype=np.float32).reshape(2, 3)
     homogeneous = np.eye(3, dtype=np.float32)
@@ -1964,11 +2017,11 @@ def _fan_out_canonical_render_batch(
                 data_role=DataRole.INTENSITY,
                 frame_address=FrameAddress(
                     int(spec.global_destination_index),
-                    mirror_u=bool(spec.mirror_radial_u),
+                    mirror_u=bool(spec.mirror_azimuthal_u),
                 ),
                 metadata={
                     'result_index': int(result_index),
-                    'radial_padding': bool(spec.is_radial_padding),
+                    'azimuthal_padding': bool(spec.is_azimuthal_padding),
                 },
             )
         )
@@ -1976,7 +2029,7 @@ def _fan_out_canonical_render_batch(
             result_index=result_index,
             center_index=(int(spec.global_destination_index) if spec is not None else None),
             synthetic_padding=bool(spec is None),
-            radial_padding=bool(spec is not None and spec.is_radial_padding),
+            azimuthal_padding=bool(spec is not None and spec.is_azimuthal_padding),
             frame=frame,
             request=request,
         ))
@@ -1999,8 +2052,8 @@ class InMemoryYoloVolumeSource:
  loader lets the predictor consume a 3-D gray volume or 4-D H×W×C volume
  incrementally with ``stream=True`` and the requested ``--batch``. Cartesian
  sources extend a final partial batch by repeating the last real frame and
- discard those synthetic results. Radial sources instead wrap across the
- 0/180-degree seam, mirror radial-u after an odd crossing, inverse-map the
+ discard those synthetic results. Azimuthal sources instead wrap across the
+ 0/180-degree seam, mirror azimuthal-u after an odd crossing, inverse-map the
  predictions, and union them into the wrapped destination slices."""
 
     def __init__(
@@ -2049,7 +2102,7 @@ class InMemoryYoloVolumeSource:
         self.bs = max(1, int(batch_size))
         self.yield_nf = int(math.ceil(float(self.nf) / float(self.bs)) * self.bs) if self.nf > 0 else 0
         self.synthetic_count = max(0, int(self.yield_nf) - int(self.nf))
-        self.radial_padding_count = radial_batch_padding_count(
+        self.azimuthal_padding_count = azimuthal_batch_padding_count(
             self.view, self.nf, self.bs, slice_offset=self.slice_offset,
         )
         self.mode = 'image'
@@ -2107,14 +2160,14 @@ class InMemoryYoloVolumeSource:
         last_real_idx = max(0, int(self.nf) - 1)
         for idx in range(start, stop):
             spec = self.result_frame_spec(int(idx))
-            radial_wrap = bool(spec is not None and spec.is_radial_padding)
+            azimuthal_wrap = bool(spec is not None and spec.is_azimuthal_padding)
             if int(idx) < int(self.nf):
                 real_idx = int(idx)
-            elif radial_wrap and int(idx) < int(self.volume_gray.shape[0]):
-                # Official materialized Radial refs include renderer-produced seam frames,
+            elif azimuthal_wrap and int(idx) < int(self.volume_gray.shape[0]):
+                # Official materialized Azimuthal refs include renderer-produced seam frames,
                 # preserving native-before-affine mirroring for nonzero TTA rotations.
                 real_idx = int(idx)
-            elif radial_wrap and spec is not None:
+            elif azimuthal_wrap and spec is not None:
                 # Compatibility for callers that provide only the logical frames. This is
                 # exact for identity/post-affine-symmetric jobs; package-created refs use the
                 # renderer-produced branch above.
@@ -2122,24 +2175,24 @@ class InMemoryYoloVolumeSource:
             else:
                 real_idx = int(last_real_idx)
             synthetic = int(idx) >= int(self.nf)
-            suffix = '_radial_wrap' if radial_wrap else ('_synthetic' if synthetic else '')
+            suffix = '_azimuthal_wrap' if azimuthal_wrap else ('_synthetic' if synthetic else '')
             paths.append(f'{self.name}_{idx + 1:06d}{suffix}.png')
             frame = self._frame_to_model_channels(
                 self.volume_gray[int(real_idx)], int(self.channel_count)
             )
             if (
-                radial_wrap
+                azimuthal_wrap
                 and spec is not None
-                and bool(spec.mirror_radial_u)
+                and bool(spec.mirror_azimuthal_u)
                 and int(idx) >= int(self.volume_gray.shape[0])
             ):
                 frame = np.ascontiguousarray(frame[:, ::-1])
             imgs.append(frame)
-            if radial_wrap and spec is not None:
+            if azimuthal_wrap and spec is not None:
                 info.append(
-                    f'in-memory {self.name} radial seam extension {idx + 1}/{self.yield_nf} '
+                    f'in-memory {self.name} azimuthal seam extension {idx + 1}/{self.yield_nf} '
                     f'wraps to slice {int(spec.global_destination_index) + 1}/{int(self.view.num_slices)} '
-                    f'with radial-u {"mirrored" if spec.mirror_radial_u else "unchanged"}: '
+                    f'with azimuthal-u {"mirrored" if spec.mirror_azimuthal_u else "unchanged"}: '
                 )
             elif synthetic:
                 info.append(f'in-memory {self.name} synthetic padded slice {idx + 1}/{self.yield_nf} repeats real slice {real_idx + 1}/{self.nf}: ')
@@ -2198,7 +2251,7 @@ class StreamingYoloVolumeSource:
         self.bs = max(1, int(batch_size))
         self.yield_nf = int(math.ceil(float(self.nf) / float(self.bs)) * self.bs) if self.nf > 0 else 0
         self.synthetic_count = max(0, int(self.yield_nf) - int(self.nf))
-        self.radial_padding_count = radial_batch_padding_count(
+        self.azimuthal_padding_count = azimuthal_batch_padding_count(
             self.view, self.nf, self.bs, slice_offset=self.slice_offset,
         )
         self.render_workers = max(1, min(int(render_workers), max(1, int(self.nf))))
@@ -2349,21 +2402,21 @@ class StreamingYoloVolumeSource:
         last_real_idx = max(0, int(self.nf) - 1)
         for idx in range(start, stop):
             spec = self.result_frame_spec(int(idx))
-            radial_wrap = bool(spec is not None and spec.is_radial_padding)
-            real_idx = int(idx) if (int(idx) < int(self.nf) or radial_wrap) else int(last_real_idx)
+            azimuthal_wrap = bool(spec is not None and spec.is_azimuthal_padding)
+            real_idx = int(idx) if (int(idx) < int(self.nf) or azimuthal_wrap) else int(last_real_idx)
             synthetic = int(idx) >= int(self.nf)
-            suffix = '_radial_wrap' if radial_wrap else ('_synthetic' if synthetic else '')
+            suffix = '_azimuthal_wrap' if azimuthal_wrap else ('_synthetic' if synthetic else '')
             # Wrapped centers intentionally bypass the real-frame prefetch range. The
             # center-aware renderer resolves the global seam and mirrors every contextual
             # channel with the correct crossing parity.
-            frame = self._render_one(real_idx) if radial_wrap else self._get_real_frame(real_idx)
+            frame = self._render_one(real_idx) if azimuthal_wrap else self._get_real_frame(real_idx)
             paths.append(f'{self.name}_{idx + 1:06d}{suffix}.png')
             imgs.append(self._frame_to_model_channels(frame, int(self.channel_count)))
-            if radial_wrap and spec is not None:
+            if azimuthal_wrap and spec is not None:
                 info.append(
-                    f'streaming {self.name} radial seam extension {idx + 1}/{self.yield_nf} '
+                    f'streaming {self.name} azimuthal seam extension {idx + 1}/{self.yield_nf} '
                     f'wraps to slice {int(spec.global_destination_index) + 1}/{int(self.view.num_slices)} '
-                    f'with radial-u {"mirrored" if spec.mirror_radial_u else "unchanged"}: '
+                    f'with azimuthal-u {"mirrored" if spec.mirror_azimuthal_u else "unchanged"}: '
                 )
             elif synthetic:
                 info.append(f'streaming {self.name} synthetic padded slice {idx + 1}/{self.yield_nf} repeats real slice {real_idx + 1}/{self.nf}: ')
@@ -2468,7 +2521,7 @@ class GpuPrefetchingYoloSource:
         self.nf = int(getattr(base_source, 'nf', 0) or 0)
         self.yield_nf = int(getattr(base_source, 'yield_nf', 0) or 0)
         self.synthetic_count = int(getattr(base_source, 'synthetic_count', max(0, self.yield_nf - self.nf)))
-        self.radial_padding_count = int(getattr(base_source, 'radial_padding_count', 0) or 0)
+        self.azimuthal_padding_count = int(getattr(base_source, 'azimuthal_padding_count', 0) or 0)
         self.source_type = getattr(base_source, 'source_type', argparse.Namespace(stream=False, screenshot=False, from_img=True, tensor=False))
         self._queue: 'queue.Queue[object]' = queue.Queue(maxsize=self.queue_batches)
         self._stop_event = threading.Event()
@@ -3257,7 +3310,7 @@ def write_dense_tile_job_meta(
             'model_input_channels': int(fmt.channel_count),
             'channel_stride': int(fmt.stride),
             'channel_offsets': [int(v) for v in fmt.offsets],
-            'channel_boundary_policy': 'radial_wrap_mirror_u_cartesian_edge_clamp',
+            'channel_boundary_policy': 'azimuthal_wrap_mirror_u_cartesian_edge_clamp',
             'prediction_slice_policy': 'center_N_only',
         },
         separators=(',', ':'),
@@ -3837,7 +3890,7 @@ def render_intensity_frame_on_grid(
     output_height: int,
     output_width: int,
     view_frames: Optional[np.ndarray] = None,
-    mirror_radial_u: bool = False,
+    mirror_azimuthal_u: bool = False,
 ) -> np.ndarray:
     """Render intensity data through the canonical TTA grid sampler.
 
@@ -3865,9 +3918,9 @@ def render_intensity_frame_on_grid(
             volume_rgb, view, int(frame_idx), view_frames=view_frames,
         )
     )
-    if bool(mirror_radial_u):
-        if not is_radial_view(view):
-            raise ValueError('radial-u mirroring requested for a non-Radial view')
+    if bool(mirror_azimuthal_u):
+        if not is_azimuthal_view(view):
+            raise ValueError('azimuthal-u mirroring requested for a non-Azimuthal view')
         native_frame = np.ascontiguousarray(native_frame[:, ::-1])
     identity = np.asarray(
         [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32,
@@ -3902,7 +3955,7 @@ def render_categorical_frame_on_grid(
     output_height: int,
     output_width: int,
     view_frames: Optional[np.ndarray] = None,
-    mirror_radial_u: bool = False,
+    mirror_azimuthal_u: bool = False,
 ) -> np.ndarray:
     """Render categorical data on the same grid with nearest/threshold rules."""
 
@@ -3925,10 +3978,10 @@ def render_categorical_frame_on_grid(
             mask_u8, view, int(frame_idx), view_frames=view_frames,
         )
     )
-    if bool(mirror_radial_u):
-        if not is_radial_view(view):
+    if bool(mirror_azimuthal_u):
+        if not is_azimuthal_view(view):
             raise ValueError(
-                'radial-u mirroring requested for a non-Radial categorical view'
+                'azimuthal-u mirroring requested for a non-Azimuthal categorical view'
             )
         native_frame = np.ascontiguousarray(native_frame[:, ::-1])
     identity = np.asarray(
@@ -3962,7 +4015,7 @@ def render_fullframe_frame_for_job(
     frame_idx: int,
     view_frames: Optional[np.ndarray] = None,
     *,
-    mirror_radial_u: bool = False,
+    mirror_azimuthal_u: bool = False,
 ) -> np.ndarray:
     return render_intensity_frame_on_grid(
         volume_rgb,
@@ -3973,7 +4026,7 @@ def render_fullframe_frame_for_job(
         output_height=int(job.aff.out_size),
         output_width=int(job.aff.out_size),
         view_frames=view_frames,
-        mirror_radial_u=bool(mirror_radial_u),
+        mirror_azimuthal_u=bool(mirror_azimuthal_u),
     )
 
 def render_dense_tile_frame_for_job(
@@ -3983,7 +4036,7 @@ def render_dense_tile_frame_for_job(
     frame_idx: int,
     view_frames: Optional[np.ndarray] = None,
     *,
-    mirror_radial_u: bool = False,
+    mirror_azimuthal_u: bool = False,
 ) -> np.ndarray:
     """Render one tile inference range directly from the native view volume.
 
@@ -4002,7 +4055,7 @@ def render_dense_tile_frame_for_job(
         output_height=int(tile_job.out_size),
         output_width=int(tile_job.out_size),
         view_frames=view_frames,
-        mirror_radial_u=bool(mirror_radial_u),
+        mirror_azimuthal_u=bool(mirror_azimuthal_u),
     )
 
 
@@ -4013,7 +4066,7 @@ def render_categorical_fullframe_for_job(
     frame_idx: int,
     view_frames: Optional[np.ndarray] = None,
     *,
-    mirror_radial_u: bool = False,
+    mirror_azimuthal_u: bool = False,
 ) -> np.ndarray:
     """Render one full-frame categorical ground-truth raster for an ``AugJob``.
 
@@ -4030,7 +4083,7 @@ def render_categorical_fullframe_for_job(
         output_height=int(job.aff.out_size),
         output_width=int(job.aff.out_size),
         view_frames=view_frames,
-        mirror_radial_u=bool(mirror_radial_u),
+        mirror_azimuthal_u=bool(mirror_azimuthal_u),
     )
 
 
@@ -4041,7 +4094,7 @@ def render_categorical_dense_tile_for_job(
     frame_idx: int,
     view_frames: Optional[np.ndarray] = None,
     *,
-    mirror_radial_u: bool = False,
+    mirror_azimuthal_u: bool = False,
 ) -> np.ndarray:
     """Render one categorical ground-truth tile for a ``DenseTileJob``."""
     return render_categorical_frame_on_grid(
@@ -4053,7 +4106,7 @@ def render_categorical_dense_tile_for_job(
         output_height=int(tile_job.out_size),
         output_width=int(tile_job.out_size),
         view_frames=view_frames,
-        mirror_radial_u=bool(mirror_radial_u),
+        mirror_azimuthal_u=bool(mirror_azimuthal_u),
     )
 
 
@@ -4083,7 +4136,7 @@ def make_fullframe_channel_renderer(
             job=job,
             frame_idx=int(source_idx),
             view_frames=view_frames,
-            mirror_radial_u=True,
+            mirror_azimuthal_u=True,
         )
 
     return ChannelFormattedFrameRenderer(
@@ -4091,7 +4144,7 @@ def make_fullframe_channel_renderer(
         view,
         resolve_channel_format(channel_format),
         cache_frames=cache_frames,
-        mirrored_plane_renderer=_render_mirrored_plane if is_radial_view(view) else None,
+        mirrored_plane_renderer=_render_mirrored_plane if is_azimuthal_view(view) else None,
     )
 
 def make_dense_tile_channel_renderer(
@@ -4120,7 +4173,7 @@ def make_dense_tile_channel_renderer(
             tile_job=tile_job,
             frame_idx=int(source_idx),
             view_frames=view_frames,
-            mirror_radial_u=True,
+            mirror_azimuthal_u=True,
         )
 
     return ChannelFormattedFrameRenderer(
@@ -4128,7 +4181,7 @@ def make_dense_tile_channel_renderer(
         view,
         resolve_channel_format(channel_format),
         cache_frames=cache_frames,
-        mirrored_plane_renderer=_render_mirrored_plane if is_radial_view(view) else None,
+        mirrored_plane_renderer=_render_mirrored_plane if is_azimuthal_view(view) else None,
     )
 
 
@@ -4139,6 +4192,7 @@ def build_fullframe_raster_plan(
 ) -> RasterPlan:
     """Build the canonical v18 TTA plan consumed by one full-frame job."""
 
+    from .unification.tta_manifest import radial_view_plan_metadata
     fmt = resolve_channel_format(channel_format)
     return build_forward_raster_plan(
         mode='tta',
@@ -4155,6 +4209,7 @@ def build_fullframe_raster_plan(
             'runtime_view_id': str(view.name),
             'runtime_job_id': str(job.aug_id),
             'runtime_kind': 'fullframe',
+            **radial_view_plan_metadata(view),
         },
     )
 
@@ -4173,6 +4228,7 @@ def build_dense_tile_raster_plan(
 ) -> RasterPlan:
     """Build the canonical v18 TTA plan consumed by one collapsed tile job."""
 
+    from .unification.tta_manifest import radial_view_plan_metadata
     fmt = resolve_channel_format(channel_format)
     return build_forward_raster_plan(
         mode='tta',
@@ -4194,6 +4250,7 @@ def build_dense_tile_raster_plan(
             'tile_config_id': str(tile_job.config_id),
             'tile_x': int(tile_job.tile_x),
             'tile_y': int(tile_job.tile_y),
+            **radial_view_plan_metadata(view),
         },
     )
 
@@ -4261,7 +4318,7 @@ def _materialize_prediction_volume_from_renderer(
         )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    materialized_slices = int(num_slices) + radial_batch_padding_count(
+    materialized_slices = int(num_slices) + azimuthal_batch_padding_count(
         view, int(num_slices), inference_batch_size(), slice_offset=0,
     )
     prediction_shape = (
@@ -4395,11 +4452,11 @@ def materialize_dense_tile_prediction_volume_for_job(
     )
 
 def should_cache_view_frames(view: ViewInfo, dense_tiling_active: bool) -> bool:
-    """Return whether an opt-in Radial tile-frame cache should be prebuilt.
+    """Return whether an opt-in Azimuthal tile-frame cache should be prebuilt.
 
     Streaming remains the default to avoid a full-view time-to-first-prediction barrier.
     """
-    return bool(_env_flag('YOLO_TTA_PREBUILD_VIEW_FRAME_CACHES', False)) and bool(dense_tiling_active) and view.family == 'radial'
+    return bool(_env_flag('YOLO_TTA_PREBUILD_VIEW_FRAME_CACHES', False)) and bool(dense_tiling_active) and view.family == 'azimuthal'
 
 def build_view_frame_cache(
     volume_rgb: np.ndarray,
@@ -4413,8 +4470,8 @@ def build_view_frame_cache(
 ) -> np.ndarray:
     """Materialize native single-channel frames for a view into a reusable cache volume.
 
- This is used primarily for the radial view when tiling is enabled so later tile video
- generation no longer recomputes the same radial slices for every tile location."""
+ This is used primarily for the azimuthal view when tiling is enabled so later tile video
+ generation no longer recomputes the same azimuthal slices for every tile location."""
     cache_mm = allocate_workspace_array(
         shape=(int(view.num_slices), int(view.src_h), int(view.src_w)),
         dtype=np.uint8,
@@ -4517,6 +4574,11 @@ def get_view_frame_by_index(
 
     T, H, W = volume_rgb.shape
 
+    if is_radial_view(view):
+        from .cylindrical_geometry import render_shell_frame
+        wait_for_volume_ready(volume_rgb)
+        return render_shell_frame(volume_rgb, view, int(index))
+
     if physical_view_name(view) == 'transverse':
         wait_for_volume_slice_ready(volume_rgb, int(index))
         return np.asarray(volume_rgb[int(index)])
@@ -4529,19 +4591,19 @@ def get_view_frame_by_index(
         if volume_rgb.ndim == 3 and bool(volume_rgb.flags['C_CONTIGUOUS']):
             return _coronal_frame_from_block_cache(volume_rgb, int(index))
         return np.ascontiguousarray(volume_rgb[:, :, int(index)])
-    if is_radial_view(view):
+    if is_azimuthal_view(view):
         wait_for_volume_ready(volume_rgb)
         angle_deg = float(view.azimuths_deg[int(index)])
-        sampler = get_radial_sampler(view, angle_deg)
-        if is_tilted_radial_view(view):
+        sampler = get_azimuthal_sampler(view, angle_deg)
+        if is_tilted_azimuthal_view(view):
             return np.ascontiguousarray(
-                extract_tilted_radial_slice_frame(
+                extract_tilted_azimuthal_slice_frame(
                     volume_rgb, view, sampler, out_rows=int(view.src_h),
                 )
             )
-        oriented = radial_oriented_stack_view(volume_rgb, view)
+        oriented = azimuthal_oriented_stack_view(volume_rgb, view)
         return np.ascontiguousarray(
-            extract_radial_slice_frame(oriented, sampler, out_rows=int(view.src_h))
+            extract_azimuthal_slice_frame(oriented, sampler, out_rows=int(view.src_h))
         )
     if is_tilted_view(view):
         wait_for_volume_ready(volume_rgb)
@@ -4564,6 +4626,11 @@ def get_categorical_view_frame_by_index(
     if mask.ndim != 3:
         raise ValueError(f'Categorical source volume must be 3D, got {mask.shape}')
 
+    if is_radial_view(view):
+        from .cylindrical_geometry import render_shell_frame
+        wait_for_volume_ready(mask_u8)
+        return render_shell_frame(mask, view, int(index), categorical=True)
+
     if physical_view_name(view) == 'transverse':
         wait_for_volume_slice_ready(mask_u8, int(index))
         return np.ascontiguousarray(np.asarray(mask[int(index)]) > 0, dtype=np.uint8)
@@ -4573,19 +4640,19 @@ def get_categorical_view_frame_by_index(
     if physical_view_name(view) == 'coronal':
         wait_for_volume_ready(mask_u8)
         return np.ascontiguousarray(np.asarray(mask[:, :, int(index)]) > 0, dtype=np.uint8)
-    if is_radial_view(view):
+    if is_azimuthal_view(view):
         wait_for_volume_ready(mask_u8)
         angle_deg = float(view.azimuths_deg[int(index)])
-        sampler = get_radial_sampler(view, angle_deg)
-        if is_tilted_radial_view(view):
+        sampler = get_azimuthal_sampler(view, angle_deg)
+        if is_tilted_azimuthal_view(view):
             return np.ascontiguousarray(
-                extract_tilted_radial_categorical_slice_frame(
+                extract_tilted_azimuthal_categorical_slice_frame(
                     mask, view, sampler, out_rows=int(view.src_h),
                 )
             )
-        oriented = radial_oriented_stack_view(mask, view)
+        oriented = azimuthal_oriented_stack_view(mask, view)
         return np.ascontiguousarray(
-            extract_radial_categorical_slice_frame(
+            extract_azimuthal_categorical_slice_frame(
                 oriented, sampler, out_rows=int(view.src_h),
             )
         )

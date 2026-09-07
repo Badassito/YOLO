@@ -1,6 +1,6 @@
-"""Exact sparse Radial/tilted-Radial projection into immutable source mask stores.
+"""Exact sparse Azimuthal/tilted-Azimuthal projection into immutable source mask stores.
 
-The legacy projector gathers a discrete Radial ownership map for every stack
+The legacy projector gathers a discrete Azimuthal ownership map for every stack
 frame. This module inverts that same relation and visits only positive input
 samples. Input crops, map construction strips and output crops are bounded; no
 dense view-native mask or volume-sized coordinate list is materialized.
@@ -18,7 +18,7 @@ from typing import Dict, Iterator, Tuple
 
 import numpy as np
 from ._deps import _numba
-from .geometry import ViewInfo, is_radial_view, is_tilted_radial_view, radial_base_view_name, radial_plane_shape, radial_source_tilted_view, tilted_frame_center, tilted_stack_axis_length
+from .geometry import ViewInfo, is_azimuthal_view, is_tilted_azimuthal_view, azimuthal_base_view_name, azimuthal_plane_shape, azimuthal_source_tilted_view, tilted_frame_center, tilted_stack_axis_length
 from .interpolation import INTERNAL_PACKED_CVOL_FORMAT, RawBBoxMaskStore, RawBBoxSlicePayload, _write_raw_bbox_payload_store
 
 _MAP_CACHE_MAX_BYTES = 256 * 1024 * 1024
@@ -154,7 +154,7 @@ def _map_key_strips(view, plan, grid, plane_shape) -> Iterator[Tuple[np.ndarray,
     Do not call the legacy map builder here: its global cache retains full maps
     indefinitely. Tests compare these keys to that actual builder's result.
     """
-    work_h, work_w = radial_plane_shape(view)
+    work_h, work_w = azimuthal_plane_shape(view)
     out_h, out_w = plane_shape
     if not plan:
         return
@@ -201,21 +201,21 @@ def _map_key_strips(view, plan, grid, plane_shape) -> Iterator[Tuple[np.ndarray,
 def _make_inverse_map(view, input_shape, output_shape) -> _InverseMap:
     from . import backprojection as projection
 
-    # resolve_radial_processing_grid only inspects shape before constructing its
+    # resolve_azimuthal_processing_grid only inspects shape before constructing its
     # 1-D OpenCV coordinate ramps. This probe has one byte of backing storage.
     probe = np.broadcast_to(np.zeros((1, 1, 1), dtype=np.uint8), input_shape)
-    grid = projection.resolve_radial_processing_grid(probe, view)
-    plan, _ = projection.build_radial_backprojection_plan(view)
-    base_id = {'transverse': 0, 'sagittal': 1, 'coronal': 2}[radial_base_view_name(view)]
-    tilted = is_tilted_radial_view(view)
+    grid = projection.resolve_azimuthal_processing_grid(probe, view)
+    plan, _ = projection.build_azimuthal_backprojection_plan(view)
+    base_id = {'transverse': 0, 'sagittal': 1, 'coronal': 2}[azimuthal_base_view_name(view)]
+    tilted = is_tilted_azimuthal_view(view)
     vertical = str(view.tilt_direction) == 'vertical'
     working_shape = (int(view.full_t), int(view.full_h), int(view.full_w))
     if tilted:
-        tilted_source = radial_source_tilted_view(view)
+        tilted_source = azimuthal_source_tilted_view(view)
         plane_shape = (int(tilted_source.src_h), int(tilted_source.src_w))
         frame_count = int(tilted_source.num_slices)
         if str(tilted_source.tilt_direction) not in ('vertical', 'horizontal'):
-            raise ValueError('Unsupported tilted Radial direction')
+            raise ValueError('Unsupported tilted Azimuthal direction')
         axis_count = plane_shape[0] if vertical else plane_shape[1]
         axis_center = float((axis_count - 1) / 2.0)
         axis = np.arange(axis_count, dtype=np.int32)
@@ -231,7 +231,7 @@ def _make_inverse_map(view, input_shape, output_shape) -> _InverseMap:
             values[(values < 0) | (values >= stack_limit)] = -1
             shear[frame] = values
     else:
-        frame_count, plane_shape = projection._radial_output_stack_and_plane_shape(view, output_shape)
+        frame_count, plane_shape = projection._azimuthal_output_stack_and_plane_shape(view, output_shape)
         shear = np.empty((0, 0), dtype=np.int32)
     if int(plane_shape[0]) * int(plane_shape[1]) > 0xFFFFFFFF:
         raise ValueError('Sparse projection base plane exceeds uint32 map capacity')
@@ -239,7 +239,7 @@ def _make_inverse_map(view, input_shape, output_shape) -> _InverseMap:
     counts = np.zeros(key_count, dtype=np.uint32)
     for keys, _positions in _map_key_strips(view, plan, grid, plane_shape):
         if keys.size and (int(keys.min()) < 0 or int(keys.max()) >= key_count):
-            raise ValueError('Radial ownership map references an absent source sample')
+            raise ValueError('Azimuthal ownership map references an absent source sample')
         _count_keys(keys, counts)
     offsets = _prefix_counts(counts)
     owners = np.empty(int(offsets[-1]), dtype=np.uint32)
@@ -249,7 +249,7 @@ def _make_inverse_map(view, input_shape, output_shape) -> _InverseMap:
     del counts
     row_lists = [[] for _ in range(int(input_shape[1]))]
     for frame in range(frame_count):
-        for row in projection._radial_processing_rows_for_output(grid, frame_count, frame):
+        for row in projection._azimuthal_processing_rows_for_output(grid, frame_count, frame):
             row_lists[int(row)].append(frame)
     row_counts = np.asarray([len(items) for items in row_lists], dtype=np.uint32)
     row_offsets = _prefix_counts(row_counts)
@@ -338,7 +338,7 @@ def _packed_output_slice(z, packed, bounds, slice_counts):
                               foreground_voxels=int(slice_counts[z]))
 
 
-def project_radial_sparse_store(
+def project_azimuthal_sparse_store(
     source: RawBBoxMaskStore | Path,
     view: ViewInfo,
     store_dir: Path,
@@ -353,8 +353,8 @@ def project_radial_sparse_store(
     so overlapping source bits cannot race. GPU execution is not selected here.
     """
     started = time.perf_counter()
-    if not is_radial_view(view):
-        raise ValueError('Sparse Radial projection requires a Radial view')
+    if not is_azimuthal_view(view):
+        raise ValueError('Sparse Azimuthal projection requires a Azimuthal view')
     output_shape = tuple(int(value) for value in out_shape_tyx)
     if len(output_shape) != 3 or min(output_shape) <= 0:
         raise ValueError('Sparse projection requires three positive output dimensions')
@@ -366,9 +366,9 @@ def project_radial_sparse_store(
     packed = None
     try:
         if not all(int(value) > 0 for value in store.shape):
-            raise ValueError('Sparse Radial input requires three positive dimensions')
+            raise ValueError('Sparse Azimuthal input requires three positive dimensions')
         if int(store.shape[0]) != int(view.num_slices) or int(store.shape[0]) != len(view.azimuths_deg):
-            raise ValueError('Sparse Radial depth differs from the view azimuths')
+            raise ValueError('Sparse Azimuthal depth differs from the view azimuths')
         if (target == store.root.resolve() or target in store.root.resolve().parents
                 or store.root.resolve() in target.parents):
             raise ValueError('Projected store must not replace its input')
@@ -423,8 +423,8 @@ def project_radial_sparse_store(
                     shape=output_shape, store_dir=staging,
                     encode_slice=lambda z: _packed_output_slice(z, packed, bounds, slice_counts),
                     format_name=INTERNAL_PACKED_CVOL_FORMAT,
-                    desc=f'Sparse Radial projection {view.name}', workers=int(workers),
-                    extra_meta={'projection_payload_fusion': 'sparse_inverse_radial_ownership'},
+                    desc=f'Sparse Azimuthal projection {view.name}', workers=int(workers),
+                    extra_meta={'projection_payload_fusion': 'sparse_inverse_azimuthal_ownership'},
                 ))
                 encode_seconds = time.perf_counter()-encode_started
                 if int(stats['foreground_voxels']) != unique:

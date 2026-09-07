@@ -136,19 +136,19 @@ class CrossModeGeometryMatrixTests(unittest.TestCase):
             ("--enable_cartesian", "transverse"),
         ),
         (
-            "radial",
-            ("--enable_radial", "transverse:60"),
+            "azimuthal",
+            ("--enable_azimuthal", "transverse:60"),
         ),
         (
             "tilted_cartesian",
             ("--enable_tilted", "sagittal:20:vertical"),
         ),
         (
-            "tilted_radial",
+            "tilted_azimuthal",
             (
                 "--enable_tilted",
                 "coronal:20:horizontal",
-                "--enable_radial",
+                "--enable_azimuthal",
                 "tilted_coronal:60",
             ),
         ),
@@ -194,7 +194,7 @@ class CrossModeGeometryMatrixTests(unittest.TestCase):
             h=self.VOLUME_SHAPE[1],
             w=self.VOLUME_SHAPE[2],
             config=config,
-            radial_native_raster=0,
+            azimuthal_native_raster=0,
         )
         self.assertEqual(
             [view.shared_view for view in adapted],
@@ -206,16 +206,16 @@ class CrossModeGeometryMatrixTests(unittest.TestCase):
                 view
                 for view in adapted
                 if view.shared_view is not None
-                and not geometry.is_radial_view(view.shared_view)
+                and not geometry.is_azimuthal_view(view.shared_view)
                 and not geometry.is_tilted_view(view.shared_view)
             ]
-        elif case_name == "radial":
+        elif case_name == "azimuthal":
             matches = [
                 view
                 for view in adapted
                 if view.shared_view is not None
-                and geometry.is_radial_view(view.shared_view)
-                and not geometry.is_tilted_radial_view(view.shared_view)
+                and geometry.is_azimuthal_view(view.shared_view)
+                and not geometry.is_tilted_azimuthal_view(view.shared_view)
             ]
         elif case_name == "tilted_cartesian":
             matches = [
@@ -230,7 +230,7 @@ class CrossModeGeometryMatrixTests(unittest.TestCase):
                 view
                 for view in adapted
                 if view.shared_view is not None
-                and geometry.is_tilted_radial_view(view.shared_view)
+                and geometry.is_tilted_azimuthal_view(view.shared_view)
                 and float(view.shared_view.tilt_angle_deg) > 0.0
             ]
         self.assertTrue(matches, msg=f"{case_name}: requested physical view was not compiled")
@@ -373,7 +373,7 @@ class CrossModeGeometryMatrixTests(unittest.TestCase):
             M_out_to_src=plan.aff.M_out_to_src,
             output_height=int(plan.aff.out_h),
             output_width=int(plan.aff.out_w),
-            mirror_radial_u=bool(mirror_u),
+            mirror_azimuthal_u=bool(mirror_u),
         )
 
     @staticmethod
@@ -398,7 +398,7 @@ class CrossModeGeometryMatrixTests(unittest.TestCase):
             plan.view.shared_view,
             tile.shared_job,
             int(source_idx),
-            mirror_radial_u=bool(mirror_u),
+            mirror_azimuthal_u=bool(mirror_u),
         )
 
     def test_intensity_and_categorical_fullframe_and_tile_matrix(self) -> None:
@@ -580,8 +580,8 @@ class CrossModeGeometryMatrixTests(unittest.TestCase):
             root = Path(temp_dir)
             for case_name, arguments in self.VIEW_CASES:
                 view = self._compile_view(case_name, arguments)
-                # Center zero forces the first custom plane across a Radial seam.
-                center_idx = 0 if case_name in {"radial", "tilted_radial"} else 1
+                # Center zero forces the first custom plane across a Azimuthal seam.
+                center_idx = 0 if case_name in {"azimuthal", "tilted_azimuthal"} else 1
                 for imgsz in (0, 5):
                     for variant in variants:
                         with self.subTest(
@@ -627,9 +627,9 @@ class CrossModeGeometryMatrixTests(unittest.TestCase):
                                 self._expected_channel_tile(plan, tile, center_idx),
                             )
 
-    def test_radial_seam_wrap_mirror_and_multiwrap_parity(self) -> None:
+    def test_azimuthal_seam_wrap_mirror_and_multiwrap_parity(self) -> None:
         view = self._compile_view(
-            "radial", ("--enable_radial", "transverse:60")
+            "azimuthal", ("--enable_azimuthal", "transverse:60")
         )
         assert view.shared_view is not None
         shared_view = view.shared_view
@@ -676,7 +676,7 @@ class CrossModeGeometryMatrixTests(unittest.TestCase):
                     view,
                     count - 1,
                     plan.aff,
-                    mirror_radial_u=True,
+                    mirror_azimuthal_u=True,
                 ),
                 mirrored_image,
             )
@@ -686,7 +686,7 @@ class CrossModeGeometryMatrixTests(unittest.TestCase):
                     view,
                     count - 1,
                     plan.aff,
-                    mirror_radial_u=True,
+                    mirror_azimuthal_u=True,
                 ),
                 mirrored_mask,
             )

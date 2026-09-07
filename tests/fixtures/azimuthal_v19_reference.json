@@ -1,0 +1,700 @@
+{
+  "source_commit": "d6e49f45839104b0768e4c8f28ae8b9dc6e5fc71",
+  "source_shape": [
+    9,
+    11,
+    13
+  ],
+  "cases": [
+    {
+      "name": "azimuthal_transverse",
+      "raster": 0,
+      "shape": [
+        3,
+        9,
+        11
+      ],
+      "frames": [
+        {
+          "intensity": "299e99202ec39c9a83f0deadb7ae6083c391cc4e9f921619410ed497565fd989",
+          "categorical": "d9e5b2337d07a1cb44393b729c399c790124e3081147b6db50301a07469890b6"
+        },
+        {
+          "intensity": "55ff053b5868f1c73cd553a83cb2b1f03c2a2c5b6421bc902018a461df40f0ec",
+          "categorical": "bf0c44ea478d8dd9f84b383502edabdd83fef40b2ff9a1fab97012d68c54d95a"
+        },
+        {
+          "intensity": "320a9e4cde5bc274b7f9c95b181760445f5ec1e940dd5ffad2f34bad14d18bc3",
+          "categorical": "1e432e3f912bba354b62816674690a80e6d349fb60fb971a1f9b68fdd9cd7048"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_sagittal",
+      "raster": 0,
+      "shape": [
+        3,
+        11,
+        9
+      ],
+      "frames": [
+        {
+          "intensity": "e93f7ee3397bfc816f59befbc2f860696e213d0ec5f1e638f2075519ebfbd5a3",
+          "categorical": "5365e41d690966da94146e7bbdf8d08499871ace520231ab2586384b5ffbfce8"
+        },
+        {
+          "intensity": "8ef9bc02b0e0df93cd34dd018f70d64ad828b6acc95faa319a8df64905667c7f",
+          "categorical": "1dbc560a487e1bc461f322719c912cdf55b324646d27d223b4ff099d37a7ab66"
+        },
+        {
+          "intensity": "c08a8c026aeb852069459fcbb4f79bbd8e6e45897f6be3ca07f871a03de382df",
+          "categorical": "5f6cae3da40012da98e3389a84f9b74c62696fd072e80fe5859b87cbd3142e73"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_coronal",
+      "raster": 0,
+      "shape": [
+        3,
+        13,
+        9
+      ],
+      "frames": [
+        {
+          "intensity": "7b67f81dea56d9dbe506042eae7a376449b402263409c58c388c4f61a6fe7a30",
+          "categorical": "2001ac40cc4e04ff429031e1a097a64ee510c0905b324c94fd5c4717f2514ba2"
+        },
+        {
+          "intensity": "4a0f404e3308b60e3155e1a10f4de60b383f8028d9b3fbdc89a09747ba51ce49",
+          "categorical": "5f70def46d65a26cde47566ff5c73fa836b8a5ffe5d9e2bee79eeaad1d6351dd"
+        },
+        {
+          "intensity": "249f9d71e92fc09f6df29cca7fa431a760af491bd640dfbfb04207e92d04663a",
+          "categorical": "112b881175b596eaeb6bfb360db58b64e95b06c60e831f7f60a828a724b4de45"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_transverse_vertical_p20",
+      "raster": 0,
+      "shape": [
+        3,
+        9,
+        11
+      ],
+      "frames": [
+        {
+          "intensity": "299e99202ec39c9a83f0deadb7ae6083c391cc4e9f921619410ed497565fd989",
+          "categorical": "d9e5b2337d07a1cb44393b729c399c790124e3081147b6db50301a07469890b6"
+        },
+        {
+          "intensity": "90fdecd0eb123579f7566220f48f631fd6c48a725690f836f11c7047bfcb5b6a",
+          "categorical": "706c01277ec788d9d0a6cb016d63ffb148055781d0d9fc6986ba47136ae42323"
+        },
+        {
+          "intensity": "853da9633ebaf9f61f3ad56c01325a850a854a6f367f104a07830f0798f9a308",
+          "categorical": "75655b3f140641ee890c5f5a641b4c4ec138bd5a46ac85bb61570f3e99da3ba2"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_transverse_vertical_m20",
+      "raster": 0,
+      "shape": [
+        3,
+        9,
+        11
+      ],
+      "frames": [
+        {
+          "intensity": "299e99202ec39c9a83f0deadb7ae6083c391cc4e9f921619410ed497565fd989",
+          "categorical": "d9e5b2337d07a1cb44393b729c399c790124e3081147b6db50301a07469890b6"
+        },
+        {
+          "intensity": "8d980fd76ff41b828443452192ef4b9c7aba24b58dbd23e3b30e34c367e60a20",
+          "categorical": "df71ca0c81a509070bb7fbc466b1a22f0f650a631240671945b20a40b61a2075"
+        },
+        {
+          "intensity": "245853199f7de90a8281e3ff7c93882a198e03867e843afaf5a6840fe1658839",
+          "categorical": "f93c3deec7cbb71a0638b4d02a1ef5bec33c2fe3ce960bba008476bf090d9a10"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_transverse_horizontal_p20",
+      "raster": 0,
+      "shape": [
+        3,
+        9,
+        11
+      ],
+      "frames": [
+        {
+          "intensity": "aad24d07117545f4cf98b9f434af304d928b5c8a20a3fe0f8fa7043d84b92b8b",
+          "categorical": "07d94c481ff9a04e50cd8f0f52c162bde3270bfeab8e31c96323e7ac359957ac"
+        },
+        {
+          "intensity": "24ebc56ef3a9d1910b38798edff7f662316c7790f42d2c496d84304698738537",
+          "categorical": "1f98edfaa5aa087a649b09570df6c7751eb8a34ba4ffd91fea89fd03557b1421"
+        },
+        {
+          "intensity": "011988819b302826e3b25b0dcbd9199c1d412b51c6a69a3bd0e8a6abc1bc1972",
+          "categorical": "42196bad99864f0a49aff408fa9abd890c84d053ba2829d25b6b1164e6ed917d"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_transverse_horizontal_m20",
+      "raster": 0,
+      "shape": [
+        3,
+        9,
+        11
+      ],
+      "frames": [
+        {
+          "intensity": "ba04e8395542c5fafb6c6e81bb93a1831bdbd1779c289592909497c019111eb7",
+          "categorical": "71d1b97279fd0f6ef588a91387d81242450eb9d13910431b274c4940a0e0f47a"
+        },
+        {
+          "intensity": "d006a915ec55d9226e6e4399da160b3a578ba7e9876f040f3427a6032716276c",
+          "categorical": "53a61331095f2a0d645db8960dbdcc3c004564500c2a2ab87bec602f848305ec"
+        },
+        {
+          "intensity": "c582a862e7264f3ca7075d8a65bc4ee34b63cad1c27f165e46fd02fa8f57d1cd",
+          "categorical": "4712b096c399572171e0ac312de06d921c2e6f8b2362dee6e1dfbef3dc290cd5"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_sagittal_vertical_p20",
+      "raster": 0,
+      "shape": [
+        3,
+        11,
+        9
+      ],
+      "frames": [
+        {
+          "intensity": "e93f7ee3397bfc816f59befbc2f860696e213d0ec5f1e638f2075519ebfbd5a3",
+          "categorical": "5365e41d690966da94146e7bbdf8d08499871ace520231ab2586384b5ffbfce8"
+        },
+        {
+          "intensity": "d9e1f743d0130056d1d57821a0f6d3f459a14df6f741ba0bd18cced1a6c527b1",
+          "categorical": "8a597343716bf12bd83f257d5def88bcaf737df05bf2da8194892c5ec660bb97"
+        },
+        {
+          "intensity": "9878c242b2b3ac75609e2db38152f8f33f57ef25fa09275870e0df09fcb21c9b",
+          "categorical": "f3b174a0cce36447efedb0267a6c0748517f980208e82cca45bc5fc73ede4fa7"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_sagittal_vertical_m20",
+      "raster": 0,
+      "shape": [
+        3,
+        11,
+        9
+      ],
+      "frames": [
+        {
+          "intensity": "e93f7ee3397bfc816f59befbc2f860696e213d0ec5f1e638f2075519ebfbd5a3",
+          "categorical": "5365e41d690966da94146e7bbdf8d08499871ace520231ab2586384b5ffbfce8"
+        },
+        {
+          "intensity": "a5d2dff4db2a6f2821523a7255ae5642e8ea2266014dc2a63f0baaadac4de1ad",
+          "categorical": "f54217f7d562068f0e1879e2ceedf46732af8db72f1626cd83f3490a14f04059"
+        },
+        {
+          "intensity": "fc0409651c790b3690b7068054aea77bccd09cd3298cea24d2df57f8d1301d8b",
+          "categorical": "09b97e6d461bf1725e427f2202e129e86586f375b5e31f1c4da22a200bb1ae91"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_sagittal_horizontal_p20",
+      "raster": 0,
+      "shape": [
+        3,
+        11,
+        9
+      ],
+      "frames": [
+        {
+          "intensity": "314887e166481cc791714b656a91ecd8239a21db96319f4d64f03ed422d7ab65",
+          "categorical": "f17ffdc9c474b323d68b9cd2317b71ddad0f76d84f53a45e75460852d71d9365"
+        },
+        {
+          "intensity": "5476b077c815ace2bdbb003bf8130902adfebb82c4c82256fdca22a19eedf842",
+          "categorical": "96d950b4130362351e1e0686b8c6e39ca0d2918c7a987470077c59783948243a"
+        },
+        {
+          "intensity": "4d9252102885569918b4cb3035def3632cad95ceccfedf46fdddbf57888d2720",
+          "categorical": "5badd4d76a9b110ac4cbf71fa4ac08b9f1e09c705248d5d76e2539087bdd3be8"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_sagittal_horizontal_m20",
+      "raster": 0,
+      "shape": [
+        3,
+        11,
+        9
+      ],
+      "frames": [
+        {
+          "intensity": "71b69512e9f94db22af9cd6514de616edc04df66562a6d6fd5ae5222ca634c4c",
+          "categorical": "c89232c058e2108e67a0de9baa567efe8b12226944bbba5b01b93b5426fb9d2b"
+        },
+        {
+          "intensity": "db8bef51ba97b1cda1c40c30f283422b7e9034aa0426e7294d78c37374ff6d75",
+          "categorical": "03dc006f872c40b68f1c714e464d5667d09d493c1ca482a37e05dcc00e5aa1d0"
+        },
+        {
+          "intensity": "ec84ff240a44eae1f1f6c9e092d794079555cd28da8b051dd685dbc4dbf09ba0",
+          "categorical": "c6a70bca472bdb3ade2eee6965ee0f407438a4599b046c98aedefec93476ecb5"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_coronal_vertical_p20",
+      "raster": 0,
+      "shape": [
+        3,
+        13,
+        9
+      ],
+      "frames": [
+        {
+          "intensity": "7b67f81dea56d9dbe506042eae7a376449b402263409c58c388c4f61a6fe7a30",
+          "categorical": "2001ac40cc4e04ff429031e1a097a64ee510c0905b324c94fd5c4717f2514ba2"
+        },
+        {
+          "intensity": "72b05df9fb08bafdcfb2e94d2bc489c5728801282dbadf1dc25958b26a34b982",
+          "categorical": "e935695d7b1f81ba4318c0b0bd4c170c2ba33050a713ebef11cd4394c85ebc87"
+        },
+        {
+          "intensity": "cb4520c43cfdd8e0d22b8f86b59701ed75ecde1ffb542b75668e8a402734eaa9",
+          "categorical": "9236119d3f7c2e4092071f237170565e0df9e33130b6e77add5bdcfd2ce43ba7"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_coronal_vertical_m20",
+      "raster": 0,
+      "shape": [
+        3,
+        13,
+        9
+      ],
+      "frames": [
+        {
+          "intensity": "7b67f81dea56d9dbe506042eae7a376449b402263409c58c388c4f61a6fe7a30",
+          "categorical": "2001ac40cc4e04ff429031e1a097a64ee510c0905b324c94fd5c4717f2514ba2"
+        },
+        {
+          "intensity": "3a3418886e47c939d1031b1b757d53881324e0a02e1fb2378ffeabe2282ef469",
+          "categorical": "43c351e1c073ac0301e95fdbd5f2f91270ae17e1cf95ec4badf1886021b3039f"
+        },
+        {
+          "intensity": "c84875653e6833489882201ad8fba72be2b9dbd6bbff8571068b87d83afad1b2",
+          "categorical": "b51de5e56ebf96f48eadca9378bf261dc8271cadfc9d93654a487308fe0c45af"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_coronal_horizontal_p20",
+      "raster": 0,
+      "shape": [
+        3,
+        13,
+        9
+      ],
+      "frames": [
+        {
+          "intensity": "2136b300c2d23a5ad35a5cda501cec4f7864482dc8df5d38b2c7b011b5a24599",
+          "categorical": "b691a4896c8d182a55acb98d877ebf89c6b5e16e17fa678c19aa987b420ca06f"
+        },
+        {
+          "intensity": "f2e4b5046068d2bb776d75df09cd1ebb81a5a8bf3323825bb9636fda90b4af19",
+          "categorical": "2ff68156c88f4bd9c80d1b6eadd99d368ec9cb6182d38a0b051837d43e4ad85f"
+        },
+        {
+          "intensity": "34c61673c000405f7cfde63f99f76a62b09e35e4cb8b58b4233e2f8c87b32ed3",
+          "categorical": "2b3af3753a548bea1982cd02682228235b32c43ee739e00a10c95b732d6805ef"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_coronal_horizontal_m20",
+      "raster": 0,
+      "shape": [
+        3,
+        13,
+        9
+      ],
+      "frames": [
+        {
+          "intensity": "16048fec295dd1da4637e5b8476e9c6137913feabc638afb486b76bdd5e41503",
+          "categorical": "ec332914efbcf56d87f8be8cf2410c43761d3840208c96d8fb2acea4d08edd16"
+        },
+        {
+          "intensity": "ede13b22549ca8994332e434fb914e984c35da541c58eeceb826a35d6e2e9f72",
+          "categorical": "caefb863f19308fecf20062a83421aba64cfad4d23bf19b4dfe46b2de1506d3d"
+        },
+        {
+          "intensity": "925b83d9f9343c67be8c19e2a2879dcf5f9a01db28cbb31d9a03202dad9719e2",
+          "categorical": "da040c51c784742c1e4bf70b5f75f9defcaf82a66c8d4a33639059bbb426f326"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_transverse",
+      "raster": 7,
+      "shape": [
+        3,
+        7,
+        7
+      ],
+      "frames": [
+        {
+          "intensity": "741f0996c5c960359e1a9f651cfa4b837f9bd42c6e5fbf10a52ccf5eba94540f",
+          "categorical": "979c3d69953409295e4a8d58e754169395adca69de8c18ed5659c2c0a51f323a"
+        },
+        {
+          "intensity": "a386ea47610d483eb53fb15768dbcea63cc32a4a9364b9728a8ff4a117180e71",
+          "categorical": "c1c9d987035ad5c3e1db7a94bcf0fc543fbb5244438f71cfda7399d0e228376f"
+        },
+        {
+          "intensity": "07eb803bcf5f178d7ab4e8e9dedcf4703123960aa63f0af6736673a76e45a72b",
+          "categorical": "148d1d646c8994bb12668f585ec7b99bff1bfd44cf6b899ea36875043868aed3"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_sagittal",
+      "raster": 7,
+      "shape": [
+        3,
+        7,
+        7
+      ],
+      "frames": [
+        {
+          "intensity": "a8e9063e9cb8636c7cae3d6a4539d1db76528e0499ea8806ba49cefd36b85f71",
+          "categorical": "38b93cffa6dc79a1bc5f022772d9566ad9bc4eeb66ddf2617a6e2c3f0f2407fd"
+        },
+        {
+          "intensity": "b705db0e062be3f047cce3342a885157ce570966411269c9ad98d27e52efceec",
+          "categorical": "d76f235ebb62ac13efd19143ea99633f7802b39979574270c20ca34cabb1c976"
+        },
+        {
+          "intensity": "496c46b91269e45b5bde2785e3d5d3a4cfb8103e3d0e335f7cd23902d358fefd",
+          "categorical": "19cf9c8a80fc96527c90d8d7e82c734ffce19f3d1e1d191b8143dbf8bdc97c85"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_coronal",
+      "raster": 7,
+      "shape": [
+        3,
+        7,
+        7
+      ],
+      "frames": [
+        {
+          "intensity": "e6624b7aac3e75ea4de3f4b8740fab235d36201b3b8f7ea4b4c53c6cc54fc3a0",
+          "categorical": "e1d6c3e59f3f966c9133d183c431444883391785add6640423864c9ea435f7ee"
+        },
+        {
+          "intensity": "148a5b4e4ddc0c72b638bd1ee2bf03ca3ca5212f90ecd7d143bfc7704c9b06f7",
+          "categorical": "86007df53edf326063875ef4b080fffde1bec7a8e4395b8e2a58b1d33a452a30"
+        },
+        {
+          "intensity": "6950cb74beb62ab5ac869ae65ef35d76f62e01e4f59b25e8dca35e7bd1ab4005",
+          "categorical": "363c63ea56be3988b5dc26647e7b73c94f7c9a074501ea400373754b916c8d48"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_transverse_vertical_p20",
+      "raster": 7,
+      "shape": [
+        3,
+        7,
+        7
+      ],
+      "frames": [
+        {
+          "intensity": "741f0996c5c960359e1a9f651cfa4b837f9bd42c6e5fbf10a52ccf5eba94540f",
+          "categorical": "979c3d69953409295e4a8d58e754169395adca69de8c18ed5659c2c0a51f323a"
+        },
+        {
+          "intensity": "2449c1676391b3dcc25f1d0f27caddfc3e4aeb219c60fd02fb5658bcda4dbab5",
+          "categorical": "59967f0151170d48a66eb87cdd367d7de27bdcea464c2d5e747ffaa932fc1767"
+        },
+        {
+          "intensity": "f3e0b8fcbddd2eee93f4c07ba3cb47a01c91c71db3c46c459f2b21a561d77905",
+          "categorical": "5564992a1b5ced5f02d5ab385be01cde5ba661da89f6335a13de75489dea3730"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_transverse_vertical_m20",
+      "raster": 7,
+      "shape": [
+        3,
+        7,
+        7
+      ],
+      "frames": [
+        {
+          "intensity": "741f0996c5c960359e1a9f651cfa4b837f9bd42c6e5fbf10a52ccf5eba94540f",
+          "categorical": "979c3d69953409295e4a8d58e754169395adca69de8c18ed5659c2c0a51f323a"
+        },
+        {
+          "intensity": "dcb14713e2acf4d82eda6e54a4f9352c8aa03ac5ee7d2ce4cfb737d59f0e15d6",
+          "categorical": "54e0f6ad5ee6fd79a9fb23568099da583fc023471d8d102d2b55d19b6a250535"
+        },
+        {
+          "intensity": "39bf196b16998a09faa9e4b0bf692d3bc53bae337eea37f3ccefd819c9f8289d",
+          "categorical": "0caa4cf88e74b455b2f3718510bea2e3e42e14d2decd8cb5e0a710f187afd53d"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_transverse_horizontal_p20",
+      "raster": 7,
+      "shape": [
+        3,
+        7,
+        7
+      ],
+      "frames": [
+        {
+          "intensity": "1f246d0f5a9a6f716fb33f0a579d7adb31a2df2808e7d1ca1fa4c8e04641b7cf",
+          "categorical": "ec8f42cdf120df25c16e25669c5bd5923761ad9ab9a5aa3484338ddd4f4d3537"
+        },
+        {
+          "intensity": "105db9b6b72fe8ff6f10f4d1ba10d16ad093400d15ccf42579926ee1d41af046",
+          "categorical": "234d86e0dbd7f7fd7e037cecad3045244db5546a7afe8124a52f2a58ab4f0796"
+        },
+        {
+          "intensity": "43d6f9160d68037b9cea5dee6a2765a2d61eeb1a19e89ff88e60aff9c337a01a",
+          "categorical": "ce739b0f987c519c47181ffe872fa0415ffb2a0432e6654f566001fd46f43067"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_transverse_horizontal_m20",
+      "raster": 7,
+      "shape": [
+        3,
+        7,
+        7
+      ],
+      "frames": [
+        {
+          "intensity": "667d307e4584128be7254ae83f486ffe8bb39ce632c413287a23ffd5009f6a6e",
+          "categorical": "a398c8cdd66cc4272dc2cfb06fd6089b8cfc8f5952bddbe706a31c5a66262f60"
+        },
+        {
+          "intensity": "de9ebdeca85c0369f640de940f171d061bb3b7e5624baa734bea3120ded643b2",
+          "categorical": "f006751ec36dabc4c24662c19e5eca0bcc1999cb49b222ab9cfdc1d74d9acba9"
+        },
+        {
+          "intensity": "c09d4ee1d54abc3fb1f754be868a3f95de3855b9dde6a0801b6881e787cbd77b",
+          "categorical": "1fac722317514127839969770199f837a67bbe71f58665e7af23bd6d3abd61d1"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_sagittal_vertical_p20",
+      "raster": 7,
+      "shape": [
+        3,
+        7,
+        7
+      ],
+      "frames": [
+        {
+          "intensity": "a8e9063e9cb8636c7cae3d6a4539d1db76528e0499ea8806ba49cefd36b85f71",
+          "categorical": "38b93cffa6dc79a1bc5f022772d9566ad9bc4eeb66ddf2617a6e2c3f0f2407fd"
+        },
+        {
+          "intensity": "cafd6c56c94877fe01102f239deb22edadba4639ef4df569f35fec43f978774e",
+          "categorical": "f372b34837f203b603b08e4ccdf7632a1ec388b124d6003e11c29f1de113a45d"
+        },
+        {
+          "intensity": "cc3bc2653e3ce870fde3326db294aff2c8e60f7b2a8f676fb00772dd5b37915a",
+          "categorical": "1a2cec187bee2a0f74d1e926df6f0b8aca5d2a72e4995088b6b0d255ffd85963"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_sagittal_vertical_m20",
+      "raster": 7,
+      "shape": [
+        3,
+        7,
+        7
+      ],
+      "frames": [
+        {
+          "intensity": "a8e9063e9cb8636c7cae3d6a4539d1db76528e0499ea8806ba49cefd36b85f71",
+          "categorical": "38b93cffa6dc79a1bc5f022772d9566ad9bc4eeb66ddf2617a6e2c3f0f2407fd"
+        },
+        {
+          "intensity": "c64f188af348a41b00063f6492b19e3fe1e15e0998a47f77faafbe00d1a9c56e",
+          "categorical": "7d783af115ebc8c2473da6004622ee34de7b59c76be1b976226e29a0554f1341"
+        },
+        {
+          "intensity": "c9251f97efb3f64a37f0a8db343cf4d430cd8a5eed156f8e5b4917905ec41ad8",
+          "categorical": "d64169fe5c76934cb0fc1fb08225797b5539342f67cc0e6db9fe00f9fc20a55a"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_sagittal_horizontal_p20",
+      "raster": 7,
+      "shape": [
+        3,
+        7,
+        7
+      ],
+      "frames": [
+        {
+          "intensity": "1966c142127503687538782d9cc9852881b5b8f23e2dd798a81eda0f49e8eef9",
+          "categorical": "cfd0ce72a67612c04c3c1da14e0ca35bb195dd1de4d6e3d4e425724a166cc837"
+        },
+        {
+          "intensity": "f54e70851600e82e5ed843a8ff7af420485357e00d45fbb0dd6a9039d3de4362",
+          "categorical": "14a0d203c86ba55a56defac7b0d975cb30524781fed29b0dbc0367ae0584073b"
+        },
+        {
+          "intensity": "85e70dec9f1782b2e3f8990d03da7b980daf9078d86a1fb5b3cb9f44914f21b1",
+          "categorical": "d9c7e19eba62d4a5c0559848d0f4165673293acf36ad07a38d63169e1507db96"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_sagittal_horizontal_m20",
+      "raster": 7,
+      "shape": [
+        3,
+        7,
+        7
+      ],
+      "frames": [
+        {
+          "intensity": "4572b726b705071ef6bec5b7f9aea7de8ad5ef0a185a15b5fa32098456e28a12",
+          "categorical": "b1a43444d0069bdbc8254237cbafd57f8279d59806705c663259d679dee9ce8f"
+        },
+        {
+          "intensity": "410a15d0d098b9bb765e7bd3e4ce7df2e43d59a45f5585abbf1341c9e1fcd78f",
+          "categorical": "8994d96fa9451cf7783046826410dea1db8e695a20393ccfb3ddba26ed7eed37"
+        },
+        {
+          "intensity": "4a00cdca72dafecbd11749f5ab97ce39ff6e2d7f6a20e9730cb8870353e76343",
+          "categorical": "652b80a5ef188909bb6d8810d7aae44bf4310009664f5e1a2cdf666a2d144ac9"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_coronal_vertical_p20",
+      "raster": 7,
+      "shape": [
+        3,
+        7,
+        7
+      ],
+      "frames": [
+        {
+          "intensity": "e6624b7aac3e75ea4de3f4b8740fab235d36201b3b8f7ea4b4c53c6cc54fc3a0",
+          "categorical": "e1d6c3e59f3f966c9133d183c431444883391785add6640423864c9ea435f7ee"
+        },
+        {
+          "intensity": "47558f96d90e95f47ea3faae1bdcf6c144decc41167194fded01a72d72ea8088",
+          "categorical": "957410a0039e54c5e0f7866f1bdff3c6cdac3b9a598e62ca30fa03b523a900b2"
+        },
+        {
+          "intensity": "ae7a71982997904d03fd012b8e1864c777dc07561f7a3bf965c565d500d64d7c",
+          "categorical": "5e16576d3ed1ea8687c12667d19915f08fb6b0a30fd37185796f0d18571ddb1c"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_coronal_vertical_m20",
+      "raster": 7,
+      "shape": [
+        3,
+        7,
+        7
+      ],
+      "frames": [
+        {
+          "intensity": "e6624b7aac3e75ea4de3f4b8740fab235d36201b3b8f7ea4b4c53c6cc54fc3a0",
+          "categorical": "e1d6c3e59f3f966c9133d183c431444883391785add6640423864c9ea435f7ee"
+        },
+        {
+          "intensity": "4ff9f42af9e60ae45a46af8cf056f0cd2d0e337eaf3f3c1cadf5629ae88289c4",
+          "categorical": "a83311eb5e1f67863b1f8dfc34bcbcb1f9276ecbd752be8d75aecaff582ab5d3"
+        },
+        {
+          "intensity": "6c337bf0050b9e98d083d1f53d06a41c00c49b0859111cffd31fe915d507113d",
+          "categorical": "83b62ce43dc8565505c49c581b7f64ac911be87be7e63dfb58aea9f8218c4e28"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_coronal_horizontal_p20",
+      "raster": 7,
+      "shape": [
+        3,
+        7,
+        7
+      ],
+      "frames": [
+        {
+          "intensity": "dfc9d21718142e84e760f1eb1dbbbb2b297529c92a47be4b9890c35d1b9378dc",
+          "categorical": "2ffdfa1e94acc47f1538ca41d6e894815f8953b1865ce868f850fd2f8734e591"
+        },
+        {
+          "intensity": "74cf241db06c0d84651032b5e35c5d757ea0eb06f6f6fd53706ca24f8e504821",
+          "categorical": "835ff20d62dd9def084d85d18fa2df963932e709cb92bedd952c78207e538afa"
+        },
+        {
+          "intensity": "39ef7dae3ad3f17232c04f3bc64dc8e7ef39d0e4407a3f930c469ea71509cfb6",
+          "categorical": "5fa15ce2f8b73654b682a7b34fdff7831ff45e73976ba9a06bdf96d5429eb47e"
+        }
+      ]
+    },
+    {
+      "name": "azimuthal_tilted_coronal_horizontal_m20",
+      "raster": 7,
+      "shape": [
+        3,
+        7,
+        7
+      ],
+      "frames": [
+        {
+          "intensity": "718b2afbb6d1a13a79ef0c16603afa7fd11887496b681fd5a55b1080badced2f",
+          "categorical": "ac7d7f4c0d4641006f7746c25a0f194893cc91f73188187fdab6130890c22d4e"
+        },
+        {
+          "intensity": "dc6f8a0f5c4582ee5ce5b99b86651aa74eb668d9fa7d341b529d523b9ffd6fa7",
+          "categorical": "b59065588ebcc7ce3f1babdee9ba72d656594d534c977ca774e1cdaab8ebaf99"
+        },
+        {
+          "intensity": "e87b51b4e004faa6bfea74dd7c1ab80db3616f9741a054e5d16525761ee72992",
+          "categorical": "c95be74cba478a8723666768261cf1e5dcd2dd8e3b11b31b733a8357fb1d88df"
+        }
+      ]
+    }
+  ]
+}

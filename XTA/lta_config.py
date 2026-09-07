@@ -10,11 +10,14 @@ from typing import Optional, Sequence, Tuple
 
 from .config import (
     PostprocessingRequest,
+    AzimuthalViewRequest,
     RadialViewRequest,
     TiltedViewGroup,
     resolve_cartesian_views,
     resolve_postprocessing_options,
+    resolve_azimuthal_view_requests,
     resolve_radial_view_requests,
+    parse_radial_min_radius,
     resolve_tilted_view_groups,
     resolve_tta_angles,
 )
@@ -49,12 +52,13 @@ class LtaConfig:
     device_ids: Tuple[int, ...]
     exemplar_dirs: Tuple[str, ...]
     cartesian_views: Tuple[str, ...]
-    radial_requests: Tuple[RadialViewRequest, ...]
+    azimuthal_requests: Tuple[AzimuthalViewRequest, ...]
     tilted_groups: Tuple[TiltedViewGroup, ...]
     tiles: Tuple[ResolvedTileGroup, ...]
     angles: Tuple[float, ...]
     save: LtaSaveRequest
     postprocessing: PostprocessingRequest
+    radial_requests: Tuple[RadialViewRequest, ...] = ()
 
     @property
     def has_physical_views(self) -> bool:
@@ -68,7 +72,7 @@ class LtaConfig:
         return any(
             not str(request.view).startswith("tilted_")
             or str(request.view)[len("tilted_") :] in tilted_bases
-            for request in self.radial_requests
+            for request in (*self.azimuthal_requests, *self.radial_requests)
         )
 
 
@@ -178,11 +182,20 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         ),
     )
     parser.add_argument(
-        "--enable_radial",
+        "--enable_azimuthal",
         nargs="+",
         default=None,
         metavar="VIEWS[:AZIMUTH_ANGLE]",
-        help="Planned structured Radial view groups; production execution is not yet connected",
+        help="Planned structured Azimuthal view groups; production execution is not yet connected",
+    )
+    parser.add_argument(
+        "--enable_radial", nargs="+", default=None, metavar="VIEW",
+        help="Planned dense cylindrical-shell views with 1008-pixel patches; production execution is not yet connected",
+    )
+    parser.add_argument(
+        "--radial_min_radius", default=None, type=parse_radial_min_radius,
+        metavar="RADIUS|auto",
+        help="Minimum shell radius; auto selects 1008/(4*pi), two wraps per patch",
     )
     parser.add_argument(
         "--enable_tilted",
@@ -264,6 +277,7 @@ def resolve_lta_config(args: argparse.Namespace) -> LtaConfig:
         device_ids=resolve_lta_device_ids(args.device),
         exemplar_dirs=exemplar_dirs,
         cartesian_views=tuple(resolve_cartesian_views(args.enable_cartesian)),
+        azimuthal_requests=tuple(resolve_azimuthal_view_requests(args.enable_azimuthal)),
         radial_requests=tuple(resolve_radial_view_requests(args.enable_radial)),
         tilted_groups=tuple(resolve_tilted_view_groups(args.enable_tilted)),
         tiles=tuple(resolve_tile_groups(args.enable_tile)),
@@ -274,7 +288,7 @@ def resolve_lta_config(args: argparse.Namespace) -> LtaConfig:
     if not config.has_physical_views:
         raise ValueError(
             "No LTA inference views are active. Enable at least one view with "
-            "--enable_cartesian, --enable_tilted, or --enable_radial; "
+            "--enable_cartesian, --enable_tilted, --enable_azimuthal, or --enable_radial; "
             "--enable_tile does not create a parent view"
         )
     return config

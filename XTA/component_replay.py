@@ -213,6 +213,7 @@ def load_component_replay(path: Path) -> ComponentProjectionReplay:
         raise ValueError('Component replay ViewInfo fields differ from this runtime')
     view_data = dict(value['view'])
     view_data['azimuths_deg'] = tuple(float(angle) for angle in view_data['azimuths_deg'])
+    view_data['radial_radii'] = tuple(float(radius) for radius in view_data['radial_radii'])
     view = ViewInfo(**view_data)
     output_shape = tuple(int(dimension) for dimension in value['out_shape_tyx'])
     if len(output_shape) != 3 or min(output_shape) <= 0:

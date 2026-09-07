@@ -29,7 +29,7 @@ class LtaConfigTests(unittest.TestCase):
             "--device", "3,1", "cuda:2", "gpu:1",
             "--exemplar", "positive-a", "positive-b",
             "--enable_cartesian", "sagittal,transverse",
-            "--enable_radial", "transverse:2.5", "tilted_coronal:auto",
+            "--enable_azimuthal", "transverse:2.5", "tilted_coronal:auto",
             "--enable_tilted", "coronal:15:horizontal",
             "--enable_tile", "512:256", "128:64",
             "--angle", "240,0",
@@ -44,7 +44,7 @@ class LtaConfigTests(unittest.TestCase):
         self.assertEqual(config.args.exemplar_index_origin, 1)
         self.assertEqual(config.cartesian_views, ("sagittal", "transverse"))
         self.assertEqual(
-            [(request.view, request.azimuth_angle) for request in config.radial_requests],
+            [(request.view, request.azimuth_angle) for request in config.azimuthal_requests],
             [("transverse", 2.5), ("tilted_coronal", None)],
         )
         self.assertEqual(config.tilted_groups[0].views, ("coronal",))

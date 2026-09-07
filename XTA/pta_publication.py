@@ -427,7 +427,7 @@ class PtaDatasetImageSink:
 
     def __call__(self, batch: CanonicalRenderBatch) -> None:
         for path_value, item in zip(batch.paths, batch.items):
-            if item.synthetic_padding or item.radial_padding:
+            if item.synthetic_padding or item.azimuthal_padding:
                 continue
             write_image(
                 Path(path_value),
@@ -475,7 +475,7 @@ def publish_pta_candidate_image_batch(
                 result_index=int(cand.frame_idx),
                 center_index=int(cand.frame_idx),
                 synthetic_padding=False,
-                radial_padding=False,
+                azimuthal_padding=False,
                 frame=frame,
                 request=request,
             ),

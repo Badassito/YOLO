@@ -22,10 +22,10 @@ def run_worker(result_path: Path) -> None:
     shape = (13, 17, 19)
     target = (15, 21, 23)
     all_views = geometry.get_view_infos(*shape, cartesian_views=[],
-        radial_views=['transverse', 'sagittal', 'coronal', 'tilted_transverse', 'tilted_sagittal', 'tilted_coronal'],
-        radial_azimuth_angles=[15.0] * 6,
+        azimuthal_views=['transverse', 'sagittal', 'coronal', 'tilted_transverse', 'tilted_sagittal', 'tilted_coronal'],
+        azimuthal_azimuth_angles=[15.0] * 6,
         tilt_groups=[TiltedViewGroup(('transverse', 'sagittal', 'coronal'), (30.0,), ('vertical',))])
-    # Upright Radial and one tilt sign for each radial/orthogonal base.
+    # Upright Azimuthal and one tilt sign for each azimuthal/orthogonal base.
     selected = [v for v in all_views if not ('minus' in v.name or 'neg' in v.name)]
     rows = []
     assembly.set_final_source_output_shape(target)

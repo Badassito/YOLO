@@ -1639,9 +1639,8 @@ def _drive_workers_to_fixed_point(
                 key=lambda work_id: active_started[work_id],
             )
             remaining = (
-                active_started[oldest_work_id]
-                + float(worker_task_timeout)
-                - time.monotonic()
+                float(worker_task_timeout)
+                - (time.monotonic() - active_started[oldest_work_id])
             )
             if remaining <= 0.0:
                 raise TimeoutError(

@@ -68,15 +68,15 @@ class BackendContractTests(unittest.TestCase):
         self.assertEqual(lease.execution_slice_count, 32)
 
     def test_current_backend_capabilities_remain_explicit(self) -> None:
-        radial = TaskRequirements(
+        azimuthal = TaskRequirements(
             task_kind="fullframe",
-            view_family="radial",
+            view_family="azimuthal",
             pipeline_extent=PipelineExtent.INFER_ONLY,
             acceptable_results=frozenset({ResultContract.TASK_ARTIFACT}),
             model_io_contract="yolo-seg-raw-v1",
         )
-        self.assertTrue(cuda_local_capabilities().supports(radial))
-        self.assertFalse(openvino_local_capabilities().supports(radial))
+        self.assertTrue(cuda_local_capabilities().supports(azimuthal))
+        self.assertFalse(openvino_local_capabilities().supports(azimuthal))
         incompatible_model = TaskRequirements(
             task_kind="fullframe",
             view_family="orthogonal",
@@ -144,15 +144,15 @@ class BackendContractTests(unittest.TestCase):
         self.assertTrue(cuda_local_capabilities().supports(auxiliary))
         self.assertFalse(openvino_local_capabilities().supports(auxiliary))
 
-        tilted_radial = TaskRequirements(
+        tilted_azimuthal = TaskRequirements(
             task_kind="fullframe",
-            view_family="tilted_radial",
+            view_family="tilted_azimuthal",
             pipeline_extent=PipelineExtent.INFER_ONLY,
             acceptable_results=frozenset({ResultContract.TASK_ARTIFACT}),
             model_io_contract="yolo-seg-raw-v1",
         )
-        self.assertTrue(cuda_local_capabilities().supports(tilted_radial))
-        self.assertFalse(openvino_local_capabilities().supports(tilted_radial))
+        self.assertTrue(cuda_local_capabilities().supports(tilted_azimuthal))
+        self.assertFalse(openvino_local_capabilities().supports(tilted_azimuthal))
 
     def test_windows_artifact_paths_are_not_uri_schemes(self) -> None:
         ref = ArtifactRef(

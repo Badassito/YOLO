@@ -197,8 +197,8 @@ def proto_hole_treatment_radius() -> int:
     default = 2 if v1613_fast_bundle_active() else 0
     return max(0, min(8, _env_int('YOLO_TTA_PROTO_HOLE_RADIUS', default)))
 
-def radial_source_mode() -> str:
-    """Source sampling used by resident Radial kernels.
+def azimuthal_source_mode() -> str:
+    """Source sampling used by resident Azimuthal kernels.
 
     ``texture_linear`` (default, v16.1.8) samples through the hardware-linear 3D texture:
     measured as fast as the pointer path on the standard command while interpolating all
@@ -207,7 +207,7 @@ def radial_source_mode() -> str:
     nearest-neighbor in-plane (and sagittal/coronal stack-axis) sampling.
     """
     default = 'texture_linear'
-    raw = os.environ.get('YOLO_TTA_RADIAL_SOURCE_MODE', default).strip().lower().replace('-', '_')
+    raw = os.environ.get('YOLO_TTA_AZIMUTHAL_SOURCE_MODE', default).strip().lower().replace('-', '_')
     aliases = {
         'texture': 'texture_linear', 'texture_linear': 'texture_linear',
         'hardware_linear': 'texture_linear', 'trilinear': 'texture_linear',

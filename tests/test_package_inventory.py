@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import ast
+import copy
+import json
+import tempfile
 import textwrap
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from tools.verify_package_inventory import (
     INTENTIONALLY_CHANGED_BINDINGS,
     LOCAL_IMPORT_SEAM_MARKER,
+    MANIFEST,
+    azimuthal_rename_replacements,
+    digest,
     main as verify_inventory,
     reviewed_local_import_seams,
     stable_ast_dump,
@@ -20,6 +27,48 @@ def inspect_seams(source: str):
 
 
 class PackageInventoryTests(unittest.TestCase):
+    def test_azimuthal_rename_pins_exact_ast_without_accepting_shell_names_or_changed_math(self) -> None:
+        old = ast.parse('def radial_sample(value):\n    return value + 1\n').body[0]
+        renamed = ast.parse('def azimuthal_sample(value):\n    return value + 1\n').body[0]
+        altered = ast.parse('def azimuthal_sample(value):\n    return value + 2\n').body[0]
+        baseline_hash = digest(old)
+        record = {
+            'module': 'sample', 'baseline_sha256': baseline_hash,
+            'renamed_sha256': digest(renamed), 'baseline_name': 'radial_sample',
+            'current_name': 'azimuthal_sample',
+        }
+        manifest = {
+            'statements': [{'module': 'sample', 'sha256': baseline_hash, 'name': 'radial_sample'}],
+            'v20_azimuthal_rename': {'statements': [record]},
+        }
+        replacement = azimuthal_rename_replacements(manifest)['sample', baseline_hash]
+        self.assertEqual(replacement, digest(renamed))
+        self.assertNotEqual(replacement, digest(old), 'A new shell function reusing the old name is a different declaration')
+        self.assertNotEqual(replacement, digest(altered), 'The rename map must not normalize arithmetic changes')
+        for updates, message in (
+            ({'baseline_sha256': '0' * 64}, 'absent immutable'),
+            ({'current_name': 'radial_sample'}, 'identity mismatch'),
+            ({'renamed_sha256': 'not-a-digest'}, 'invalid reviewed'),
+        ):
+            broken = copy.deepcopy(manifest)
+            broken['v20_azimuthal_rename']['statements'][0].update(updates)
+            with self.subTest(updates=updates), self.assertRaisesRegex(RuntimeError, message):
+                azimuthal_rename_replacements(broken)
+        duplicated = copy.deepcopy(manifest)
+        duplicated['v20_azimuthal_rename']['statements'].append(record)
+        with self.assertRaisesRegex(RuntimeError, 'duplicate Azimuthal rename'):
+            azimuthal_rename_replacements(duplicated)
+
+    def test_original_inventory_cannot_be_silently_rebaselined(self) -> None:
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        manifest['statements'][0]['sha256'] = '0' * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'inventory.json'
+            path.write_text(json.dumps(manifest), encoding='utf-8')
+            with mock.patch('tools.verify_package_inventory.MANIFEST', path):
+                with self.assertRaisesRegex(RuntimeError, 'immutable inventory digest mismatch'):
+                    verify_inventory()
+
     def test_ast_dump_keeps_empty_fields_across_python_versions(self) -> None:
         function = ast.parse("def callback():\n    pass\n").body[0]
 

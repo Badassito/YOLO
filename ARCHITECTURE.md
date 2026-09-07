@@ -1,17 +1,68 @@
 # XTA architecture
 
-`GPT-6-Astra-Ultra_v19.0.4_SLURM.py` is the sole versioned launcher. It, the
+`GPT-6-Astra-Ultra_v20.0.0_SLURM.py` is the sole versioned launcher. It, the
 installed `xta` console script, and `python -m XTA` all dispatch
 through `XTA.cli.run()`.
 The implementation lives in the importable `XTA` package so spawned processes
 resolve worker functions and data types through canonical module paths.
+
+## Cylindrical view family (v20)
+
+`--enable_azimuthal VIEWS[:AZIMUTH_ANGLE]` is the former Radial view, renamed
+without changing its diameter/height sampling, half-turn symmetry, mirrored seam,
+tilted composition, interpolation or projection arithmetic. Existing command lines
+that request those views must use `--enable_azimuthal`. The new `--enable_radial`
+has a different meaning; it is not a compatibility alias.
+
+`--enable_radial VIEWS` selects concentric cylindrical shells for transverse,
+sagittal or coronal axes. The corresponding `tilted_*` tokens compose with enabled
+Tilted variants. Model axes are circumferential arc length and axial height;
+radius is the slice direction. The omitted height-sliced polar family is not added.
+
+The minimum radius is `--radial_min_radius auto` by default: `imgsz / (4*pi)` in
+working source voxels. Thus one patch spans two full circumferences at the first
+shell. An explicit finite positive radius can permit more wraps. Coverage is the
+annulus from this minimum to the largest inscribed cylinder; the central core is
+excluded. The outer radius is `(min(plane_height, plane_width)-1)/2`, centered on
+the source voxel-center grid. Invalid/empty radius ranges fail explicitly.
+
+Shells have at most one-voxel radial gaps and include both radius endpoints.
+Arc-length and height pixels retain one-voxel spacing. Each shell is covered by
+`imgsz`-square intrinsic patches with real periodic data beyond the 0/360 seam.
+The last height band overlaps its predecessor; a source height smaller than a
+patch is zero-padded. No axis is stretched to fill the square. Dense coverage
+means every source voxel center in the declared annulus participates in the
+intensity interpolation footprint; numerical tests enumerate actual nonzero taps.
+Categorical sampling uses nearest source voxels and remains binary.
+
+A physical patch trajectory retains its arc/height origin while stepping through
+radius. Trajectories begin when their arc origin first lies on a shell. This
+keeps contextual channels and interpolation on neighboring radii rather than
+adjacent unrelated patches; radius boundaries clamp, with no Azimuthal mirror.
+Optional `--enable_tile` ranges are extracted inside these native patches. Every
+trajectory has explicit geometry/provenance in the run and render-plan manifests;
+repeated periodic pixels are not labeled as independent views.
+
+Terminal projection uses bounded source-coordinate strips and selects the nearest
+global shell before applying a trajectory's radius offset. Every periodic patch
+occurrence contributes by OR, retaining differing model predictions in repeated
+wraps. Existing native/LQ layer publication and final source-space union apply.
+New shell inference supports the generic CPU/CUDA routes; CUDA rendering uses
+bounded source sampling. Shells do not enter the old Azimuthal sparse projector,
+fused resident ring or D1 bitset kernels. Their parent-owned CPU projection is the
+functional v20 path; further acceleration is separate optimization work.
+
+PTA requires positive `--imgsz` with Radial shells, while its existing `--imgsz 0`
+native raster mode still works for the other families. LTA geometry/planning can
+describe shells at its 1008-pixel model raster, but production LTA retains its
+existing single-Transverse/angle-zero restriction.
 
 ## Default sparse execution
 
 Full-frame, zero-angle Cartesian interpolation components retain sparse storage
 through publication. Transverse components reuse their immutable store;
 sagittal and coronal components transpose directly into packed orthogonal stores.
-Radial and tilted-Radial components invert the reference projector's discrete
+Azimuthal and tilted-Azimuthal components invert the reference projector's discrete
 ownership map and visit foreground crops directly, producing packed source-space
 stores without dense view reconstruction. Compiled kernels use the existing
 optional Numba dependency; ordinary tilted Cartesian components retain the
@@ -66,14 +117,16 @@ not imply persistence: cluster `/tmp` remains disposable after the job ends.
 | `media` | ffprobe/ffmpeg, decode/resize readiness and source-volume lifecycle |
 | `render_batch` | runtime frame-carrying `RenderBatch` values and exact model/image fan-out contracts; distinct from logical `RenderRequestBatch` planning |
 | `geometry` | authoritative CPU forward renderer, affine/view/channel/seam/tile primitives, `RasterPlan` builders, slicing and render-source geometry |
+| `cylindrical_geometry` | dense annular shell grids, periodic intrinsic patches, zero-extended source sampling and radius trajectory coordinates |
+| `cylindrical_projection` | bounded source-coordinate pull projection, discrete tilted-sample ownership and periodic occurrence union |
 | `gaussian` | one binary Gaussian numerical primitive shared by PTA preprocessing and TTA postprocessing |
 | `inference` | shared Ultralytics execution, mask payloads and inference cleanup |
 | `cuda_backend` | CUDA-resident rendering and CUDA worker-side helpers |
 | `cuda_interpolation` | Lazy CUDA bridge morphology/radius evaluation and crop-bounded painting |
 | `workers` | module-level OpenVINO and CUDA worker entry points |
 | `topology` | slice labeling, union-find and component metadata |
-| `backprojection` | radial/tilted projection plans and source-space accumulation |
-| `sparse_projection` | exact crop-driven Radial/tilted-Radial inverse ownership maps and packed source-space publication |
+| `backprojection` | azimuthal/tilted projection plans and source-space accumulation |
+| `sparse_projection` | exact crop-driven Azimuthal/tilted-Azimuthal inverse ownership maps and packed source-space publication |
 | `projection_queue` | bounded immutable-component handoff, active scratch admission and projection-future lifetime |
 | `component_replay` | bounded persistent component capture, checksummed geometry descriptors and replay loading |
 | `finalization` | source-volume fusion, object filtering and centerline processing |
@@ -251,7 +304,7 @@ Two similarly named batch types sit on opposite sides of rendering:
   are valid.
 - `render_batch.RenderBatch` carries the actual frames. A `RenderBatchItem.frame` must be the same
   object as the corresponding model-bound list element, and an attached logical request must
-  match the batch plan digest. Synthetic Cartesian tail repeats and radial seam-extension slots
+  match the batch plan digest. Synthetic Cartesian tail repeats and azimuthal seam-extension slots
   remain explicitly marked so artifact sinks can omit them.
 
 Only layout, dtype, normalization, and other backend-only conversion may occur after the
@@ -261,7 +314,7 @@ device-resident CUDA/direct TensorRT-ring capture remains unfinished and unquali
 
 Unification also uses shared operation primitives rather than duplicating mode adapters.
 `unification.channels` expands the canonical TTA channel grammar into TTA ascending or PTA
-ascending/reversed variants; shared geometry owns contextual addressing and radial mirror parity.
+ascending/reversed variants; shared geometry owns contextual addressing and azimuthal mirror parity.
 `unification.tiles` parses each strict `TILE_SIZE:TILE_STRIDE` group, while `geometry` builds the
 collapsed direct-to-output tile transform. `gaussian.binary_gaussian_pass` supplies the one
 constant-zero, truncate-4, threshold-at-0.5 numerical operation; mode-owned orchestration decides
@@ -270,7 +323,7 @@ whether it runs before geometry (PTA) or after fused prediction (TTA).
 Grouped-view duplicate behavior deliberately follows TTA. Exact repeated tilted groups and
 overlapping tilted groups that generate the same concrete signed-angle/direction view are
 deduplicated. Duplicate tile groups are errors. Duplicate Cartesian tokens and repeated
-assignment of a radial target remain errors because those forms are ambiguous under their
+assignment of a azimuthal target remain errors because those forms are ambiguous under their
 respective grammar.
 
 ## Backend boundary
@@ -395,6 +448,25 @@ python tools/smoke_import.py
 python tools/verify_package_inventory.py
 ```
 
+The v20 shell tests include actual source-tap coverage, the v19 Azimuthal pixel
+reference captured before the rename, periodic duplicates, radius-only context,
+thin tilted boundaries, and intrinsic-patch/Tile separation. On a live CUDA host:
+
+```powershell
+$env:XTA_RUN_CYLINDRICAL_CUDA_SMOKE = '1'
+$env:CUPY_CACHE_DIR = Join-Path (Get-Location) 'build/cupy-cache'
+python -B -m unittest -v tests.test_cylindrical_cuda
+```
+
+Local v20 validation on 2026-09-07 passed 819 tests with 74 skipped in aggregate
+discovery, plus the explicitly enabled CUDA corpus. Independent rendered-mask
+projection checks covered 312 intensity and 312 categorical cases. A bounded
+24-frame real-volume crop and the supplied gray PyTorch model completed both
+922-frame Radial inference and a 3,630-frame mixed Azimuthal/Radial inference run
+with 0/45-degree rotations, interpolation and nested Tiles. Native/LQ NRRDs were
+decoded and both output videos verified. This establishes functional integration,
+not full-volume accuracy or H100/TensorRT production qualification.
+
 Run the interpolation numerical corpus separately with the numerical dependencies installed;
 the aggregate dependency-light suite can replace those dependencies with stubs:
 
@@ -413,7 +485,7 @@ one-versus-four-device scheduling and final bytes are covered by deterministic s
 representative H100 execution remains a hardware qualification step:
 
 ```bash
-python -u GPT-6-Astra-Ultra_v19.0.4_SLURM.py \
+python -u GPT-6-Astra-Ultra_v20.0.0_SLURM.py \
   --mode lta \
   --input <target-video> \
   --exemplar <aligned-image-yolo-directory> \
@@ -551,7 +623,7 @@ For v18 specifically, CPU tests cover policy/plan identity, categorical and inte
 channel/tile primitives, spawn-worker contracts, manifest/ownership safety, and the implemented
 CPU-backed `RenderBatch` fan-out. A bounded, nonrepresentative GPU run qualified
 basic CUDA/Torch/CuPy execution and the resident renderer: Cartesian and tilted-Cartesian fixtures
-met the one-uint8 cross-backend tolerance, while optimized hardware-texture Radial fixtures showed
+met the one-uint8 cross-backend tolerance, while optimized hardware-texture Azimuthal fixtures showed
 backend-specific sampling differences and their Torch fallbacks remained within tolerance. This
 found no seam-index/mirror-assembly mismatch and does not authorize a sampling-policy change.
 Remaining qualification is narrower than implementation: device-resident CUDA and direct
@@ -563,7 +635,7 @@ invariants, but still needs representative user-policy dataset runs and confirma
 training loader consumes deferred replay bundles. Geometry authored inside an external policy is
 outside the built-in forward-policy guarantee.
 
-Direct Radial/Tilted rendering and resident mask quantization use 32-by-8 pixel launches,
+Direct Azimuthal/Tilted rendering and resident mask quantization use 32-by-8 pixel launches,
 avoiding flattened-index division in the output kernels. The D1 path also derives each
 slice's nonempty flag and exclusive bbox during final quantization. One tiny four-int record
 per slice is copied with the task union, so D1 does not rescan the full device volume for
@@ -632,8 +704,8 @@ worker-visible physical CUDA token.
 ### Component projection replay
 
 `--capture_component_replay PERSISTENT_DIR` copies a bounded sample of immutable
-view-native Radial components, output geometry and checksums during TTA. The default
-selects three vertical +30-degree tilted-Radial views, one component each, within a
+view-native Azimuthal components, output geometry and checksums during TTA. The default
+selects three vertical +30-degree tilted-Azimuthal views, one component each, within a
 4 GiB total input budget. `--capture_component_views` and
 `--capture_component_limit` change the selection and count. The capture directory
 must survive the job; cluster `/tmp` is unsuitable. Capture is disabled by default.
@@ -657,7 +729,7 @@ reported in submission order so concurrency does not make error selection nondet
 The scheduler treats each runtime TTA view as terminal when its full-frame/tile continuation
 has retired. As soon as every variant of one physical view is terminal, ownership of that
 group is detached from the inference registries, its variants are OR-collapsed, and any
-Radial/Tilted projection runs while other views may still be inferencing. Completed physical
+Azimuthal/Tilted projection runs while other views may still be inferencing. Completed physical
 views feed one path-backed, single-writer source-space union reducer. Equal-geometry sparse
 component layers are ORed before one restore per output slice, retaining the grouped G5
 optimization. A one-credit dense handoff prevents finalizers from retaining multiple

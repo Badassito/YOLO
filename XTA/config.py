@@ -19,9 +19,9 @@ GIB = 1024 ** 3
 
 NRRD_SPACE = "left-posterior-superior"
 
-SCRIPT_VERSION = '19.0.4'
+SCRIPT_VERSION = '20.0.0'
 
-SCRIPT_VERSION_COMPACT = '1904'
+SCRIPT_VERSION_COMPACT = '2000'
 
 SCRIPT_BASENAME = f'GPT-6-Astra-Ultra_v{SCRIPT_VERSION}_SLURM.py'
 
@@ -268,19 +268,27 @@ def resolve_postprocessing_options(
 
 CARTESIAN_VIEW_TOKENS: Tuple[str, ...] = ('transverse', 'sagittal', 'coronal')
 
-RADIAL_VIEW_TOKENS: Tuple[str, ...] = (
+AZIMUTHAL_VIEW_TOKENS: Tuple[str, ...] = (
     'transverse', 'sagittal', 'coronal',
     'tilted_transverse', 'tilted_sagittal', 'tilted_coronal',
 )
 
+RADIAL_VIEW_TOKENS: Tuple[str, ...] = AZIMUTHAL_VIEW_TOKENS
+
 TILT_DIRECTION_TOKENS: Tuple[str, ...] = ('vertical', 'horizontal', 'both')
 
 @dataclass(frozen=True)
-class RadialViewRequest:
-    """One Radial target paired with an explicit spacing or the per-view auto default."""
+class AzimuthalViewRequest:
+    """One Azimuthal target paired with an explicit spacing or the per-view auto default."""
 
     view: str
     azimuth_angle: Optional[float] = None  # None means auto/full coverage.
+
+@dataclass(frozen=True)
+class RadialViewRequest:
+    """One cylindrical-shell target, sampled densely from its minimum radius."""
+
+    view: str
 
 @dataclass(frozen=True)
 class TiltedViewGroup:
@@ -330,6 +338,31 @@ def resolve_cartesian_views(values: Sequence[str] | str | None) -> List[str]:
         valid=CARTESIAN_VIEW_TOKENS,
         flag_name='--enable_cartesian',
     )
+
+
+def resolve_radial_view_requests(
+    values: Sequence[str] | str | None,
+) -> List[RadialViewRequest]:
+    """Resolve flat shell-view targets; angular spacing belongs to Azimuthal views."""
+    return [
+        RadialViewRequest(view=view)
+        for view in _resolve_unique_view_tokens(
+            values, valid=RADIAL_VIEW_TOKENS, flag_name='--enable_radial'
+        )
+    ]
+
+
+def parse_radial_min_radius(value: str | float | None) -> Optional[float]:
+    """Accept a finite positive radius or auto (two wraps per inference patch)."""
+    if value is None or str(value).strip().lower() == 'auto':
+        return None
+    try:
+        radius = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError('--radial_min_radius must be positive or auto') from exc
+    if not math.isfinite(radius) or radius <= 0.0:
+        raise argparse.ArgumentTypeError('--radial_min_radius must be finite and > 0 or auto')
+    return radius
 
 def _structured_group_values(
     values: Sequence[str] | str | None,
@@ -449,26 +482,26 @@ def tilted_group_base_views(groups: Sequence[TiltedViewGroup]) -> List[str]:
                 out.append(str(view))
     return out
 
-def resolve_radial_view_requests(
+def resolve_azimuthal_view_requests(
     values: Sequence[str] | str | None,
-) -> List[RadialViewRequest]:
+) -> List[AzimuthalViewRequest]:
     """Resolve ``VIEWS:AZIMUTH_ANGLE`` groups into one unambiguous request per view."""
-    out: List[RadialViewRequest] = []
+    out: List[AzimuthalViewRequest] = []
     seen: set[str] = set()
-    for raw_group in _structured_group_values(values, flag_name='--enable_radial'):
+    for raw_group in _structured_group_values(values, flag_name='--enable_azimuthal'):
         view_slot, angle_slot = _split_structured_group(
             raw_group,
             slot_count=2,
-            flag_name='--enable_radial',
+            flag_name='--enable_azimuthal',
         )
         views = _resolve_unique_view_tokens(
             _parse_comma_slot(view_slot),
-            valid=RADIAL_VIEW_TOKENS,
-            flag_name=f'--enable_radial group {raw_group!r} VIEWS',
+            valid=AZIMUTHAL_VIEW_TOKENS,
+            flag_name=f'--enable_azimuthal group {raw_group!r} VIEWS',
         )
         if not views:
             raise ValueError(
-                f'--enable_radial group {raw_group!r} must specify at least one VIEW'
+                f'--enable_azimuthal group {raw_group!r} must specify at least one VIEW'
             )
         angle: Optional[float]
         angle_token = str(angle_slot).strip().lower()
@@ -477,29 +510,29 @@ def resolve_radial_view_requests(
         else:
             if len(_parse_comma_slot(angle_slot)) != 1:
                 raise ValueError(
-                    f'--enable_radial group {raw_group!r} accepts one AZIMUTH_ANGLE '
+                    f'--enable_azimuthal group {raw_group!r} accepts one AZIMUTH_ANGLE '
                     'shared by every VIEW in that group'
                 )
             try:
                 angle = float(angle_slot)
             except Exception as exc:
                 raise ValueError(
-                    f'--enable_radial group {raw_group!r} has invalid AZIMUTH_ANGLE '
+                    f'--enable_azimuthal group {raw_group!r} has invalid AZIMUTH_ANGLE '
                     f'{angle_slot!r}'
                 ) from exc
             if not math.isfinite(float(angle)) or float(angle) <= 0.0:
                 raise ValueError(
-                    f'--enable_radial group {raw_group!r} requires AZIMUTH_ANGLE '
+                    f'--enable_azimuthal group {raw_group!r} requires AZIMUTH_ANGLE '
                     f'to be greater than 0 or omitted/auto; got {angle_slot!r}'
                 )
         for view in views:
             if view in seen:
                 raise ValueError(
-                    f'--enable_radial assigns {view!r} more than once; each Radial VIEW '
+                    f'--enable_azimuthal assigns {view!r} more than once; each Azimuthal VIEW '
                     'must have exactly one paired AZIMUTH_ANGLE'
                 )
             seen.add(view)
-            out.append(RadialViewRequest(view=str(view), azimuth_angle=angle))
+            out.append(AzimuthalViewRequest(view=str(view), azimuth_angle=angle))
     return out
 
 @dataclass(frozen=True)
@@ -860,10 +893,11 @@ def build_argparser() -> argparse.ArgumentParser:
         help=(
             "Model-input channel layout. gray/grey uses center slice N as one channel; "
             "RGB triplicates N into three channels; C{odd}S{stride>=1}, e.g. C5S1, "
-            "uses neighboring view slices in ascending offset order. Radial and Tilted "
-            "Radial indices wrap; after an odd number of 0/180-degree seam crossings, "
-            "the contextual plane's radial-u axis is reversed. Cartesian and Tilted "
-            "Cartesian indices edge-clamp. "
+            "uses neighboring view slices in ascending offset order. Azimuthal and Tilted "
+            "Azimuthal indices wrap; after an odd number of 0/180-degree seam crossings, "
+            "the contextual plane's radius (u) axis is reversed. Cartesian and Tilted "
+            "Cartesian indices edge-clamp. Radial indices clamp to the radius range "
+            "of the same periodic patch. "
             "Only one value is accepted and every prediction remains assigned to N"
         ),
     )
@@ -875,7 +909,7 @@ def build_argparser() -> argparse.ArgumentParser:
             "Backend-specific static model batch. Use gpu:1 cpu:1 in hybrid mode; a "
             "single untagged value is accepted for a single-backend run. Cartesian sources "
             "extend a final partial batch by repeating the last real slice and discard those "
-            "synthetic results. Radial sources wrap across the 0/180 seam, mirror radial-u "
+            "synthetic results. Azimuthal sources wrap across the 0/180 seam, mirror radius (u) "
             "after odd seam crossings, and merge each prediction into its wrapped destination"
         ),
     )
@@ -935,19 +969,38 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--enable_radial",
+        "--enable_azimuthal",
         nargs="+",
         default=None,
         type=str,
         metavar="VIEWS[:AZIMUTH_ANGLE]",
         help=(
-            "Enable one or more structured Radial groups. VIEWS accepts comma-separated "
+            "Enable one or more structured Azimuthal groups. VIEWS accepts comma-separated "
             "transverse, sagittal, coronal, tilted_transverse, tilted_sagittal, and "
             "tilted_coronal values. AZIMUTH_ANGLE is one positive degree spacing shared by "
             "every view in its group; omission or 'auto' selects the largest per-view "
-            "full-coverage spacing. Spaces separate groups. Upright Radial targets do not "
+            "full-coverage spacing. Spaces separate groups. Upright Azimuthal targets do not "
             "require their Cartesian base, while tilted_* targets expand across every enabled "
             "Tilted variant of that base and are skipped with a log when none exist"
+        ),
+    )
+    p.add_argument(
+        "--enable_radial", nargs="+", default=None, type=str, metavar="VIEW",
+        help=(
+            "Enable dense cylindrical-shell views: transverse, sagittal, coronal, "
+            "tilted_transverse, tilted_sagittal, tilted_coronal. Radius is the slice "
+            "direction; periodic (azimuth,height) patches have --imgsz square shape. "
+            "Tiles, when enabled, sample within those patches. Tilted targets expand "
+            "over the corresponding enabled Tilted variants"
+        ),
+    )
+    p.add_argument(
+        "--radial_min_radius", default=None, type=parse_radial_min_radius,
+        metavar="RADIUS|auto",
+        help=(
+            "Smallest Radial shell radius in source voxels. Default auto is "
+            "imgsz/(4*pi), giving two complete circumference wraps per patch. "
+            "Sampling is dense from this radius outward; the central core is excluded"
         ),
     )
     p.add_argument(
@@ -1029,7 +1082,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--centerline_timeout", default=900.0, type=float,
                    help="Seconds allowed for each isolated embedded-centerline attempt before preserving the current union and using safe pass-through behavior")
     p.add_argument("--interpolation_distance", default=15, type=int,
-                   help="Maximum view-native slice/frame distance used to search for interpolation candidates. Radial interpolation wraps around frame order. 0 disables interpolation")
+                   help="Maximum view-native slice/frame distance used to search for interpolation candidates. Azimuthal interpolation wraps around frame order. 0 disables interpolation")
     p.add_argument("--interpolation_walk_back", default=1, type=int,
                    help="Additional source slices to bridge before the endpoint slice. The endpoint and first walked-back origin share output layer 1, preserving exactly N x --interpolation_candidates component NRRDs. 0 disables walk-back bridges but retains endpoint bridges")
     p.add_argument("--interpolation_candidates", default=1, type=int,
@@ -1041,9 +1094,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--interpolation_search_angle", default=15.0, type=float,
                    help="Projection growth angle in degrees. Must be greater than -90 and less than 90")
     p.add_argument("--capture_component_replay", default=None, type=str, metavar="PERSISTENT_DIR",
-                   help="Copy a bounded sample of view-native Radial bridge components for isolated projection replay; must survive job completion")
+                   help="Copy a bounded sample of view-native Azimuthal bridge components for isolated projection replay; must survive job completion")
     p.add_argument("--capture_component_views", nargs='+', default=None, metavar="VIEW_GLOB",
-                   help="Replay capture view names/globs; default selects vertical +30 degree tilted Radial transverse, sagittal and coronal")
+                   help="Replay capture view names/globs; default selects vertical +30 degree tilted Azimuthal transverse, sagittal and coronal")
     p.add_argument("--capture_component_limit", default=3, type=int, metavar="N",
                    help="Maximum component replay captures (one per selected view, 4 GiB total); default 3")
 

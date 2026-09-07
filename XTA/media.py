@@ -26,7 +26,7 @@ from ._deps import cv2, tqdm
 
 from .config import (
     GIB,
-    RadialViewRequest,
+    AzimuthalViewRequest,
 )
 
 # Explicit lower-layer dependencies keep imports one-way.
@@ -47,7 +47,7 @@ from .runtime import (
 
 
 if TYPE_CHECKING:
-    from .backprojection import radial_full_coverage_angle_deg
+    from .backprojection import azimuthal_full_coverage_angle_deg
 
 def _require_bin(name: str) -> None:
     if shutil.which(name) is None:
@@ -1197,25 +1197,25 @@ def restore_mask_volume_to_original_shape(
     )
     return out_mm
 
-def resolve_radial_azimuth_angles(
-    requests: Sequence[RadialViewRequest],
+def resolve_azimuthal_azimuth_angles(
+    requests: Sequence[AzimuthalViewRequest],
     *,
     diameters: Sequence[int],
 ) -> List[float]:
-    """Resolve each Radial request's paired spacing after its diameter is known."""
+    """Resolve each Azimuthal request's paired spacing after its diameter is known."""
     # Local import keeps the package dependency graph acyclic.
-    from .backprojection import radial_full_coverage_angle_deg
+    from .backprojection import azimuthal_full_coverage_angle_deg
 
     request_list = list(requests)
     if len(diameters) != len(request_list):
         raise ValueError(
-            f'internal radial diameter count mismatch: {len(diameters)} diameter(s) for '
+            f'internal azimuthal diameter count mismatch: {len(diameters)} diameter(s) for '
             f'{len(request_list)} request(s)'
         )
     resolved: List[float] = []
     for request, diameter in zip(request_list, diameters):
         if request.azimuth_angle is None:
-            resolved.append(radial_full_coverage_angle_deg(int(diameter)))
+            resolved.append(azimuthal_full_coverage_angle_deg(int(diameter)))
         else:
             resolved.append(float(request.azimuth_angle))
     return resolved

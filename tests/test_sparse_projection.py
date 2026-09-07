@@ -1,4 +1,4 @@
-"""Sparse projector equality against actual legacy Radial projection operators."""
+"""Sparse projector equality against actual legacy Azimuthal projection operators."""
 from __future__ import annotations
 
 import contextlib
@@ -24,11 +24,11 @@ HAS_NATIVE = bool(getattr(geometry.cv2, '__file__', None))
 
 def views(shape=(9, 11, 13), spacing=45.0, native_raster=0):
     all_views = geometry.get_view_infos(*shape, cartesian_views=[],
-        radial_views=['transverse', 'sagittal', 'coronal', 'tilted_transverse', 'tilted_sagittal', 'tilted_coronal'],
-        radial_azimuth_angles=[spacing]*6,
+        azimuthal_views=['transverse', 'sagittal', 'coronal', 'tilted_transverse', 'tilted_sagittal', 'tilted_coronal'],
+        azimuthal_azimuth_angles=[spacing]*6,
         tilt_groups=[TiltedViewGroup(('transverse', 'sagittal', 'coronal'), (30.0,), ('vertical', 'horizontal'))],
-        radial_native_raster=native_raster)
-    return [view for view in all_views if view.family == 'radial']
+        azimuthal_native_raster=native_raster)
+    return [view for view in all_views if view.family == 'azimuthal']
 
 
 def read_store(path):
@@ -40,7 +40,7 @@ def read_store(path):
 
 
 @unittest.skipUnless(HAS_NATIVE, 'Native OpenCV unavailable')
-class SparseRadialProjectionTests(unittest.TestCase):
+class SparseAzimuthalProjectionTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -60,7 +60,7 @@ class SparseRadialProjectionTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             source_path = root/'input.cvol'
             write_raw_bbox_mask_store(data, source_path, format_name=fmt, desc='test input', workers=1)
-            oracle = backprojection.backproject_radial_volume_to_volume(data, view, root/'oracle.dat',
+            oracle = backprojection.backproject_azimuthal_volume_to_volume(data, view, root/'oracle.dat',
                 'numerical oracle', prefer_memory=True, reserve_bytes=0, workers=2, out_shape_tyx=target_shape)
             expected = np.asarray(oracle).copy()
             close_memmap_array(oracle)
@@ -70,7 +70,7 @@ class SparseRadialProjectionTests(unittest.TestCase):
                 # the view or even ask the adapter to decode a complete source slice.
                 with mock.patch.object(RawBBoxMaskStore, 'decode_slice', side_effect=AssertionError('dense source decode')), \
                         mock.patch.object(RawBBoxMaskStore, 'decode_slice_crop', side_effect=AssertionError('whole crop decode')):
-                    result = sparse_projection.project_radial_sparse_store(source, view, root/'projected.cvol',
+                    result = sparse_projection.project_azimuthal_sparse_store(source, view, root/'projected.cvol',
                         out_shape_tyx=target_shape, workers=2)
                 # The helper borrows source ownership; it remains readable afterwards.
                 self.assertEqual(source.shape, data.shape)
@@ -86,7 +86,7 @@ class SparseRadialProjectionTests(unittest.TestCase):
         self.assertFalse(list(root.glob('.*.projection-*')))
         return result
 
-    def test_all_radial_bases_tilt_signs_directions_and_temporal_changes(self):
+    def test_all_azimuthal_bases_tilt_signs_directions_and_temporal_changes(self):
         rng = np.random.default_rng(9903)
         for view in views():
             data = (rng.random((view.num_slices, view.src_h, view.src_w)) < 0.12).astype(np.uint8)
@@ -117,10 +117,10 @@ class SparseRadialProjectionTests(unittest.TestCase):
     def test_map_strip_equations_equal_actual_dense_map_and_cache_is_bounded(self):
         for view in views(shape=(9, 11, 13), spacing=37.0)[::2]:
             probe = np.zeros((view.num_slices, view.src_h, view.src_w), np.uint8)
-            grid = backprojection.resolve_radial_processing_grid(probe, view)
-            plan, _ = backprojection.build_radial_backprojection_plan(view)
-            expected = backprojection._radial_dense_map_for_processing(
-                backprojection.build_dense_radial_backprojection_map(view, plan, out_shape_hw=(8, 10)), grid)
+            grid = backprojection.resolve_azimuthal_processing_grid(probe, view)
+            plan, _ = backprojection.build_azimuthal_backprojection_plan(view)
+            expected = backprojection._azimuthal_dense_map_for_processing(
+                backprojection.build_dense_azimuthal_backprojection_map(view, plan, out_shape_hw=(8, 10)), grid)
             with mock.patch.object(sparse_projection, '_MAP_STRIP_PIXELS', 20):
                 parts = list(sparse_projection._map_key_strips(view, plan, grid, (8, 10)))
             keys = np.concatenate([pair[0] for pair in parts])
@@ -155,12 +155,12 @@ class SparseRadialProjectionTests(unittest.TestCase):
         source_path = self.root/'concurrent.cvol'
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             write_raw_bbox_mask_store(data, source_path, format_name=INTERNAL_PACKED_CVOL_FORMAT, desc='input')
-            oracle = backprojection.backproject_radial_volume_to_volume(data, view, self.root/'expected.dat',
+            oracle = backprojection.backproject_azimuthal_volume_to_volume(data, view, self.root/'expected.dat',
                 'oracle', reserve_bytes=0, out_shape_tyx=(7, 8, 11))
             expected = np.asarray(oracle).copy()
             close_memmap_array(oracle)
             with ThreadPoolExecutor(max_workers=4) as pool:
-                results = list(pool.map(lambda i: sparse_projection.project_radial_sparse_store(
+                results = list(pool.map(lambda i: sparse_projection.project_azimuthal_sparse_store(
                     source_path, view, self.root/f'parallel-{i}', out_shape_tyx=(7, 8, 11), workers=2), range(4)))
         self.assertEqual(sum(bool(result['map_cache_hit']) for result in results), 3)
         for result in results:
@@ -169,9 +169,9 @@ class SparseRadialProjectionTests(unittest.TestCase):
     def test_bounded_input_slabs_and_legacy_cache_are_independent(self):
         view = replace(views()[0], center_x=5.125)
         shape = (view.num_slices, view.src_h, view.src_w)
-        before = set(backprojection._DENSE_RADIAL_BACKPROJECT_MAP_CACHE)
+        before = set(backprojection._DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE)
         sparse_projection._inverse_map(view, shape, (7, 8, 11))
-        self.assertEqual(set(backprojection._DENSE_RADIAL_BACKPROJECT_MAP_CACHE), before)
+        self.assertEqual(set(backprojection._DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE), before)
         source_path = self.root/'slabs.cvol'
         with contextlib.redirect_stdout(io.StringIO()):
             write_raw_bbox_mask_store(np.ones(shape, np.uint8), source_path,
@@ -201,13 +201,13 @@ class SparseRadialProjectionTests(unittest.TestCase):
         target.mkdir()
         (target/'keep').write_bytes(b'preserve')
         with self.assertRaises(FileExistsError):
-            sparse_projection.project_radial_sparse_store(source, view, target, out_shape_tyx=(9, 11, 13))
+            sparse_projection.project_azimuthal_sparse_store(source, view, target, out_shape_tyx=(9, 11, 13))
         self.assertEqual((target/'keep').read_bytes(), b'preserve')
         with self.assertRaises(ValueError):
-            sparse_projection.project_radial_sparse_store(source, view, source/'child', out_shape_tyx=(9, 11, 13))
+            sparse_projection.project_azimuthal_sparse_store(source, view, source/'child', out_shape_tyx=(9, 11, 13))
         with mock.patch.object(sparse_projection, '_scatter_crop', side_effect=RuntimeError('fault')):
             with self.assertRaisesRegex(RuntimeError, 'fault'):
-                sparse_projection.project_radial_sparse_store(source, view, self.root/'failed', out_shape_tyx=(9, 11, 13))
+                sparse_projection.project_azimuthal_sparse_store(source, view, self.root/'failed', out_shape_tyx=(9, 11, 13))
         # Mock's recorded call tuple can keep its borrowed mmap crop alive until
         # its cycle is collected; that external owner is not the projector's leak.
         gc.collect()

@@ -2559,7 +2559,7 @@ def build_slice_endpoint_seeds_from_label_volume(
  prohibitively slow when an object's bounding box spans a large fraction of the volume. Endpoints
  are identified from connected components in each slice that do not continue into the previous or
  next slice of the same relabeled object. When wrap_axis is true, slice 0 and the
- final slice are also considered adjacent for Radial interpolation.
+ final slice are also considered adjacent for Azimuthal interpolation.
 
  When a component cache is supplied, the scan reuses cached per-slice component tables and tests
  continuation only inside each component's crop. This makes endpoint discovery and later seed
@@ -2583,7 +2583,7 @@ def build_slice_endpoint_seeds_from_label_volume(
         if bool(wrap_axis) and z_dim > 1:
             prev_z = int((z_i - 1) % z_dim)
             next_z = int((z_i + 1) % z_dim)
-            # continuation across the radial 0°/180° wrap happens at
+            # continuation across the azimuthal 0°/180° wrap happens at
             # u -> width-1-u, not at the same u.
             prev_wrapped = z_i == 0
             next_wrapped = z_i == (z_dim - 1)
@@ -2608,7 +2608,7 @@ def build_slice_endpoint_seeds_from_label_volume(
             therefore paid O(K²) Python calls per slice.  Direct overlap has a simpler
             equivalent definition: at any pixel in this component, the adjacent canonical
             label equals ``record.label``.  Reading only this component's bbox preserves that
-            definition, including local-label LUTs and radial wrap mirroring, without building
+            definition, including local-label LUTs and azimuthal wrap mirroring, without building
             or scanning the neighbor's component list.
             """
             if neighbor_z is None:

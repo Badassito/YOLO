@@ -64,7 +64,7 @@ from .geometry import (
     _source_prediction_channel_count,
     make_prediction_ref_yolo_source,
     maybe_wrap_source_with_gpu_input_staging,
-    mirror_radial_u_output_to_native_affine,
+    mirror_azimuthal_u_output_to_native_affine,
     prediction_result_frame_spec,
     view_processing_min_radius,
 )
@@ -513,9 +513,9 @@ class PredictionAccumulationHandle:
     precompleted_prediction_count: int = 0
     precompleted_frames_with_predictions: int = 0
     pending_limit: int = 0
-    radial_padding_processed: int = 0
-    radial_padding_union_mm: Optional[np.ndarray] = None
-    radial_padding_confmap_mm: Optional[np.ndarray] = None
+    azimuthal_padding_processed: int = 0
+    azimuthal_padding_union_mm: Optional[np.ndarray] = None
+    azimuthal_padding_confmap_mm: Optional[np.ndarray] = None
 
     def wait(self) -> Dict[str, int]:
         prediction_count = int(self.precompleted_prediction_count)
@@ -529,7 +529,7 @@ class PredictionAccumulationHandle:
             'frames_with_predictions': int(frames_with_predictions),
             'submitted_frames': int(self.submitted_frames),
             'synthetic_discarded': int(self.synthetic_discarded),
-            'radial_padding_processed': int(self.radial_padding_processed),
+            'azimuthal_padding_processed': int(self.azimuthal_padding_processed),
             'async_accumulation': 1,
         }
 
@@ -2771,14 +2771,14 @@ def _prediction_accumulation_target(
     *,
     view_union_mm: np.ndarray,
     view_confmap_mm: Optional[np.ndarray],
-    radial_padding_union_mm: Optional[np.ndarray],
-    radial_padding_confmap_mm: Optional[np.ndarray],
+    azimuthal_padding_union_mm: Optional[np.ndarray],
+    azimuthal_padding_confmap_mm: Optional[np.ndarray],
     M_out_to_native: np.ndarray,
     native_w: int,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], int, np.ndarray, bool]:
     """Resolve storage, destination index, affine, and stat policy for one result."""
 
-    if not bool(spec.is_radial_padding):
+    if not bool(spec.is_azimuthal_padding):
         target_index = int(spec.task_index)
         if target_index < 0 or target_index >= int(view_union_mm.shape[0]):
             raise IndexError(
@@ -2793,27 +2793,27 @@ def _prediction_accumulation_target(
             True,
         )
 
-    if radial_padding_union_mm is not None:
-        target_union = radial_padding_union_mm
-        target_conf = radial_padding_confmap_mm
-        target_index = int(spec.radial_padding_ordinal or 0)
+    if azimuthal_padding_union_mm is not None:
+        target_union = azimuthal_padding_union_mm
+        target_conf = azimuthal_padding_confmap_mm
+        target_index = int(spec.azimuthal_padding_ordinal or 0)
     else:
         target_union = view_union_mm
         target_conf = view_confmap_mm
         target_index = int(spec.global_destination_index)
     if target_index < 0 or target_index >= int(target_union.shape[0]):
         raise IndexError(
-            f'Radial padding result {int(spec.result_index)} maps to {target_index}, but '
+            f'Azimuthal padding result {int(spec.result_index)} maps to {target_index}, but '
             f'target shape is {tuple(int(v) for v in target_union.shape)}; provide a '
-            'task-local radial padding sink for split leases'
+            'task-local azimuthal padding sink for split leases'
         )
     return (
         target_union,
         target_conf,
         target_index,
         (
-            mirror_radial_u_output_to_native_affine(M_out_to_native, int(native_w))
-            if bool(spec.mirror_radial_u)
+            mirror_azimuthal_u_output_to_native_affine(M_out_to_native, int(native_w))
+            if bool(spec.mirror_azimuthal_u)
             else np.asarray(M_out_to_native, dtype=np.float32)
         ),
         False,
@@ -2924,7 +2924,7 @@ class _ResidentGpuPipelineSlot:
         self.render_graph = None
         self.render_graph_key = None
         # Prepared once per resident source/task. Graph replay compares this cached key
-        # instead of rebuilding large Radial azimuth-byte geometry keys for every frame.
+        # instead of rebuilding large Azimuthal azimuth-byte geometry keys for every frame.
         self.render_expected_key = None
         # Keep zero-copy cupy array views alive for the lifetime of captured graphs.
         self._cupy_refs: Dict[str, object] = {}
@@ -3463,17 +3463,27 @@ def _ensure_predictor_for_direct_predict(model: object, cfg: 'PredictConfig') ->
 def _split_segmentation_backend_outputs(preds: object) -> Optional[Tuple[object, object]]:
     """Return (head, protos) from a raw segmentation forward.
 
- Mirrors SegmentationPredictor.postprocess's output handling: preds[0] is the
- (B, 4+nc+nm, A) detection head, preds[1] the (B, nm, mh, mw) prototype tensor (torch
-.pt backends nest it as the last element of a tuple). None when the structure does not
- match, so the caller can fail fast instead of mis-decoding."""
+    Accept the flat exported/TensorRT pair, the legacy PyTorch auxiliary tuple,
+    and PyTorch Segment's explicit ``((head, proto), auxiliary_dict)`` layout.
+    The latter is also preserved by AutoBackend as a list around that same pair.
+    Do not search arbitrary nested tensors: unsupported structures return None.
+    """
     try:
         if not isinstance(preds, (list, tuple)) or len(preds) < 2:
             return None
-        head = preds[0]
-        proto = preds[1]
-        if isinstance(proto, (list, tuple)):
-            proto = proto[-1]
+        if (
+            len(preds) == 2
+            and isinstance(preds[0], tuple)
+            and len(preds[0]) == 2
+            and isinstance(preds[1], dict)
+            and 'proto' in preds[1]
+        ):
+            head, proto = preds[0]
+        else:
+            head = preds[0]
+            proto = preds[1]
+            if isinstance(proto, (list, tuple)):
+                proto = proto[-1]
         if getattr(head, 'ndim', 0) != 3 or getattr(proto, 'ndim', 0) != 4:
             return None
         return head, proto
@@ -3551,6 +3561,7 @@ def _build_direct_device_compacted_payload(
             (
                 cp_head, np.int32(anchors), np.float32(confidence_threshold),
                 cp_indices, cp_count,
+                np.int32(img_h), np.int32(img_w), np.uintp(0),
             ),
             stream=external,
         )
@@ -3759,8 +3770,8 @@ def predict_source_and_accumulate(
     device_union_consumer: Optional[Callable[['_DeviceUnionAccumulator'], Dict[str, object]]] = None,
     require_device_union: bool = False,
     require_proto_hole_treatment: bool = False,
-    radial_padding_union_mm: Optional[np.ndarray] = None,
-    radial_padding_confmap_mm: Optional[np.ndarray] = None,
+    azimuthal_padding_union_mm: Optional[np.ndarray] = None,
+    azimuthal_padding_confmap_mm: Optional[np.ndarray] = None,
 ) -> Dict[str, object]:
     """Run YOLO predict(stream=True) on an in-memory source and accumulate native masks.
 
@@ -3920,7 +3931,7 @@ def predict_source_and_accumulate(
                 prediction_count = int(specialized_stats['prediction_count'])
                 frames_with_predictions = int(specialized_stats['frames_with_predictions'])
 
-        source_padding_count = max(0, int(getattr(source, 'radial_padding_count', 0) or 0))
+        source_padding_count = max(0, int(getattr(source, 'azimuthal_padding_count', 0) or 0))
         effective_slice_locks = slice_locks
         if effective_slice_locks is None and source_padding_count > 0:
             effective_slice_locks = [
@@ -3937,8 +3948,8 @@ def predict_source_and_accumulate(
                     spec,
                     view_union_mm=view_union_mm,
                     view_confmap_mm=view_confmap_mm,
-                    radial_padding_union_mm=radial_padding_union_mm,
-                    radial_padding_confmap_mm=radial_padding_confmap_mm,
+                    azimuthal_padding_union_mm=azimuthal_padding_union_mm,
+                    azimuthal_padding_confmap_mm=azimuthal_padding_confmap_mm,
                     M_out_to_native=M_out_to_native,
                     native_w=int(native_w),
                 )
@@ -3947,7 +3958,7 @@ def predict_source_and_accumulate(
             if effective_slice_locks is not None and len(effective_slice_locks) > 0:
                 lock_index = (
                     int(spec.global_destination_index)
-                    if bool(spec.is_radial_padding) else int(spec.task_index)
+                    if bool(spec.is_azimuthal_padding) else int(spec.task_index)
                 )
                 slice_lock = effective_slice_locks[lock_index % len(effective_slice_locks)]
             if isinstance(masks_obj, GpuFlattenedRetinaPayload):
@@ -3974,7 +3985,7 @@ def predict_source_and_accumulate(
                     native_h=native_h,
                     native_w=native_w,
                     slice_lock=None,
-                    # The task-local device union has only logical frames. Radial extension
+                    # The task-local device union has only logical frames. Azimuthal extension
                     # slots are few and retire through their explicit host/auxiliary sink.
                     device_union=(device_union if count_stats else None),
                 )
@@ -4023,7 +4034,7 @@ def predict_source_and_accumulate(
         if gpu_flatten_eager:
             effective_pending_limit = max(1, min(int(pending_limit), gpu_retina_flatten_pending_limit(worker_count)))
 
-        radial_padding_processed = 0
+        azimuthal_padding_processed = 0
         if specialized_stats is not None:
             # The resident ring wrote the device union and task metadata directly.
             pass
@@ -4032,7 +4043,7 @@ def predict_source_and_accumulate(
                 spec = prediction_result_frame_spec(source, int(idx), num_frames=int(num_frames))
                 if spec is None:
                     continue
-                radial_padding_processed += int(bool(spec.is_radial_padding))
+                azimuthal_padding_processed += int(bool(spec.is_azimuthal_padding))
                 masks_np, confs_np = _extract_result_masks_and_confs(r)
                 pred_inc, frame_inc = _process_prediction_unit(spec, masks_np, confs_np)
                 prediction_count += int(pred_inc)
@@ -4046,7 +4057,7 @@ def predict_source_and_accumulate(
                     spec = prediction_result_frame_spec(source, int(idx), num_frames=int(num_frames))
                     if spec is None:
                         continue
-                    radial_padding_processed += int(bool(spec.is_radial_padding))
+                    azimuthal_padding_processed += int(bool(spec.is_azimuthal_padding))
 
                     if gpu_flatten_eager:
                         masks_np, confs_np = _extract_result_masks_and_confs(r)
@@ -4124,7 +4135,7 @@ def predict_source_and_accumulate(
                 'device_hole_filled_frames': int(device_hole_filled_frames),
                 'proto_hole_treated_frames': int(device_hole_filled_frames),
                 'slice_meta': None,
-                'radial_padding_processed': int(radial_padding_processed),
+                'azimuthal_padding_processed': int(azimuthal_padding_processed),
                 **consumed,
                 # Reuse the established worker-private future channel; the deferred result
                 # wrapper is agnostic to whether the future retires D2H or publishes cvol.
@@ -4173,9 +4184,9 @@ def predict_source_and_accumulate(
                             'frames_with_predictions': int(base_frames_with_predictions + compacted_frames),
                             'device_hole_filled_frames': int(filled_frames_for_result),
                             'slice_meta': (
-                                None if int(radial_padding_processed) > 0 else retired_meta
+                                None if int(azimuthal_padding_processed) > 0 else retired_meta
                             ),
-                            'radial_padding_processed': int(radial_padding_processed),
+                            'azimuthal_padding_processed': int(azimuthal_padding_processed),
                         }
                     finally:
                         if retirement_manager is not None and retirement_lane is not None:
@@ -4217,8 +4228,8 @@ def predict_source_and_accumulate(
             'prediction_count': int(prediction_count),
             'frames_with_predictions': int(frames_with_predictions),
             'device_hole_filled_frames': int(device_hole_filled_frames),
-            'slice_meta': None if int(radial_padding_processed) > 0 else slice_meta,
-            'radial_padding_processed': int(radial_padding_processed),
+            'slice_meta': None if int(azimuthal_padding_processed) > 0 else slice_meta,
+            'azimuthal_padding_processed': int(azimuthal_padding_processed),
             # Private worker protocol; removed before the stats cross the process queue.
             '_device_union_flush_future': device_union_flush_future,
         }
@@ -4247,8 +4258,8 @@ def predict_source_and_submit_accumulation(
     streaming_cleanup_min_conf: float = 0.0,
     streaming_cleanup_min_radius: float = 0.0,
     slice_locks: Optional[Sequence[threading.Lock]] = None,
-    radial_padding_union_mm: Optional[np.ndarray] = None,
-    radial_padding_confmap_mm: Optional[np.ndarray] = None,
+    azimuthal_padding_union_mm: Optional[np.ndarray] = None,
+    azimuthal_padding_confmap_mm: Optional[np.ndarray] = None,
 ) -> PredictionAccumulationHandle:
     """Run YOLO streaming inference and enqueue result accumulation without draining it."""
     # only compute the GPU flatten's max-conf plane when a confidence
@@ -4337,7 +4348,7 @@ def predict_source_and_submit_accumulation(
         stream_min_radius = float(streaming_cleanup_min_radius)
         stream_min_conf_u8 = int(min_conf_to_u8_threshold(stream_min_conf)) if stream_min_conf > 0.0 else 0
 
-        source_padding_count = max(0, int(getattr(source, 'radial_padding_count', 0) or 0))
+        source_padding_count = max(0, int(getattr(source, 'azimuthal_padding_count', 0) or 0))
         effective_slice_locks = slice_locks
         if effective_slice_locks is None and source_padding_count > 0:
             effective_slice_locks = [
@@ -4354,8 +4365,8 @@ def predict_source_and_submit_accumulation(
                     spec,
                     view_union_mm=view_union_mm,
                     view_confmap_mm=view_confmap_mm,
-                    radial_padding_union_mm=radial_padding_union_mm,
-                    radial_padding_confmap_mm=radial_padding_confmap_mm,
+                    azimuthal_padding_union_mm=azimuthal_padding_union_mm,
+                    azimuthal_padding_confmap_mm=azimuthal_padding_confmap_mm,
                     M_out_to_native=M_out_to_native,
                     native_w=int(native_w),
                 )
@@ -4364,7 +4375,7 @@ def predict_source_and_submit_accumulation(
             if effective_slice_locks is not None and len(effective_slice_locks) > 0:
                 lock_index = (
                     int(spec.global_destination_index)
-                    if bool(spec.is_radial_padding) else int(spec.task_index)
+                    if bool(spec.is_azimuthal_padding) else int(spec.task_index)
                 )
                 slice_lock = effective_slice_locks[lock_index % len(effective_slice_locks)]
             if isinstance(masks_obj, GpuFlattenedRetinaPayload):
@@ -4415,7 +4426,7 @@ def predict_source_and_submit_accumulation(
         futures: List[Future] = []
         submitted_frames = 0
         synthetic_discarded = 0
-        radial_padding_processed = 0
+        azimuthal_padding_processed = 0
         precompleted_prediction_count = 0
         precompleted_frames_with_predictions = 0
         pending_limit = async_predict_pending_frame_limit(int(num_frames))
@@ -4445,8 +4456,8 @@ def predict_source_and_submit_accumulation(
             if spec is None:
                 synthetic_discarded += 1
                 continue
-            if spec.is_radial_padding:
-                radial_padding_processed += 1
+            if spec.is_azimuthal_padding:
+                azimuthal_padding_processed += 1
             else:
                 submitted_frames += 1
             if gpu_flatten_eager:
@@ -4471,9 +4482,9 @@ def predict_source_and_submit_accumulation(
             precompleted_prediction_count=int(precompleted_prediction_count),
             precompleted_frames_with_predictions=int(precompleted_frames_with_predictions),
             pending_limit=int(pending_limit),
-            radial_padding_processed=int(radial_padding_processed),
-            radial_padding_union_mm=radial_padding_union_mm,
-            radial_padding_confmap_mm=radial_padding_confmap_mm,
+            azimuthal_padding_processed=int(azimuthal_padding_processed),
+            azimuthal_padding_union_mm=azimuthal_padding_union_mm,
+            azimuthal_padding_confmap_mm=azimuthal_padding_confmap_mm,
         )
     finally:
         if owned_staging_wrapper is not None:
@@ -4499,8 +4510,8 @@ def predict_in_memory_volume_and_submit_accumulation(
     streaming_cleanup_min_conf: float = 0.0,
     streaming_cleanup_min_radius: float = 0.0,
     slice_locks: Optional[Sequence[threading.Lock]] = None,
-    radial_padding_union_mm: Optional[np.ndarray] = None,
-    radial_padding_confmap_mm: Optional[np.ndarray] = None,
+    azimuthal_padding_union_mm: Optional[np.ndarray] = None,
+    azimuthal_padding_confmap_mm: Optional[np.ndarray] = None,
 ) -> PredictionAccumulationHandle:
     source = make_prediction_ref_yolo_source(
         prediction_volume,
@@ -4524,8 +4535,8 @@ def predict_in_memory_volume_and_submit_accumulation(
         streaming_cleanup_min_conf=float(streaming_cleanup_min_conf),
         streaming_cleanup_min_radius=float(streaming_cleanup_min_radius),
         slice_locks=slice_locks,
-        radial_padding_union_mm=radial_padding_union_mm,
-        radial_padding_confmap_mm=radial_padding_confmap_mm,
+        azimuthal_padding_union_mm=azimuthal_padding_union_mm,
+        azimuthal_padding_confmap_mm=azimuthal_padding_confmap_mm,
     )
 
 def predict_in_memory_volume_and_accumulate(
@@ -4545,8 +4556,8 @@ def predict_in_memory_volume_and_accumulate(
     streaming_cleanup_min_conf: float = 0.0,
     streaming_cleanup_min_radius: float = 0.0,
     slice_locks: Optional[Sequence[threading.Lock]] = None,
-    radial_padding_union_mm: Optional[np.ndarray] = None,
-    radial_padding_confmap_mm: Optional[np.ndarray] = None,
+    azimuthal_padding_union_mm: Optional[np.ndarray] = None,
+    azimuthal_padding_confmap_mm: Optional[np.ndarray] = None,
 ) -> Dict[str, int]:
     source = make_prediction_ref_yolo_source(
         prediction_volume,
@@ -4570,8 +4581,8 @@ def predict_in_memory_volume_and_accumulate(
         streaming_cleanup_min_conf=float(streaming_cleanup_min_conf),
         streaming_cleanup_min_radius=float(streaming_cleanup_min_radius),
         slice_locks=slice_locks,
-        radial_padding_union_mm=radial_padding_union_mm,
-        radial_padding_confmap_mm=radial_padding_confmap_mm,
+        azimuthal_padding_union_mm=azimuthal_padding_union_mm,
+        azimuthal_padding_confmap_mm=azimuthal_padding_confmap_mm,
     )
 
 def cleanup_backend() -> str:
@@ -4993,9 +5004,9 @@ def cleanup_view_volume_after_prediction_inplace(
     known_slice_bboxes: Optional[np.ndarray] = None,
     threshold_plane_shape: Optional[Tuple[int, int]] = None,
 ) -> None:
-    # non-radial masks can still be on the canonical inference grid here.
+    # non-azimuthal masks can still be on the canonical inference grid here.
     # Convert the native-view radius once and perform every component operation on that smaller
-    # raster. Radial already owns a deliberately folded native raster and keeps its historical
+    # raster. Azimuthal already owns a deliberately folded native raster and keeps its historical
     # threshold unchanged.
     threshold_shape = (
         tuple(int(v) for v in threshold_plane_shape)

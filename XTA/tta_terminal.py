@@ -53,7 +53,7 @@ def finalize_physical_view_volume_group(
                 f"{sorted(physical_volumes)} instead of one physical volume"
             )
 
-        if physical_view.family != "radial" and not is_tilted_view(physical_view):
+        if physical_view.family not in ("azimuthal", "radial") and not is_tilted_view(physical_view):
             return str(model_name), physical_name, native_volume
 
         out_path.parent.mkdir(parents=True, exist_ok=True)

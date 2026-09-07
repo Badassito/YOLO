@@ -32,11 +32,11 @@ class _Record:
 
 @dataclass(frozen=True)
 class _View:
-    name: str = "radial_transverse"
+    name: str = "azimuthal_transverse"
     physical_view_name: str = ""
-    family: str = "radial"
-    summary_family: str = "radial"
-    display_name: str = "Radial Transverse"
+    family: str = "azimuthal"
+    summary_family: str = "azimuthal"
+    display_name: str = "Azimuthal Transverse"
     num_slices: int = 3
     src_h: int = 5
     src_w: int = 7
@@ -57,10 +57,10 @@ class _View:
     horizontal_axis: str = "x"
     vertical_axis: str = "y"
     stack_axis: str = "t"
-    radial_base_view: str = "transverse"
-    radial_tilted_source: bool = False
-    radial_source_view_name: str = ""
-    radial_request_token: str = "transverse"
+    azimuthal_base_view: str = "transverse"
+    azimuthal_tilted_source: bool = False
+    azimuthal_source_view_name: str = ""
+    azimuthal_request_token: str = "transverse"
     tta_aug_id: str = ""
     tta_angle_deg: float = 0.0
 
@@ -82,7 +82,7 @@ class _Tile:
 
 
 @dataclass(frozen=True)
-class _RadialRequest:
+class _AzimuthalRequest:
     view: str = "transverse"
     azimuth_angle: float | None = 45.0
 
@@ -171,8 +171,8 @@ class RunContextManifestTests(unittest.TestCase):
                     physical_views=(_View(),),
                     inference_views=(
                         _View(
-                            name="radial_transverse__tta_a120",
-                            physical_view_name="radial_transverse",
+                            name="azimuthal_transverse__tta_a120",
+                            physical_view_name="azimuthal_transverse",
                             tta_aug_id="a120",
                             tta_angle_deg=120.0,
                         ),
@@ -180,9 +180,9 @@ class RunContextManifestTests(unittest.TestCase):
                     angles=(0.0, 120.0),
                     channel_format=_Channel(),
                     tile_configs=(_Tile(),),
-                    radial_requests=(_RadialRequest(),),
-                    radial_diameters=(7,),
-                    radial_azimuth_angles=(45.0,),
+                    azimuthal_requests=(_AzimuthalRequest(),),
+                    azimuthal_diameters=(7,),
+                    azimuthal_azimuth_angles=(45.0,),
                     backend={
                         "inference_devices": ["cuda:0", "cpu:0"],
                         "gpu_precision": "fp16",
@@ -196,14 +196,14 @@ class RunContextManifestTests(unittest.TestCase):
                         },
                         "physical_view_backend_ownership": [
                             {
-                                "physical_view": "radial_transverse",
+                                "physical_view": "azimuthal_transverse",
                                 "contract": "hybrid_frame_partition",
                                 "frames": {"cpu": 1, "gpu": 2},
                             }
                         ],
                     },
                     forward_sampling={
-                        "radial_source_mode": "texture_linear",
+                        "azimuthal_source_mode": "texture_linear",
                         "cube_t_axis_resize_backend": "trilinear",
                         "image_capture": "canonical_render_batch_tee",
                         "runtime_cuda_renderer_fallback_capture": (
@@ -246,10 +246,10 @@ class RunContextManifestTests(unittest.TestCase):
         self.assertIsNone(payload["inputs"]["models"]["cpu"])
         self.assertEqual(payload["geometry"]["channel_format"]["direction"], "forward")
         self.assertEqual(payload["geometry"]["tta_angles_deg"], [0.0, 120.0])
-        radial = payload["geometry"]["radial_groups"][0]
-        self.assertEqual(radial["resolved_azimuth_angle_deg"], 45.0)
+        azimuthal = payload["geometry"]["azimuthal_groups"][0]
+        self.assertEqual(azimuthal["resolved_azimuth_angle_deg"], 45.0)
         self.assertEqual(
-            radial["concrete_azimuth_vectors"][0]["azimuths_deg"],
+            azimuthal["concrete_azimuth_vectors"][0]["azimuths_deg"],
             [0.0, 45.0, 90.0, 135.0],
         )
         self.assertTrue(

@@ -14,11 +14,14 @@ from typing import Optional, Sequence, Tuple
 
 from .config import (
     ChannelFormat,
+    AzimuthalViewRequest,
     RadialViewRequest,
     TiltedViewGroup,
     resolve_cartesian_views,
     resolve_channel_format,
+    resolve_azimuthal_view_requests,
     resolve_radial_view_requests,
+    parse_radial_min_radius,
     resolve_tilted_view_groups,
 )
 from .unification.tiles import ResolvedTileGroup, resolve_tile_groups
@@ -65,12 +68,13 @@ class PtaConfig:
     preprocessing: PreprocessingRequest
     save: PtaSaveRequest
     cartesian_views: Tuple[str, ...]
-    radial_requests: Tuple[RadialViewRequest, ...]
+    azimuthal_requests: Tuple[AzimuthalViewRequest, ...]
     tilted_groups: Tuple[TiltedViewGroup, ...]
     tiles: Tuple[TileRequest, ...]
     device_ids: Optional[Tuple[int, ...]]
     requested_output_format: str
     effective_output_format: str
+    radial_requests: Tuple[RadialViewRequest, ...] = ()
 
     @property
     def has_physical_views(self) -> bool:
@@ -84,7 +88,7 @@ class PtaConfig:
         return any(
             not str(request.view).startswith("tilted_")
             or str(request.view)[len("tilted_") :] in tilted_bases
-            for request in self.radial_requests
+            for request in (*self.azimuthal_requests, *self.radial_requests)
         )
 
 
@@ -328,10 +332,19 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         metavar="VIEW",
     )
     parser.add_argument(
-        "--enable_radial",
+        "--enable_azimuthal",
         nargs="+",
         default=None,
         metavar="VIEWS[:AZIMUTH_ANGLE]",
+    )
+    parser.add_argument(
+        "--enable_radial", nargs="+", default=None, metavar="VIEW",
+        help="Dense cylindrical-shell (azimuth,height) views; requires --imgsz > 0",
+    )
+    parser.add_argument(
+        "--radial_min_radius", default=None, type=parse_radial_min_radius,
+        metavar="RADIUS|auto",
+        help="Minimum shell radius; auto selects imgsz/(4*pi), two wraps per patch",
     )
     parser.add_argument(
         "--enable_tilted",
@@ -403,6 +416,9 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
 def resolve_pta_config(args: argparse.Namespace) -> PtaConfig:
     if int(args.imgsz) < 0:
         raise ValueError("--imgsz must be >= 0 in PTA mode")
+    radial_requests = tuple(resolve_radial_view_requests(args.enable_radial))
+    if radial_requests and int(args.imgsz) <= 0:
+        raise ValueError("--enable_radial requires --imgsz > 0 to define its periodic patches")
     if not (0.0 <= float(args.background_percent) <= 1.0):
         raise ValueError("--background_percent must be in [0,1]")
     if args.train_split is not None and not (0.0 <= float(args.train_split) <= 1.0):
@@ -440,7 +456,8 @@ def resolve_pta_config(args: argparse.Namespace) -> PtaConfig:
         preprocessing=resolve_preprocessing_options(args.preprocessing),
         save=resolve_pta_save_request(args.save),
         cartesian_views=tuple(resolve_cartesian_views(args.enable_cartesian)),
-        radial_requests=tuple(resolve_radial_view_requests(args.enable_radial)),
+        azimuthal_requests=tuple(resolve_azimuthal_view_requests(args.enable_azimuthal)),
+        radial_requests=radial_requests,
         tilted_groups=tuple(resolve_tilted_view_groups(args.enable_tilted)),
         tiles=resolve_tile_requests(args.enable_tile),
         device_ids=resolve_pta_device_ids(args.device),

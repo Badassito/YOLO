@@ -664,7 +664,7 @@ def assemble_view_volumes_into_native_union(
 ) -> None:
     """OR all per-view prediction volumes from the single active model into the final union.
 
- Already-backprojected Tilted/Radial volumes arrive at the union's own (out) geometry and are
+ Already-backprojected Tilted/Azimuthal volumes arrive at the union's own (out) geometry and are
  merged slice-wise. Transverse, Sagittal, and Coronal retain their native working-geometry view
  stacks; restores each of them working->source with ONE resample
  while merging (union-biased: a source slice ORs every working slice it covers and XY planes
@@ -902,7 +902,7 @@ def assemble_view_volumes_and_projected_layers_fused(
 
         # shape fully defines the restore transform here because every
         # projected layer is already in canonical orthogonal (t,Y,X) coordinates.
-        # Grouping is intentionally limited to non-native layers. Native Radial stores
+        # Grouping is intentionally limited to non-native layers. Native Azimuthal stores
         # continue to contribute bbox crops directly to the output accumulator.
         group_restores = bool(fused_final_restore_geometry_groups_enabled())
         native_projected: List[Tuple['NrrdLayerRef', object]] = []
@@ -1641,7 +1641,7 @@ def assemble_view_volumes_and_projected_layers_fused(
                 np.bitwise_or(acc, np.asarray(vol[int(out_z)], dtype=np.uint8), out=acc)
 
             if group_restores:
-                # Native projected layers (the two Radial refs in the reference run)
+                # Native projected layers (the two Azimuthal refs in the reference run)
                 # retain the exact -independent sparse direct path.
                 for _ref, src in native_projected:
                     _or_native_source_slice(acc, src, int(out_z))
@@ -3432,8 +3432,8 @@ def _v14_sample_one_normal_section(
     center_label = int(labels[center_rc])
     if int(label_count) <= 1 or center_label <= 0:
         return ('clean', None) if plane_complete else ('unknown', None)
-    radial = np.sqrt(uu * uu + vv * vv)
-    annulus = np.abs(radial - expanded_radius) <= 1.25
+    radial_distance = np.sqrt(uu * uu + vv * vv)
+    annulus = np.abs(radial_distance - expanded_radius) <= 1.25
     center_component = labels == int(center_label)
     if not np.any(center_component & annulus):
         return ('clean', None) if plane_complete else ('unknown', None)
@@ -3443,7 +3443,7 @@ def _v14_sample_one_normal_section(
             tuple(float(v) for v in center), float(radius),
             np.empty((0, 3), dtype=np.int32), True,
         )
-    evidence_grid = center_component & (radial >= outer_threshold)
+    evidence_grid = center_component & (radial_distance >= outer_threshold)
     evidence_plane_coords = plane_coords[evidence_grid]
     evidence_coordinate_cap = max(
         512,

@@ -32,7 +32,7 @@ def _physical_view(name: str = 'transverse', *, family: str = 'orthogonal') -> V
         full_t=2,
         full_h=3,
         full_w=4,
-        radial_base_view='transverse' if family == 'radial' else '',
+        azimuthal_base_view='transverse' if family == 'azimuthal' else '',
     )
 
 
@@ -118,8 +118,8 @@ class StreamingPhysicalViewFinalizationTests(unittest.TestCase):
         expected[1, 2, 3] = 1
         np.testing.assert_array_equal(result, expected)
 
-    def test_radial_variants_project_once_after_native_collapse(self) -> None:
-        physical = _physical_view('radial_transverse', family='radial')
+    def test_azimuthal_variants_project_once_after_native_collapse(self) -> None:
+        physical = _physical_view('azimuthal_transverse', family='azimuthal')
         first = np.zeros((2, 3, 4), dtype=np.uint8)
         second = np.zeros_like(first)
         first[0, 1, 1] = 1
@@ -134,7 +134,7 @@ class StreamingPhysicalViewFinalizationTests(unittest.TestCase):
                 job = job_list[0]
                 captured_jobs.append(job)
                 self_outer.assertEqual(int(np.count_nonzero(job.native_source)), 2)
-                return [('model', 'radial_transverse', projected)]
+                return [('model', 'azimuthal_transverse', projected)]
 
         self_outer = self
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
@@ -153,7 +153,7 @@ class StreamingPhysicalViewFinalizationTests(unittest.TestCase):
             )
 
         queue_factory.assert_called_once_with(cpu_workers=2)
-        self.assertEqual(result[:2], ('model', 'radial_transverse'))
+        self.assertEqual(result[:2], ('model', 'azimuthal_transverse'))
         self.assertIs(result[2], projected)
         self.assertEqual(captured_jobs[0].out_shape_tyx, (2, 3, 4))
 

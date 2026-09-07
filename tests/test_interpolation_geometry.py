@@ -259,11 +259,11 @@ class BridgeGeometryTests(unittest.TestCase):
         for z in (10, 11, 12, 13):
             for x in (40, 56):
                 _ellipse(branched, z, 30, x, 6, 5)
-        radial = np.zeros((16, 60, 96), np.uint8)
+        azimuthal = np.zeros((16, 60, 96), np.uint8)
         for z in (1, 2):
-            _ellipse(radial, z, 24, 18, 10, 6)
+            _ellipse(azimuthal, z, 24, 18, 10, 6)
         for z in (12, 13, 14):
-            _ellipse(radial, z, 24, 77, 10, 6)
+            _ellipse(azimuthal, z, 24, 77, 10, 6)
         edge = np.zeros((12, 43, 58), np.uint8)
         for z in (1, 2, 8, 9):
             _ellipse(edge, z, 17, 0, 10, 6)
@@ -277,7 +277,7 @@ class BridgeGeometryTests(unittest.TestCase):
             ('branched', branched, 3., 2, 3, False, True, 1, 3, True),
             ('no_radius', tracks, 0., 1, 1, False, True, 1, 2, True),
             ('binary_disk', tracks, 3., 0, 1, False, False, 1, 2, False),
-            ('radial', radial, 3., 1, 1, True, True, 2, 2, True),
+            ('azimuthal', azimuthal, 3., 1, 1, True, True, 2, 2, True),
             ('edge', edge, 3., 1, 2, False, True, 1, 2, True),
             ('empty', empty, 3., 1, 1, False, True, 1, 1, True),
             ('one', one, 3., 1, 1, False, True, 1, 1, True),
@@ -322,7 +322,7 @@ class BridgeGeometryTests(unittest.TestCase):
                         if name == 'branched':
                             self.assertGreaterEqual(sum(np.any(plane) for plane in planes), 4)
                             self.assertGreater(sum(np.count_nonzero(plane) for plane in planes), int(delta.sum()))
-                        if name == 'radial' and pass_idx == 0:
+                        if name == 'azimuthal' and pass_idx == 0:
                             self.assertTrue(np.any(delta[0]) and np.any(delta[-1]))
 
 

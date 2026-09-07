@@ -1,4 +1,4 @@
-"""Cartesian, radial, and tilted backprojection implementations."""
+"""Cartesian, azimuthal, and tilted backprojection implementations."""
 
 from __future__ import annotations
 
@@ -38,14 +38,14 @@ from .geometry import (
     _affine2x3_to_3x3,
     _cupy_external_stream,
     build_affine,
-    build_radial_azimuths,
+    build_azimuthal_azimuths,
     delayed_native_expansion_enabled,
-    is_radial_view,
-    is_tilted_radial_view,
+    is_azimuthal_view,
+    is_tilted_azimuthal_view,
     is_tilted_view,
-    radial_base_view_name,
-    radial_plane_shape,
-    radial_source_tilted_view,
+    azimuthal_base_view_name,
+    azimuthal_plane_shape,
+    azimuthal_source_tilted_view,
     tilted_base_view_name,
     tilted_frame_center,
     tilted_stack_axis_length,
@@ -94,6 +94,7 @@ from .inference import (
 from .cuda_backend import (
     GpuRenderedYoloSource,
     GpuTileRenderedYoloSource,
+    gpu_worker_fused_preflight_specs,
 )
 
 
@@ -107,20 +108,20 @@ _RESIDENT_TRT_RING_ANNOUNCED = False
 _RESIDENT_TRT_RING_FALLBACK_WARNED = False
 
 @dataclass(frozen=True)
-class RadialBackprojectionSample:
+class AzimuthalBackprojectionSample:
     angle_deg: float
     source_index: int
     reverse_u: bool = False
 
 @dataclass(frozen=True)
-class DenseRadialBackprojectionMap:
+class DenseAzimuthalBackprojectionMap:
     valid_mask: np.ndarray
     source_idx_map: np.ndarray
     u_idx_map: np.ndarray
 
 @dataclass(frozen=True)
-class RadialProcessingGrid:
-    """Map native Radial row/diameter coordinates into the stored processing raster."""
+class AzimuthalProcessingGrid:
+    """Map native Azimuthal row/diameter coordinates into the stored processing raster."""
 
     processing_h: int
     processing_w: int
@@ -130,30 +131,30 @@ class RadialProcessingGrid:
     native_u_to_processing: np.ndarray
     reduced: bool = False
 
-def resolve_radial_processing_grid(
-    radial_mask_mm: np.ndarray,
-    radial_view: ViewInfo,
-) -> RadialProcessingGrid:
-    """Resolve the exact angle-zero native-to-processing mapping for one Radial layer.
+def resolve_azimuthal_processing_grid(
+    azimuthal_mask_mm: np.ndarray,
+    azimuthal_view: ViewInfo,
+) -> AzimuthalProcessingGrid:
+    """Resolve the exact angle-zero native-to-processing mapping for one Azimuthal layer.
 
-    Radial angle/frame order is unchanged.  Only the per-frame ``(row, diameter)`` raster
+    Azimuthal angle/frame order is unchanged.  Only the per-frame ``(row, diameter)`` raster
     may be canonicalized to ``imgsz``.  The angle-zero affine is axis aligned, so compact
     one-dimensional row and diameter lookup tables carry the transform through wraparound
-    interpolation and terminal Cartesian backprojection without expanding a native Radial
+    interpolation and terminal Cartesian backprojection without expanding a native Azimuthal
     volume first.
     """
-    src = np.asarray(radial_mask_mm)
+    src = np.asarray(azimuthal_mask_mm)
     if src.ndim != 3:
-        raise ValueError(f'Radial processing grid expects a 3D layer, got {src.shape}')
+        raise ValueError(f'Azimuthal processing grid expects a 3D layer, got {src.shape}')
     processing_h, processing_w = int(src.shape[1]), int(src.shape[2])
-    native_h, native_w = int(radial_view.src_h), int(radial_view.src_w)
+    native_h, native_w = int(azimuthal_view.src_h), int(azimuthal_view.src_w)
     if min(processing_h, processing_w, native_h, native_w) <= 0:
         raise ValueError(
-            f'Radial processing grid has invalid processing/native geometry '
+            f'Azimuthal processing grid has invalid processing/native geometry '
             f'{processing_h}x{processing_w} / {native_h}x{native_w}'
         )
     if (processing_h, processing_w) == (native_h, native_w):
-        return RadialProcessingGrid(
+        return AzimuthalProcessingGrid(
             processing_h=processing_h,
             processing_w=processing_w,
             native_h=native_h,
@@ -164,31 +165,31 @@ def resolve_radial_processing_grid(
         )
     if processing_h != processing_w:
         raise ValueError(
-            f'Reduced Radial processing raster must be square, got '
+            f'Reduced Azimuthal processing raster must be square, got '
             f'{processing_h}x{processing_w}'
         )
-    if not view_uses_inference_processing_grid(radial_view, processing_w):
+    if not view_uses_inference_processing_grid(azimuthal_view, processing_w):
         raise ValueError(
-            f'Radial layer {src.shape} differs from native '
+            f'Azimuthal layer {src.shape} differs from native '
             f'({native_h},{native_w}) without delayed-expansion capability'
         )
-    expected = view_processing_plane_shape(radial_view, processing_w)
+    expected = view_processing_plane_shape(azimuthal_view, processing_w)
     if tuple(int(v) for v in expected) != (processing_h, processing_w):
         raise ValueError(
-            f'Radial processing raster {processing_h}x{processing_w} does not match '
+            f'Azimuthal processing raster {processing_h}x{processing_w} does not match '
             f'canonical geometry {expected}'
         )
     canonical = build_affine(
-        view=str(radial_view.name),
+        view=str(azimuthal_view.name),
         src_w=native_w,
         src_h=native_h,
         out_size=processing_w,
         angle_deg=0.0,
-        pad_mode=str(radial_view.pad_mode),
+        pad_mode=str(azimuthal_view.pad_mode),
     )
     matrix = np.asarray(canonical.M_src_to_out, dtype=np.float64).reshape(2, 3)
     if not bool(np.isfinite(matrix).all()) or abs(float(matrix[0, 1])) > 1e-6 or abs(float(matrix[1, 0])) > 1e-6:
-        raise ValueError('Radial canonical affine is non-finite or not axis aligned')
+        raise ValueError('Azimuthal canonical affine is non-finite or not axis aligned')
     # Ask OpenCV to transform one-dimensional coordinate ramps with the same affine
     # and nearest-neighbour implementation used by native expansion.  Re-implementing the
     # rounding algebra is not exact at fixed-point half-pixel boundaries.
@@ -227,10 +228,10 @@ def resolve_radial_processing_grid(
         or bool(np.any(u_values < 0.0))
         or bool(np.any(u_values >= float(processing_w)))
     ):
-        raise ValueError('Radial canonical affine maps native content outside the processing raster')
+        raise ValueError('Azimuthal canonical affine maps native content outside the processing raster')
     row_map = np.ascontiguousarray(row_values.astype(np.int32, copy=False))
     u_map = np.ascontiguousarray(u_values.astype(np.int32, copy=False))
-    return RadialProcessingGrid(
+    return AzimuthalProcessingGrid(
         processing_h=processing_h,
         processing_w=processing_w,
         native_h=native_h,
@@ -240,53 +241,53 @@ def resolve_radial_processing_grid(
         reduced=True,
     )
 
-def _radial_processing_rows_for_output(
-    grid: RadialProcessingGrid,
+def _azimuthal_processing_rows_for_output(
+    grid: AzimuthalProcessingGrid,
     output_rows: int,
     output_index: int,
 ) -> np.ndarray:
-    native_rows = _radial_source_rows_for_output(
+    native_rows = _azimuthal_source_rows_for_output(
         int(grid.native_h), int(output_rows), int(output_index),
     )
     mapped = grid.native_row_to_processing[np.fromiter(native_rows, dtype=np.int32)]
     return np.unique(np.asarray(mapped, dtype=np.int32))
 
-def _radial_dense_map_for_processing(
-    dense_map: DenseRadialBackprojectionMap,
-    grid: RadialProcessingGrid,
-) -> DenseRadialBackprojectionMap:
+def _azimuthal_dense_map_for_processing(
+    dense_map: DenseAzimuthalBackprojectionMap,
+    grid: AzimuthalProcessingGrid,
+) -> DenseAzimuthalBackprojectionMap:
     native_u = np.asarray(dense_map.u_idx_map, dtype=np.int32)
     if native_u.size and (int(native_u.min()) < 0 or int(native_u.max()) >= int(grid.native_w)):
-        raise ValueError('Radial backprojection diameter map exceeds native Radial width')
-    return DenseRadialBackprojectionMap(
+        raise ValueError('Azimuthal backprojection diameter map exceeds native Azimuthal width')
+    return DenseAzimuthalBackprojectionMap(
         valid_mask=np.asarray(dense_map.valid_mask, dtype=bool),
         source_idx_map=np.asarray(dense_map.source_idx_map, dtype=np.int32),
         u_idx_map=np.ascontiguousarray(grid.native_u_to_processing[native_u]),
     )
 
-_DENSE_RADIAL_BACKPROJECT_MAP_CACHE: Dict[Tuple[object, ...], DenseRadialBackprojectionMap] = {}
+_DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE: Dict[Tuple[object, ...], DenseAzimuthalBackprojectionMap] = {}
 
-def radial_full_coverage_angle_deg(diameter: int) -> float:
-    """Return the radial spacing that gives approximately 1x ROI edge coverage."""
+def azimuthal_full_coverage_angle_deg(diameter: int) -> float:
+    """Return the azimuthal spacing that gives approximately 1x ROI edge coverage."""
     diameter_i = max(1, int(diameter))
     return float(360.0 / (math.pi * float(diameter_i)))
 
-def _radial_view_nominal_spacing_deg(radial_view: ViewInfo) -> float:
-    az = list(float(a) for a in radial_view.azimuths_deg)
+def _azimuthal_view_nominal_spacing_deg(azimuthal_view: ViewInfo) -> float:
+    az = list(float(a) for a in azimuthal_view.azimuths_deg)
     if len(az) >= 2:
         return float(abs(az[1] - az[0]))
     return 180.0
 
-def _nearest_radial_source_for_backprojection(
+def _nearest_azimuthal_source_for_backprojection(
     target_angle_deg: float,
     source_angles_deg: np.ndarray,
 ) -> Tuple[int, bool]:
-    """Nearest source plane over the unoriented [0, 180) radial diameter domain.
+    """Nearest source plane over the unoriented [0, 180) azimuthal diameter domain.
 
  When the nearest match crosses the 0/180 boundary, the same diameter plane is reused with
- the radial coordinate reversed so source raster coordinates still map to the target plane."""
+ the azimuthal coordinate reversed so source raster coordinates still map to the target plane."""
     if source_angles_deg.size <= 0:
-        raise ValueError('No radial source angles are available for backprojection')
+        raise ValueError('No azimuthal source angles are available for backprojection')
 
     raw = float(target_angle_deg) - source_angles_deg.astype(np.float64, copy=False)
     wrapped = ((raw + 90.0) % 180.0) - 90.0
@@ -294,42 +295,42 @@ def _nearest_radial_source_for_backprojection(
     reverse_u = bool(abs(float(raw[idx])) > 90.0)
     return idx, reverse_u
 
-def build_radial_backprojection_plan(radial_view: ViewInfo) -> Tuple[List[RadialBackprojectionSample], Dict[str, float]]:
-    """Build the angular plan used to backproject a radial view into Cartesian space.
+def build_azimuthal_backprojection_plan(azimuthal_view: ViewInfo) -> Tuple[List[AzimuthalBackprojectionSample], Dict[str, float]]:
+    """Build the angular plan used to backproject a azimuthal view into Cartesian space.
 
- If the user-requested radial spacing is coarser than the full-coverage spacing,
+ If the user-requested azimuthal spacing is coarser than the full-coverage spacing,
  backprojection is densified to the full-coverage spacing and each dense angle samples the
- nearest completed radial prediction frame. This keeps Radial masks view-native through
+ nearest completed azimuthal prediction frame. This keeps Azimuthal masks view-native through
  postprocessing/interpolation while preventing sparse spoke-like Cartesian backprojections."""
-    source_angles = np.asarray([float(a) for a in radial_view.azimuths_deg], dtype=np.float64)
+    source_angles = np.asarray([float(a) for a in azimuthal_view.azimuths_deg], dtype=np.float64)
     if source_angles.size <= 0:
         return [], {
             'provided_spacing_deg': 0.0,
-            'coverage_spacing_deg': radial_full_coverage_angle_deg(int(radial_view.diameter)),
+            'coverage_spacing_deg': azimuthal_full_coverage_angle_deg(int(azimuthal_view.diameter)),
             'effective_spacing_deg': 0.0,
             'source_frames': 0.0,
             'backprojection_angles': 0.0,
             'densified': 0.0,
         }
 
-    provided_spacing = _radial_view_nominal_spacing_deg(radial_view)
-    coverage_spacing = radial_full_coverage_angle_deg(int(radial_view.diameter))
+    provided_spacing = _azimuthal_view_nominal_spacing_deg(azimuthal_view)
+    coverage_spacing = azimuthal_full_coverage_angle_deg(int(azimuthal_view.diameter))
     # The specification's guarantee formula is a maximum safe angular spacing. A smaller
     # user spacing is already dense enough; a larger spacing is densified during backprojection.
     effective_spacing = min(float(provided_spacing), float(coverage_spacing))
 
     if float(provided_spacing) <= float(coverage_spacing) * (1.0 + 1e-9):
         samples = [
-            RadialBackprojectionSample(angle_deg=float(angle), source_index=int(idx), reverse_u=False)
+            AzimuthalBackprojectionSample(angle_deg=float(angle), source_index=int(idx), reverse_u=False)
             for idx, angle in enumerate(source_angles.tolist())
         ]
         densified = False
     else:
-        dense_angles = build_radial_azimuths(float(effective_spacing))
+        dense_angles = build_azimuthal_azimuths(float(effective_spacing))
         samples = []
         for dense_angle in dense_angles:
-            source_idx, reverse_u = _nearest_radial_source_for_backprojection(float(dense_angle), source_angles)
-            samples.append(RadialBackprojectionSample(
+            source_idx, reverse_u = _nearest_azimuthal_source_for_backprojection(float(dense_angle), source_angles)
+            samples.append(AzimuthalBackprojectionSample(
                 angle_deg=float(dense_angle),
                 source_index=int(source_idx),
                 reverse_u=bool(reverse_u),
@@ -345,56 +346,56 @@ def build_radial_backprojection_plan(radial_view: ViewInfo) -> Tuple[List[Radial
         'densified': 1.0 if bool(densified) else 0.0,
     }
 
-def _radial_plan_signature(plan: Sequence[RadialBackprojectionSample]) -> Tuple[Tuple[float, int, bool], ...]:
+def _azimuthal_plan_signature(plan: Sequence[AzimuthalBackprojectionSample]) -> Tuple[Tuple[float, int, bool], ...]:
     return tuple((round(float(s.angle_deg), 6), int(s.source_index), bool(s.reverse_u)) for s in plan)
 
-def build_dense_radial_backprojection_map(
-    radial_view: ViewInfo,
-    plan: Sequence[RadialBackprojectionSample],
+def build_dense_azimuthal_backprojection_map(
+    azimuthal_view: ViewInfo,
+    plan: Sequence[AzimuthalBackprojectionSample],
     *,
     out_shape_hw: Optional[Tuple[int, int]] = None,
-) -> DenseRadialBackprojectionMap:
-    """Map every selected-base-plane pixel to a Radial frame and diameter coordinate.
+) -> DenseAzimuthalBackprojectionMap:
+    """Map every selected-base-plane pixel to a Azimuthal frame and diameter coordinate.
 
- ``out_shape_hw`` is expressed in the selected Radial base plane: ``(Y,X)`` for
+ ``out_shape_hw`` is expressed in the selected Azimuthal base plane: ``(Y,X)`` for
  transverse, ``(t,X)`` for sagittal, and ``(t,Y)`` for coronal. Building the map
  directly on the final plane is what turns the working-cube circle into the required
  ellipse after the source t axis is restored."""
-    work_plane_h, work_plane_w = radial_plane_shape(radial_view)
+    work_plane_h, work_plane_w = azimuthal_plane_shape(azimuthal_view)
     if out_shape_hw is None:
         out_h, out_w = int(work_plane_h), int(work_plane_w)
     else:
         out_h, out_w = (int(out_shape_hw[0]), int(out_shape_hw[1]))
     if not plan:
-        return DenseRadialBackprojectionMap(
+        return DenseAzimuthalBackprojectionMap(
             valid_mask=np.zeros((out_h, out_w), dtype=bool),
             source_idx_map=np.zeros((out_h, out_w), dtype=np.int32),
             u_idx_map=np.zeros((out_h, out_w), dtype=np.int32),
         )
 
-    u_len = int(radial_view.src_w) if int(radial_view.src_w) > 0 else int(radial_view.diameter)
+    u_len = int(azimuthal_view.src_w) if int(azimuthal_view.src_w) > 0 else int(azimuthal_view.diameter)
     key = (
-        radial_base_view_name(radial_view), bool(is_tilted_radial_view(radial_view)),
+        azimuthal_base_view_name(azimuthal_view), bool(is_tilted_azimuthal_view(azimuthal_view)),
         int(out_h), int(out_w), int(work_plane_h), int(work_plane_w),
-        int(radial_view.diameter), int(u_len),
-        round(float(radial_view.center_x), 6), round(float(radial_view.center_y), 6),
-        round(float(radial_view.roi_radius), 6), _radial_plan_signature(plan),
+        int(azimuthal_view.diameter), int(u_len),
+        round(float(azimuthal_view.center_x), 6), round(float(azimuthal_view.center_y), 6),
+        round(float(azimuthal_view.roi_radius), 6), _azimuthal_plan_signature(plan),
     )
-    cached = _DENSE_RADIAL_BACKPROJECT_MAP_CACHE.get(key)
+    cached = _DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE.get(key)
     if cached is not None:
         return cached
 
     diameter = int(u_len)
-    radius = float(radial_view.roi_radius)
+    radius = float(azimuthal_view.roi_radius)
     if radius <= 0.0:
-        radius = max(1.0, float(radial_view.diameter - 1) / 2.0)
+        radius = max(1.0, float(azimuthal_view.diameter - 1) / 2.0)
 
     plan_angles = np.asarray([float(s.angle_deg) % 180.0 for s in plan], dtype=np.float32)
     plan_sources = np.asarray([int(s.source_index) for s in plan], dtype=np.int32)
     plan_reverses = np.asarray([bool(s.reverse_u) for s in plan], dtype=bool)
     n_plan = int(plan_angles.size)
     if n_plan <= 0:
-        raise ValueError('Dense radial backprojection requires at least one angular plan sample')
+        raise ValueError('Dense azimuthal backprojection requires at least one angular plan sample')
 
     if n_plan >= 2:
         diffs = np.diff(plan_angles.astype(np.float64, copy=False))
@@ -408,8 +409,8 @@ def build_dense_radial_backprojection_map(
     if (out_h, out_w) != (int(work_plane_h), int(work_plane_w)):
         xx = (xx + np.float32(0.5)) * np.float32(float(work_plane_w) / float(out_w)) - np.float32(0.5)
         yy = (yy + np.float32(0.5)) * np.float32(float(work_plane_h) / float(out_h)) - np.float32(0.5)
-    dx = xx - float(radial_view.center_x)
-    dy = yy - float(radial_view.center_y)
+    dx = xx - float(azimuthal_view.center_x)
+    dy = yy - float(azimuthal_view.center_y)
     rr = np.sqrt((dx * dx) + (dy * dy)).astype(np.float32, copy=False)
     valid = rr <= (float(radius) + 0.5)
 
@@ -430,12 +431,12 @@ def build_dense_radial_backprojection_map(
     source_idx[~valid] = 0
     u_idx[~valid] = 0
 
-    dense_map = DenseRadialBackprojectionMap(
+    dense_map = DenseAzimuthalBackprojectionMap(
         valid_mask=np.ascontiguousarray(valid),
         source_idx_map=np.ascontiguousarray(source_idx),
         u_idx_map=np.ascontiguousarray(u_idx),
     )
-    _DENSE_RADIAL_BACKPROJECT_MAP_CACHE[key] = dense_map
+    _DENSE_AZIMUTHAL_BACKPROJECT_MAP_CACHE[key] = dense_map
     return dense_map
 
 def main_process_gpu_stage_inference_overlap_enabled() -> bool:
@@ -849,9 +850,9 @@ def _trim_main_process_cuda_device(
             f'reserved={reserved_text}, driver_free={free_text}.'
         )
 
-def _radial_row_occupancy(radial_mask_mm: np.ndarray, desc: str) -> np.ndarray:
-    """Compute a per-stack-row foreground bitmap over an azimuth-major Radial volume."""
-    n_az, work_rows, _u_len = (int(x) for x in radial_mask_mm.shape)
+def _azimuthal_row_occupancy(azimuthal_mask_mm: np.ndarray, desc: str) -> np.ndarray:
+    """Compute a per-stack-row foreground bitmap over an azimuth-major Azimuthal volume."""
+    n_az, work_rows, _u_len = (int(x) for x in azimuthal_mask_mm.shape)
     row_any = np.zeros((work_rows,), dtype=bool)
     if n_az <= 0 or work_rows <= 0:
         return row_any
@@ -864,7 +865,7 @@ def _radial_row_occupancy(radial_mask_mm: np.ndarray, desc: str) -> np.ndarray:
         a1 = min(n_az, a0 + az_chunk)
         local = np.zeros((work_rows,), dtype=bool)
         for a in range(a0, a1):
-            plane = np.asarray(radial_mask_mm[a])
+            plane = np.asarray(azimuthal_mask_mm[a])
             np.logical_or(local, plane.any(axis=1), out=local)
         with lock:
             np.logical_or(row_any, local, out=row_any)
@@ -880,16 +881,16 @@ def _radial_row_occupancy(radial_mask_mm: np.ndarray, desc: str) -> np.ndarray:
     return row_any
 
 def gpu_backproject_enabled() -> bool:
-    """Stream radial backprojection through the GPU when torch + CUDA exist."""
+    """Stream azimuthal backprojection through the GPU when torch + CUDA exist."""
     return _env_flag('YOLO_TTA_GPU_BACKPROJECT', True)
 
-def _validated_radial_slice_bboxes(
+def _validated_azimuthal_slice_bboxes(
     value: Optional[np.ndarray],
     n_az: int,
     work_t: int,
     u_len: int,
 ) -> Optional[np.ndarray]:
-    """Validate interpolation-carried ``(t0,t1,u0,u1)`` bounds for radial planes."""
+    """Validate interpolation-carried ``(t0,t1,u0,u1)`` bounds for azimuthal planes."""
     if value is None:
         return None
     try:
@@ -1536,7 +1537,7 @@ class _ResidentTensorRTRingExecutor:
             (int(self.native_h) + quantize_block[1] - 1) // quantize_block[1],
         )
         if slot.identity_native_warp:
-            # Preserve the original radial/identity specialization byte-for-byte: proto
+            # Preserve the original azimuthal/identity specialization byte-for-byte: proto
             # bilinear upsample to out_size, threshold, and nearest confidence sampling.
             self.kernels.upsample_quantize(
                 quantize_grid, quantize_block,
@@ -2043,6 +2044,8 @@ def _try_resident_trt_ring_accumulate(
 
     if not resident_trt_ring_enabled() or device_union is None:
         return _decline()
+    if not bool(getattr(source, 'resident_ring_supported', True)):
+        return _decline()
     if not isinstance(source, (GpuRenderedYoloSource, GpuTileRenderedYoloSource)):
         return _decline()
     source_channels = int(getattr(source, 'channel_count', 1))
@@ -2127,6 +2130,16 @@ def _try_resident_trt_ring_accumulate(
             raise RuntimeError(
                 f'resident TensorRT ring requires fixed input {expected_binding_shape}, '
                 f'but {input_name!r} is {binding_shape}'
+            )
+        # Only this admitted, single-channel full-frame route calls the fused
+        # direct-to-binding renderer. Keep its all-view numerical preflight ahead
+        # of binding/context acquisition; generic PT, tile, and multichannel
+        # renderers use their own paths without borrowing these ring kernels.
+        if isinstance(source, GpuRenderedYoloSource) and int(source_channels) == 1:
+            source.engine.run_startup_fused_preflight(
+                gpu_worker_fused_preflight_specs(),
+                out_size=int(out_size),
+                fp16=input_dtype == torch.float16,
             )
         threshold = (
             float(cfg.conf)
@@ -2238,8 +2251,8 @@ def _try_resident_trt_ring_accumulate(
         ),
     }
 
-def _stage_radial_t_major_block(
-    radial_mask_mm: np.ndarray,
+def _stage_azimuthal_t_major_block(
+    azimuthal_mask_mm: np.ndarray,
     v0: int,
     v1: int,
     out_t_major: np.ndarray,
@@ -2248,13 +2261,13 @@ def _stage_radial_t_major_block(
     stage_pool: Optional[ThreadPoolExecutor] = None,
     stage_workers: int = 1,
 ) -> np.ndarray:
-    """Stage one contiguous Radial row interval as ``(t, azimuth, u)``.
+    """Stage one contiguous Azimuthal row interval as ``(t, azimuth, u)``.
 
     Dense sources are transposed one bounded block at a time. Sparse bridge deltas use
     interpolation-carried bboxes and copy only intersecting crop rows. The returned view
     contains exactly ``max(0, v1 - v0)`` clipped rows.
     """
-    n_az, work_t, u_len = (int(v) for v in radial_mask_mm.shape)
+    n_az, work_t, u_len = (int(v) for v in azimuthal_mask_mm.shape)
     lo = int(np.clip(int(v0), 0, work_t))
     hi = int(np.clip(int(v1), lo, work_t))
     count = int(hi - lo)
@@ -2264,7 +2277,7 @@ def _stage_radial_t_major_block(
     if slice_bboxes is None:
         np.copyto(
             dest,
-            np.transpose(np.asarray(radial_mask_mm[:, lo:hi, :], dtype=np.uint8), (1, 0, 2)),
+            np.transpose(np.asarray(azimuthal_mask_mm[:, lo:hi, :], dtype=np.uint8), (1, 0, 2)),
         )
         return dest
 
@@ -2283,7 +2296,7 @@ def _stage_radial_t_major_block(
             if sy0 >= sy1 or bx0 >= bx1:
                 continue
             dest[sy0 - lo:sy1 - lo, int(az), bx0:bx1] = np.asarray(
-                radial_mask_mm[int(az), sy0:sy1, bx0:bx1], dtype=np.uint8,
+                azimuthal_mask_mm[int(az), sy0:sy1, bx0:bx1], dtype=np.uint8,
             )
 
     if stage_pool is not None and workers_i > 1:
@@ -2385,31 +2398,31 @@ class SinkOnlyProjectionResult:
 
     shape: Tuple[int, int, int]
 
-_RADIAL_RESIDENT_BACKPROJECT_KERNEL: Optional[object] = None
+_AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL: Optional[object] = None
 
-_RADIAL_RESIDENT_BACKPROJECT_KERNEL_FAILED = False
+_AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL_FAILED = False
 
-_RADIAL_RESIDENT_BACKPROJECT_KERNEL_ERROR: Optional[str] = None
+_AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL_ERROR: Optional[str] = None
 
-def gpu_resident_radial_backproject_enabled() -> bool:
+def gpu_resident_azimuthal_backproject_enabled() -> bool:
     return _env_flag('YOLO_TTA_GPU_BACKPROJECT_RESIDENT', True)
 
-def fused_angle_variant_radial_component_layer_enabled() -> bool:
-    """Project one post-interpolation Radial union in the angle-variant fast path."""
-    return _env_flag('YOLO_TTA_FUSED_ANGLE_VARIANT_RADIAL_LAYER', True)
+def fused_angle_variant_azimuthal_component_layer_enabled() -> bool:
+    """Project one post-interpolation Azimuthal union in the angle-variant fast path."""
+    return _env_flag('YOLO_TTA_FUSED_ANGLE_VARIANT_AZIMUTHAL_LAYER', True)
 
-def _radial_resident_backproject_kernel() -> Optional[object]:
-    global _RADIAL_RESIDENT_BACKPROJECT_KERNEL
-    global _RADIAL_RESIDENT_BACKPROJECT_KERNEL_FAILED, _RADIAL_RESIDENT_BACKPROJECT_KERNEL_ERROR
-    if _RADIAL_RESIDENT_BACKPROJECT_KERNEL is not None:
-        return _RADIAL_RESIDENT_BACKPROJECT_KERNEL
-    if _RADIAL_RESIDENT_BACKPROJECT_KERNEL_FAILED:
+def _azimuthal_resident_backproject_kernel() -> Optional[object]:
+    global _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL
+    global _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL_FAILED, _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL_ERROR
+    if _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL is not None:
+        return _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL
+    if _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL_FAILED:
         return None
     try:
         import cupy as cp  # type: ignore
         code = r'''
-        extern "C" __global__ void radial_backproject_azmajor_u8(
-            const unsigned char* radial, int n_az, int work_t, int u_len,
+        extern "C" __global__ void azimuthal_backproject_azmajor_u8(
+            const unsigned char* azimuthal, int n_az, int work_t, int u_len,
             const int* source_idx, const int* u_idx, int plane_px,
             int output_t, int output_t0, int output_count, unsigned char* output) {
           long long q0 = (long long)blockDim.x * (long long)blockIdx.x + (long long)threadIdx.x;
@@ -2433,15 +2446,15 @@ def _radial_resident_backproject_kernel() -> Optional[object]:
             unsigned char value = 0;
             long long az_base = (long long)az * (long long)work_t * (long long)u_len;
             for (int v = v0; v < v1; ++v) {
-              unsigned char candidate = radial[az_base + (long long)v * (long long)u_len + (long long)u];
+              unsigned char candidate = azimuthal[az_base + (long long)v * (long long)u_len + (long long)u];
               value = candidate > value ? candidate : value;
             }
             output[q] = value;
           }
         }
 
-        extern "C" __global__ void radial_backproject_tmajor_u8(
-            const unsigned char* radial, int n_az, int work_t, int u_len,
+        extern "C" __global__ void azimuthal_backproject_tmajor_u8(
+            const unsigned char* azimuthal, int n_az, int work_t, int u_len,
             const int* source_idx, const int* u_idx, int plane_px,
             int output_t, int output_t0, int output_count, unsigned char* output) {
           long long q0 = (long long)blockDim.x * (long long)blockIdx.x + (long long)threadIdx.x;
@@ -2466,14 +2479,14 @@ def _radial_resident_backproject_kernel() -> Optional[object]:
             for (int v = v0; v < v1; ++v) {
               long long index = ((long long)v * (long long)n_az + (long long)az)
                               * (long long)u_len + (long long)u;
-              unsigned char candidate = radial[index];
+              unsigned char candidate = azimuthal[index];
               value = candidate > value ? candidate : value;
             }
             output[q] = value;
           }
         }
 
-        extern "C" __global__ void radial_azmajor_to_tmajor_u8(
+        extern "C" __global__ void azimuthal_azmajor_to_tmajor_u8(
             const unsigned char* source, int n_az, int work_t, int u_len,
             unsigned char* target) {
           long long q0 = (long long)blockDim.x * (long long)blockIdx.x + (long long)threadIdx.x;
@@ -2493,26 +2506,26 @@ def _radial_resident_backproject_kernel() -> Optional[object]:
         compile_fn = getattr(module, 'compile', None)
         if callable(compile_fn):
             compile_fn()
-        kernel_azmajor = module.get_function('radial_backproject_azmajor_u8')
-        _RADIAL_RESIDENT_BACKPROJECT_KERNEL = argparse.Namespace(
+        kernel_azmajor = module.get_function('azimuthal_backproject_azmajor_u8')
+        _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL = argparse.Namespace(
             cp=cp,
             module=module,
             kernel_azmajor=kernel_azmajor,
-            kernel_tmajor=module.get_function('radial_backproject_tmajor_u8'),
-            transpose=module.get_function('radial_azmajor_to_tmajor_u8'),
+            kernel_tmajor=module.get_function('azimuthal_backproject_tmajor_u8'),
+            transpose=module.get_function('azimuthal_azmajor_to_tmajor_u8'),
         )
-        return _RADIAL_RESIDENT_BACKPROJECT_KERNEL
+        return _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL
     except Exception as exc:
-        _RADIAL_RESIDENT_BACKPROJECT_KERNEL_FAILED = True
-        _RADIAL_RESIDENT_BACKPROJECT_KERNEL_ERROR = f'{type(exc).__name__}: {exc}'
+        _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL_FAILED = True
+        _AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL_ERROR = f'{type(exc).__name__}: {exc}'
         print(
-            'Warning: resident Radial backprojection kernel unavailable '
-            f'({_RADIAL_RESIDENT_BACKPROJECT_KERNEL_ERROR}); using the streaming GPU path.'
+            'Warning: resident Azimuthal backprojection kernel unavailable '
+            f'({_AZIMUTHAL_RESIDENT_BACKPROJECT_KERNEL_ERROR}); using the streaming GPU path.'
         )
         return None
 
-def _radial_backproject_gpu_resident(
-    radial_mask_mm: np.ndarray,
+def _azimuthal_backproject_gpu_resident(
+    azimuthal_mask_mm: np.ndarray,
     vol_mm: Optional[np.ndarray],
     valid_mask: np.ndarray,
     source_idx_map: np.ndarray,
@@ -2526,8 +2539,8 @@ def _radial_backproject_gpu_resident(
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
     sink_only: bool = False,
 ) -> bool:
-    """Run full-resident Radial backprojection under an inference-exclusive GPU lease."""
-    if not gpu_resident_radial_backproject_enabled():
+    """Run full-resident Azimuthal backprojection under an inference-exclusive GPU lease."""
+    if not gpu_resident_azimuthal_backproject_enabled():
         return False
     try:
         import torch  # type: ignore
@@ -2536,11 +2549,11 @@ def _radial_backproject_gpu_resident(
     except Exception:
         return False
     lease = _try_acquire_main_process_gpu_stage(
-        torch, f'{desc} full-resident Radial backprojection',
+        torch, f'{desc} full-resident Azimuthal backprojection',
     )
     if lease is None:
         _announce_main_gpu_stage_skip_once(
-            'radial-resident-inference-busy',
+            'azimuthal-resident-inference-busy',
             f'{desc}: full-resident GPU backprojection skipped because every eligible GPU '
             'has active/queued inference or another main-process GPU stage; trying the bounded fallback.',
         )
@@ -2550,11 +2563,11 @@ def _radial_backproject_gpu_resident(
         # NVRTC/module initialization is itself a CUDA allocation. Keep it inside the
         # same exclusive interval as the large source upload.
         with torch.cuda.device(dev):
-            kernels = _radial_resident_backproject_kernel()
+            kernels = _azimuthal_resident_backproject_kernel()
         if kernels is None:
             return False
-        return _radial_backproject_gpu_resident_on_device(
-            radial_mask_mm,
+        return _azimuthal_backproject_gpu_resident_on_device(
+            azimuthal_mask_mm,
             vol_mm,
             valid_mask,
             source_idx_map,
@@ -2574,8 +2587,8 @@ def _radial_backproject_gpu_resident(
     finally:
         lease.release()
 
-def _radial_backproject_gpu_resident_on_device(
-    radial_mask_mm: np.ndarray,
+def _azimuthal_backproject_gpu_resident_on_device(
+    azimuthal_mask_mm: np.ndarray,
     vol_mm: Optional[np.ndarray],
     valid_mask: np.ndarray,
     source_idx_map: np.ndarray,
@@ -2593,15 +2606,15 @@ def _radial_backproject_gpu_resident_on_device(
     torch: object,
     dev: object,
 ) -> bool:
-    """Backproject a fully resident Radial volume with overlapped upload and host commit."""
-    n_az, work_t, u_len = (int(v) for v in radial_mask_mm.shape)
+    """Backproject a fully resident Azimuthal volume with overlapped upload and host commit."""
+    n_az, work_t, u_len = (int(v) for v in azimuthal_mask_mm.shape)
     plane_px = int(out_h) * int(out_w)
     t_chunk = max(1, _env_int('YOLO_TTA_GPU_BACKPROJECT_RESIDENT_T_CHUNK', 64))
     requested_pipeline_slots = max(1, min(3, _env_int(
         'YOLO_TTA_GPU_BACKPROJECT_RESIDENT_PIPELINE_SLOTS', 2,
     )))
     reserve = int(max(0.0, _env_float('YOLO_TTA_GPU_BACKPROJECT_RESIDENT_RESERVE_GIB', 4.0)) * GIB)
-    source_bytes = int(radial_mask_mm.nbytes)
+    source_bytes = int(azimuthal_mask_mm.nbytes)
     map_bytes = int(plane_px) * 2 * np.dtype(np.int32).itemsize
     output_bytes = int(t_chunk) * int(plane_px)
     base_need = int(
@@ -2629,7 +2642,7 @@ def _radial_backproject_gpu_resident_on_device(
     if known_row_occupancy is not None and int(np.asarray(known_row_occupancy).shape[0]) == int(work_t):
         row_any = np.asarray(known_row_occupancy, dtype=bool)
     else:
-        row_any = _radial_row_occupancy(radial_mask_mm, desc)
+        row_any = _azimuthal_row_occupancy(azimuthal_mask_mm, desc)
     source_flat = np.where(
         np.asarray(valid_mask, dtype=bool), np.asarray(source_idx_map, dtype=np.int32), np.int32(-1),
     ).reshape(-1)
@@ -2658,9 +2671,9 @@ def _radial_backproject_gpu_resident_on_device(
     transpose_seconds = 0.0
     projection_seconds = 0.0
     commit_cpu_seconds = 0.0
-    radial_dev = tmajor_dev = source_dev = u_dev = None
+    azimuthal_dev = tmajor_dev = source_dev = u_dev = None
     compute_tensor = compute_kernel = external = None
-    cp_source = cp_u = cp_azmajor = cp_tmajor = cp_radial = None
+    cp_source = cp_u = cp_azmajor = cp_tmajor = cp_azimuthal = None
     compute_done = copy_done = event = prior = block = None
     out_dev_slots: List[object] = []
     pin_src_slots: List[object] = []
@@ -2678,7 +2691,7 @@ def _radial_backproject_gpu_resident_on_device(
         # Torch and CuPy keep independent current-device state. Pin both explicitly so
         # the late-tail scheduler may choose any visible GPU, not only cuda:0.
         with torch.cuda.device(dev), cp.cuda.Device(int(dev_index)), torch.cuda.stream(compute_stream):
-            radial_dev = torch.empty((n_az, work_t, u_len), dtype=torch.uint8, device=dev)
+            azimuthal_dev = torch.empty((n_az, work_t, u_len), dtype=torch.uint8, device=dev)
 
             requested_upload_slots = max(1, min(3, _env_int(
                 'YOLO_TTA_GPU_BACKPROJECT_RESIDENT_UPLOAD_SLOTS', 2,
@@ -2708,9 +2721,9 @@ def _radial_backproject_gpu_resident_on_device(
                 count = int(a1 - a0)
                 np.copyto(
                     pin_src_arrays[slot_idx][:count],
-                    np.asarray(radial_mask_mm[a0:a1], dtype=np.uint8),
+                    np.asarray(azimuthal_mask_mm[a0:a1], dtype=np.uint8),
                 )
-                radial_dev[a0:a1].copy_(pin_src_slots[slot_idx][:count], non_blocking=True)
+                azimuthal_dev[a0:a1].copy_(pin_src_slots[slot_idx][:count], non_blocking=True)
                 event = torch.cuda.Event(blocking=False)
                 event.record(compute_stream)
                 upload_events[slot_idx] = event
@@ -2725,7 +2738,7 @@ def _radial_backproject_gpu_resident_on_device(
 
             layout = 'azimuth-major'
             compute_kernel = kernels.kernel_azmajor
-            compute_tensor = radial_dev
+            compute_tensor = azimuthal_dev
             tmajor_peak = int(
                 2 * source_bytes + map_bytes
                 + int(requested_pipeline_slots) * output_bytes
@@ -2738,7 +2751,7 @@ def _radial_backproject_gpu_resident_on_device(
                 transpose_t0 = time.perf_counter()
                 try:
                     tmajor_dev = torch.empty((work_t, n_az, u_len), dtype=torch.uint8, device=dev)
-                    cp_azmajor = cp.asarray(radial_dev)
+                    cp_azmajor = cp.asarray(azimuthal_dev)
                     cp_tmajor = cp.asarray(tmajor_dev)
                     total_source = int(n_az) * int(work_t) * int(u_len)
                     transpose_blocks = max(1, min(
@@ -2759,12 +2772,12 @@ def _radial_backproject_gpu_resident_on_device(
                     layout = 't-major'
                 except Exception as exc:
                     tmajor_dev = None
-                    compute_tensor = radial_dev
+                    compute_tensor = azimuthal_dev
                     compute_kernel = kernels.kernel_azmajor
                     print(f'{desc}: t-major resident transpose unavailable ({exc}); using azimuth-major layout.')
                 transpose_seconds = time.perf_counter() - transpose_t0
 
-            cp_radial = cp.asarray(compute_tensor)
+            cp_azimuthal = cp.asarray(compute_tensor)
             # allocate output device and pinned-host slots as pairs. A slot is not
             # reused until its D2H event and CPU sink commit have both completed; another
             # slot can therefore run the next projection while copy/packing proceeds.
@@ -2851,7 +2864,7 @@ def _radial_backproject_gpu_resident_on_device(
                 compute_kernel(
                     (int(launch_blocks),), (256,),
                     (
-                        cp_radial, np.int32(n_az), np.int32(work_t), np.int32(u_len),
+                        cp_azimuthal, np.int32(n_az), np.int32(work_t), np.int32(u_len),
                         cp_source, cp_u, np.int32(plane_px), np.int32(t_dim),
                         np.int32(t0), np.int32(count), cp_out_slots[slot_idx],
                     ),
@@ -2923,10 +2936,10 @@ def _radial_backproject_gpu_resident_on_device(
         out_dev_slots.clear()
         pin_src_slots.clear()
         pin_out_slots.clear()
-        cp_radial = cp_azmajor = cp_tmajor = cp_source = cp_u = None
+        cp_azimuthal = cp_azmajor = cp_tmajor = cp_source = cp_u = None
         compute_tensor = compute_kernel = external = None
         compute_done = copy_done = event = prior = block = None
-        radial_dev = tmajor_dev = source_dev = u_dev = None
+        azimuthal_dev = tmajor_dev = source_dev = u_dev = None
         commit_pool = None
         fut = owned_stream = None
         compute_stream = copy_stream = None
@@ -2941,8 +2954,8 @@ def _radial_backproject_gpu_resident_on_device(
         if cleanup_error is not None and not bool(active_exception):
             raise cleanup_error
 
-def _radial_backproject_gpu_streaming(
-    radial_mask_mm: np.ndarray,
+def _azimuthal_backproject_gpu_streaming(
+    azimuthal_mask_mm: np.ndarray,
     vol_mm: Optional[np.ndarray],
     valid_pos: np.ndarray,
     flat_src: np.ndarray,
@@ -2956,7 +2969,7 @@ def _radial_backproject_gpu_streaming(
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
     sink_only: bool = False,
 ) -> bool:
-    """Run bounded Radial backprojection under an inference-exclusive GPU lease."""
+    """Run bounded Azimuthal backprojection under an inference-exclusive GPU lease."""
     try:
         import torch  # type: ignore
         if not bool(torch.cuda.is_available()):
@@ -2964,18 +2977,18 @@ def _radial_backproject_gpu_streaming(
     except Exception:
         return False
     lease = _try_acquire_main_process_gpu_stage(
-        torch, f'{desc} streaming Radial backprojection',
+        torch, f'{desc} streaming Azimuthal backprojection',
     )
     if lease is None:
         _announce_main_gpu_stage_skip_once(
-            'radial-streaming-inference-busy',
+            'azimuthal-streaming-inference-busy',
             f'{desc}: streaming GPU backprojection skipped because every eligible GPU '
             'has active/queued inference or another main-process GPU stage; using the CPU path.',
         )
         return False
     try:
-        return _radial_backproject_gpu_streaming_on_device(
-            radial_mask_mm,
+        return _azimuthal_backproject_gpu_streaming_on_device(
+            azimuthal_mask_mm,
             vol_mm,
             valid_pos,
             flat_src,
@@ -2994,8 +3007,8 @@ def _radial_backproject_gpu_streaming(
     finally:
         lease.release()
 
-def _radial_backproject_gpu_streaming_on_device(
-    radial_mask_mm: np.ndarray,
+def _azimuthal_backproject_gpu_streaming_on_device(
+    azimuthal_mask_mm: np.ndarray,
     vol_mm: Optional[np.ndarray],
     valid_pos: np.ndarray,
     flat_src: np.ndarray,
@@ -3012,8 +3025,8 @@ def _radial_backproject_gpu_streaming_on_device(
     torch: object,
     dev: object,
 ) -> bool:
-    """Backproject a Radial volume through a bounded streaming GPU working set."""
-    n_az, work_t, u_len = (int(x) for x in radial_mask_mm.shape)
+    """Backproject a Azimuthal volume through a bounded streaming GPU working set."""
+    n_az, work_t, u_len = (int(x) for x in azimuthal_mask_mm.shape)
     plane_px = int(out_h) * int(out_w)
     # A larger projection quantum amortizes map gathers and the t-major staging transpose.
     t_chunk = max(1, _env_int('YOLO_TTA_GPU_BACKPROJECT_T_CHUNK', 128))
@@ -3049,8 +3062,8 @@ def _radial_backproject_gpu_streaming_on_device(
     if known_row_occupancy is not None and int(np.asarray(known_row_occupancy).shape[0]) == int(work_t):
         row_any = np.asarray(known_row_occupancy, dtype=bool)
     else:
-        row_any = _radial_row_occupancy(radial_mask_mm, desc)
-    slice_bboxes = _validated_radial_slice_bboxes(
+        row_any = _azimuthal_row_occupancy(azimuthal_mask_mm, desc)
+    slice_bboxes = _validated_azimuthal_slice_bboxes(
         known_slice_bboxes, int(n_az), int(work_t), int(u_len),
     )
     stage_workers = max(1, min(8, _cpu_count()))
@@ -3099,8 +3112,8 @@ def _radial_backproject_gpu_streaming_on_device(
                 if int(v_count) > int(pin_rows.shape[0]):  # pragma: no cover - conservative bound
                     raise RuntimeError(f'{desc}: covering rows {v_count} exceed staging bound {pin_rows.shape[0]}')
 
-                _stage_radial_t_major_block(
-                    radial_mask_mm,
+                _stage_azimuthal_t_major_block(
+                    azimuthal_mask_mm,
                     int(v0),
                     int(v1),
                     pin_rows_np,
@@ -3193,15 +3206,15 @@ def _radial_backproject_gpu_streaming_on_device(
     )
     return True
 
-def _log_radial_backprojection_densification(
+def _log_azimuthal_backprojection_densification(
     desc: str,
     plan_stats: Dict[str, float],
 ) -> None:
-    """Report when a coarse Radial source is densified for continuous backprojection."""
+    """Report when a coarse Azimuthal source is densified for continuous backprojection."""
     if not bool(plan_stats.get('densified', 0.0)):
         return
     print(
-        f"{desc}: densifying radial backprojection for continuity "
+        f"{desc}: densifying azimuthal backprojection for continuity "
         f"from {int(plan_stats['source_frames'])} source frame(s) at "
         f"{float(plan_stats['provided_spacing_deg']):.6g}° spacing to "
         f"{int(plan_stats['backprojection_angles'])} backprojection angle(s) at "
@@ -3209,21 +3222,21 @@ def _log_radial_backprojection_densification(
         f"(full-coverage threshold {float(plan_stats['coverage_spacing_deg']):.6g}°)"
     )
 
-def _radial_output_stack_and_plane_shape(
-    radial_view: ViewInfo,
+def _azimuthal_output_stack_and_plane_shape(
+    azimuthal_view: ViewInfo,
     out_shape_tyx: Tuple[int, int, int],
 ) -> Tuple[int, Tuple[int, int]]:
     out_t, out_h, out_w = (int(v) for v in out_shape_tyx)
-    base = radial_base_view_name(radial_view)
+    base = azimuthal_base_view_name(azimuthal_view)
     if base == 'transverse':
         return int(out_t), (int(out_h), int(out_w))
     if base == 'sagittal':
         return int(out_h), (int(out_t), int(out_w))
     if base == 'coronal':
         return int(out_w), (int(out_t), int(out_h))
-    raise ValueError(f'Unsupported Radial base: {base}')
+    raise ValueError(f'Unsupported Azimuthal base: {base}')
 
-def _radial_source_rows_for_output(
+def _azimuthal_source_rows_for_output(
     source_rows: int,
     output_rows: int,
     output_index: int,
@@ -3241,14 +3254,14 @@ def _radial_source_rows_for_output(
     nearest = int(np.clip(int(round(coord)), 0, src - 1))
     return range(nearest, nearest + 1)
 
-def _radial_backproject_plane(
-    radial_mask_mm: np.ndarray,
-    dense_map: DenseRadialBackprojectionMap,
+def _azimuthal_backproject_plane(
+    azimuthal_mask_mm: np.ndarray,
+    dense_map: DenseAzimuthalBackprojectionMap,
     source_rows: Sequence[int],
     *,
     plane_row_slice: Optional[slice] = None,
 ) -> np.ndarray:
-    src = np.asarray(radial_mask_mm)
+    src = np.asarray(azimuthal_mask_mm)
     rows = list(int(v) for v in source_rows)
     row_sel = slice(None) if plane_row_slice is None else plane_row_slice
     valid = np.asarray(dense_map.valid_mask, dtype=bool)[row_sel]
@@ -3269,9 +3282,9 @@ def _radial_backproject_plane(
     ]
     return out
 
-def _backproject_cartesian_radial_generic(
-    radial_mask_mm: np.ndarray,
-    radial_view: ViewInfo,
+def _backproject_cartesian_azimuthal_generic(
+    azimuthal_mask_mm: np.ndarray,
+    azimuthal_view: ViewInfo,
     out_path: Path,
     desc: str,
     *,
@@ -3282,19 +3295,19 @@ def _backproject_cartesian_radial_generic(
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]],
     sink_only: bool,
 ) -> np.ndarray | SinkOnlyProjectionResult:
-    """Orientation-aware dense or sink-only backprojection for upright Radial views."""
+    """Orientation-aware dense or sink-only backprojection for upright Azimuthal views."""
     target_shape = (
-        (int(radial_view.full_t), int(radial_view.full_h), int(radial_view.full_w))
+        (int(azimuthal_view.full_t), int(azimuthal_view.full_h), int(azimuthal_view.full_w))
         if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     )
     if bool(sink_only) and projection_block_callback is None:
         raise ValueError(f'{desc}: sink_only=True requires projection_block_callback')
-    stack_len, plane_shape = _radial_output_stack_and_plane_shape(radial_view, target_shape)
-    plan, plan_stats = build_radial_backprojection_plan(radial_view)
-    _log_radial_backprojection_densification(desc, plan_stats)
-    base = radial_base_view_name(radial_view)
+    stack_len, plane_shape = _azimuthal_output_stack_and_plane_shape(azimuthal_view, target_shape)
+    plan, plan_stats = build_azimuthal_backprojection_plan(azimuthal_view)
+    _log_azimuthal_backprojection_densification(desc, plan_stats)
+    base = azimuthal_base_view_name(azimuthal_view)
     if base not in ('sagittal', 'coronal'):
-        raise ValueError(f'Generic Cartesian Radial branch received base {base!r}')
+        raise ValueError(f'Generic Cartesian Azimuthal branch received base {base!r}')
 
     out: Optional[np.ndarray] = None
     if not bool(sink_only):
@@ -3308,7 +3321,7 @@ def _backproject_cartesian_radial_generic(
         )
     else:
         print(
-            f'{desc}: orientation-aware sink-only Radial projection active; skipping '
+            f'{desc}: orientation-aware sink-only Azimuthal projection active; skipping '
             f'{array_nbytes(target_shape, np.uint8) / GIB:.2f} GiB dense workspace.'
         )
 
@@ -3325,19 +3338,19 @@ def _backproject_cartesian_radial_generic(
             return out
         return SinkOnlyProjectionResult(tuple(int(v) for v in target_shape))
 
-    grid = resolve_radial_processing_grid(radial_mask_mm, radial_view)
-    dense_map = _radial_dense_map_for_processing(build_dense_radial_backprojection_map(
-        radial_view, plan, out_shape_hw=plane_shape,
+    grid = resolve_azimuthal_processing_grid(azimuthal_mask_mm, azimuthal_view)
+    dense_map = _azimuthal_dense_map_for_processing(build_dense_azimuthal_backprojection_map(
+        azimuthal_view, plan, out_shape_hw=plane_shape,
     ), grid)
     worker_count = choose_slice_parallel_workers(int(workers), int(stack_len))
 
     def _rows(stack_idx: int) -> np.ndarray:
-        return _radial_processing_rows_for_output(grid, int(stack_len), int(stack_idx))
+        return _azimuthal_processing_rows_for_output(grid, int(stack_len), int(stack_idx))
 
     if out is not None:
         def _build(stack_idx: int) -> None:
-            plane = _radial_backproject_plane(
-                radial_mask_mm, dense_map, _rows(int(stack_idx)),
+            plane = _azimuthal_backproject_plane(
+                azimuthal_mask_mm, dense_map, _rows(int(stack_idx)),
             )
             if base == 'sagittal':
                 out[:, int(stack_idx), :] = plane
@@ -3372,8 +3385,8 @@ def _backproject_cartesian_radial_generic(
         block_out = np.zeros((t1 - t0, out_h, out_w), dtype=np.uint8)
 
         def _fill_stack(stack_idx: int) -> None:
-            plane_band = _radial_backproject_plane(
-                radial_mask_mm,
+            plane_band = _azimuthal_backproject_plane(
+                azimuthal_mask_mm,
                 dense_map,
                 _rows(int(stack_idx)),
                 plane_row_slice=slice(int(t0), int(t1)),
@@ -3405,7 +3418,7 @@ if _numba is not None:
     # to a new versioned filename/module, and a cached environment from the prior filename can
     # fail to import before the first projection.
     @_numba.njit(cache=False, nogil=True)  # type: ignore[misc]
-    def _numba_or_tilted_radial_coordinates_into_packed(
+    def _numba_or_tilted_azimuthal_coordinates_into_packed(
         destination_flat: np.ndarray,
         ti: np.ndarray,
         yi: np.ndarray,
@@ -3424,9 +3437,9 @@ if _numba is not None:
             )
             destination_flat[destination_index] |= np.uint8(1 << (7 - (x & 7)))
 else:
-    _numba_or_tilted_radial_coordinates_into_packed = None
+    _numba_or_tilted_azimuthal_coordinates_into_packed = None
 
-def _or_tilted_radial_coordinates_into_packed(
+def _or_tilted_azimuthal_coordinates_into_packed(
     destination_flat: np.ndarray,
     ti: np.ndarray,
     yi: np.ndarray,
@@ -3436,8 +3449,8 @@ def _or_tilted_radial_coordinates_into_packed(
     packed_w: int,
 ) -> None:
     """OR final source coordinates into a C-order packed destination."""
-    if _numba_or_tilted_radial_coordinates_into_packed is not None:
-        _numba_or_tilted_radial_coordinates_into_packed(
+    if _numba_or_tilted_azimuthal_coordinates_into_packed is not None:
+        _numba_or_tilted_azimuthal_coordinates_into_packed(
             destination_flat,
             np.asarray(ti, dtype=np.int32),
             np.asarray(yi, dtype=np.int32),
@@ -3456,9 +3469,9 @@ def _or_tilted_radial_coordinates_into_packed(
     ).astype(np.uint8, copy=False)
     np.bitwise_or.at(destination_flat, packed_indices, bit_masks)
 
-def _backproject_tilted_radial_volume_to_volume(
-    radial_mask_mm: np.ndarray,
-    radial_view: ViewInfo,
+def _backproject_tilted_azimuthal_volume_to_volume(
+    azimuthal_mask_mm: np.ndarray,
+    azimuthal_view: ViewInfo,
     out_path: Path,
     desc: str,
     *,
@@ -3471,32 +3484,32 @@ def _backproject_tilted_radial_volume_to_volume(
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]],
     sink_only: bool,
 ) -> np.ndarray | SinkOnlyProjectionResult:
-    """Compose Radial reconstruction and Tilted inverse projection into one destination.
+    """Compose Azimuthal reconstruction and Tilted inverse projection into one destination.
 
     The retired implementation first wrote a dense ``(stack, plane_v, plane_u)`` tilted
     Cartesian volume, then read that roughly 25 GiB workspace a second time to scatter it
     into source geometry.  The dense path now gathers only foreground positions from one
-    reconstructed radial frame and immediately scatters those coordinates into the final
+    reconstructed azimuthal frame and immediately scatters those coordinates into the final
     destination.  Sink-only callers use a source-space packed-bit accumulator (one eighth the
     uint8 size) and emit completed t-major blocks directly to the callback; neither mode ever
     materializes the tilted base stack.
     """
     if bool(sink_only) and projection_block_callback is None:
         raise ValueError(f'{desc}: sink_only=True requires projection_block_callback')
-    if not is_tilted_radial_view(radial_view):
-        raise ValueError(f'{desc}: composed tilted-Radial projection requires a tilted Radial view')
+    if not is_tilted_azimuthal_view(azimuthal_view):
+        raise ValueError(f'{desc}: composed tilted-Azimuthal projection requires a tilted Azimuthal view')
 
-    tilted_source = radial_source_tilted_view(radial_view)
+    tilted_source = azimuthal_source_tilted_view(azimuthal_view)
     target_shape = (
-        (int(radial_view.full_t), int(radial_view.full_h), int(radial_view.full_w))
+        (int(azimuthal_view.full_t), int(azimuthal_view.full_h), int(azimuthal_view.full_w))
         if out_shape_tyx is None else tuple(int(v) for v in out_shape_tyx)
     )
     t_dim, out_h, out_w = (int(v) for v in target_shape)
     if min(t_dim, out_h, out_w) <= 0:
         raise ValueError(f'{desc}: invalid output shape {target_shape}')
 
-    plan, plan_stats = build_radial_backprojection_plan(radial_view)
-    _log_radial_backprojection_densification(desc, plan_stats)
+    plan, plan_stats = build_azimuthal_backprojection_plan(azimuthal_view)
+    _log_azimuthal_backprojection_densification(desc, plan_stats)
     if not plan:
         _emit_projection_empty_range(
             projection_block_callback, 0, int(t_dim), (int(out_h), int(out_w)),
@@ -3517,20 +3530,20 @@ def _backproject_tilted_radial_volume_to_volume(
 
     plane_h, plane_w = (int(tilted_source.src_h), int(tilted_source.src_w))
     stack_len = int(tilted_source.num_slices)
-    grid = resolve_radial_processing_grid(radial_mask_mm, radial_view)
-    dense_map = _radial_dense_map_for_processing(
-        build_dense_radial_backprojection_map(
-            radial_view, plan, out_shape_hw=(int(plane_h), int(plane_w)),
+    grid = resolve_azimuthal_processing_grid(azimuthal_mask_mm, azimuthal_view)
+    dense_map = _azimuthal_dense_map_for_processing(
+        build_dense_azimuthal_backprojection_map(
+            azimuthal_view, plan, out_shape_hw=(int(plane_h), int(plane_w)),
         ),
         grid,
     )
     valid_flat = np.flatnonzero(np.asarray(dense_map.valid_mask, dtype=bool).reshape(-1))
     valid_v = np.ascontiguousarray((valid_flat // int(plane_w)).astype(np.int32, copy=False))
     valid_u = np.ascontiguousarray((valid_flat % int(plane_w)).astype(np.int32, copy=False))
-    radial_source_idx = np.ascontiguousarray(
+    azimuthal_source_idx = np.ascontiguousarray(
         np.asarray(dense_map.source_idx_map, dtype=np.int32).reshape(-1)[valid_flat]
     )
-    radial_u_idx = np.ascontiguousarray(
+    azimuthal_u_idx = np.ascontiguousarray(
         np.asarray(dense_map.u_idx_map, dtype=np.int32).reshape(-1)[valid_flat]
     )
 
@@ -3540,12 +3553,12 @@ def _backproject_tilted_radial_volume_to_volume(
         if int(candidate.shape[0]) == int(grid.processing_h):
             row_occ = candidate
     # Validate metadata even though the direct gather currently uses row occupancy as its
-    # high-value skip.  This catches stale descriptors at the same boundary as upright Radial.
-    _validated_radial_slice_bboxes(
+    # high-value skip.  This catches stale descriptors at the same boundary as upright Azimuthal.
+    _validated_azimuthal_slice_bboxes(
         known_slice_bboxes,
-        int(np.asarray(radial_mask_mm).shape[0]),
+        int(np.asarray(azimuthal_mask_mm).shape[0]),
         int(grid.processing_h),
-        int(np.asarray(radial_mask_mm).shape[2]),
+        int(np.asarray(azimuthal_mask_mm).shape[2]),
     )
 
     work_t = int(tilted_source.full_t)
@@ -3570,8 +3583,8 @@ def _backproject_tilted_radial_volume_to_volume(
     def _compose_frame_indices(
         frame_index: int,
     ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """Return final source coordinates contributed by one tilted-Radial frame."""
-        rows = _radial_processing_rows_for_output(grid, int(stack_len), int(frame_index))
+        """Return final source coordinates contributed by one tilted-Azimuthal frame."""
+        rows = _azimuthal_processing_rows_for_output(grid, int(stack_len), int(frame_index))
         if int(rows.size) <= 0:
             return None
         if row_occ is not None and not bool(np.any(row_occ[rows])):
@@ -3581,10 +3594,10 @@ def _backproject_tilted_radial_volume_to_volume(
             if row_occ is not None and not bool(row_occ[int(processing_row)]):
                 continue
             hit |= np.asarray(
-                radial_mask_mm[
-                    radial_source_idx,
+                azimuthal_mask_mm[
+                    azimuthal_source_idx,
                     int(processing_row),
-                    radial_u_idx,
+                    azimuthal_u_idx,
                 ],
                 dtype=np.uint8,
             ) != 0
@@ -3641,7 +3654,7 @@ def _backproject_tilted_radial_volume_to_volume(
             reserve_bytes=int(reserve_bytes),
         )
         print(
-            f'{desc}: v16.1.3 direct tilted-Radial composition active; no '
+            f'{desc}: v16.1.3 direct tilted-Azimuthal composition active; no '
             f'{avoided_base_bytes / GIB:.2f} GiB tilted base-stack intermediate is allocated.'
         )
         destination_flat = np.asarray(destination).reshape(-1)
@@ -3688,7 +3701,7 @@ def _backproject_tilted_radial_volume_to_volume(
     # exact union semantics while reducing the live destination from one byte to one bit per
     # voxel and lets the cvol writer receive final t-major blocks without a dense uint8 file.
     packed_w = int((int(out_w) + 7) // 8)
-    packed_path = Path(out_path).with_name(Path(out_path).name + '.tilted_radial.bits.dat')
+    packed_path = Path(out_path).with_name(Path(out_path).name + '.tilted_azimuthal.bits.dat')
     packed_destination: Optional[np.ndarray] = None
     try:
         packed_destination = allocate_workspace_array(
@@ -3701,7 +3714,7 @@ def _backproject_tilted_radial_volume_to_volume(
             reserve_bytes=int(reserve_bytes),
         )
         print(
-            f'{desc}: v16.1.3 direct tilted-Radial packed sink active; no '
+            f'{desc}: v16.1.3 direct tilted-Azimuthal packed sink active; no '
             f'{avoided_base_bytes / GIB:.2f} GiB tilted base stack and no '
             f'{array_nbytes(target_shape, np.uint8) / GIB:.2f} GiB uint8 source destination. '
             f'Packed source union={array_nbytes((t_dim, out_h, packed_w), np.uint8) / GIB:.2f} GiB.'
@@ -3711,7 +3724,7 @@ def _backproject_tilted_radial_volume_to_volume(
             1,
             min(
                 int(worker_count),
-                _env_int('YOLO_TTA_TILTED_RADIAL_SINK_WORKERS', int(worker_count)),
+                _env_int('YOLO_TTA_TILTED_AZIMUTHAL_SINK_WORKERS', int(worker_count)),
             ),
         )
         for coordinates in parallel_map_unordered(
@@ -3723,14 +3736,14 @@ def _backproject_tilted_radial_volume_to_volume(
             if coordinates is None:
                 continue
             ti, yi, xi = coordinates
-            _or_tilted_radial_coordinates_into_packed(
+            _or_tilted_azimuthal_coordinates_into_packed(
                 packed_flat, ti, yi, xi,
                 out_h=int(out_h), packed_w=int(packed_w),
             )
 
         target_block_bytes = max(
             16 * 1024 * 1024,
-            int(max(16.0, _env_float('YOLO_TTA_TILTED_RADIAL_SINK_BLOCK_MIB', 256.0)) * 1024 * 1024),
+            int(max(16.0, _env_float('YOLO_TTA_TILTED_AZIMUTHAL_SINK_BLOCK_MIB', 256.0)) * 1024 * 1024),
         )
         callback_cap = max(1, _env_int('YOLO_TTA_PROJECTION_CALLBACK_BLOCK', 64))
         block_slices = max(
@@ -3768,9 +3781,9 @@ def _backproject_tilted_radial_volume_to_volume(
         except Exception:
             pass
 
-def backproject_radial_volume_to_volume(
-    radial_mask_mm: np.ndarray,
-    radial_view: ViewInfo,
+def backproject_azimuthal_volume_to_volume(
+    azimuthal_mask_mm: np.ndarray,
+    azimuthal_view: ViewInfo,
     out_path: Path,
     desc: str,
     *,
@@ -3783,43 +3796,43 @@ def backproject_radial_volume_to_volume(
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None,
     sink_only: bool = False,
 ) -> np.ndarray | SinkOnlyProjectionResult:
-    """Backproject a radial view-native mask stack into orthogonal (t, Y, X).
+    """Backproject a azimuthal view-native mask stack into orthogonal (t, Y, X).
 
  ``out_shape_tyx`` backprojects directly into final source geometry. Transverse retains the
  optimized t-major implementation; sagittal/coronal build the dense circle map on their final
- ``(t,X)``/``(t,Y)`` planes. Tilted Radial views compose radial reconstruction with the
+ ``(t,X)``/``(t,Y)`` planes. Tilted Azimuthal views compose azimuthal reconstruction with the
  Tilted shear and write final source geometry directly, without a dense tilted base stack.
  This terminal geometry map converts working-space circles into source-space ellipses when t
  was cube-resized.
 
  ``sink_only=True`` commits completed output-t blocks transactionally for every upright or
- tilted Cartesian Radial base; tilted-Radial uses one transient final destination but never
+ tilted Cartesian Azimuthal base; tilted-Azimuthal uses one transient final destination but never
  materializes the retired base-stack intermediate."""
-    if not is_radial_view(radial_view):
-        raise ValueError('backproject_radial_volume_to_volume expects a radial view')
+    if not is_azimuthal_view(azimuthal_view):
+        raise ValueError('backproject_azimuthal_volume_to_volume expects a azimuthal view')
 
-    if is_tilted_radial_view(radial_view):
-        return _backproject_tilted_radial_volume_to_volume(
-            radial_mask_mm, radial_view, out_path, desc,
+    if is_tilted_azimuthal_view(azimuthal_view):
+        return _backproject_tilted_azimuthal_volume_to_volume(
+            azimuthal_mask_mm, azimuthal_view, out_path, desc,
             prefer_memory=bool(prefer_memory), reserve_bytes=int(reserve_bytes),
             workers=int(workers), out_shape_tyx=out_shape_tyx,
             known_row_occupancy=known_row_occupancy,
             known_slice_bboxes=known_slice_bboxes,
             projection_block_callback=projection_block_callback, sink_only=bool(sink_only),
         )
-    if radial_base_view_name(radial_view) != 'transverse':
-        return _backproject_cartesian_radial_generic(
-            radial_mask_mm, radial_view, out_path, desc,
+    if azimuthal_base_view_name(azimuthal_view) != 'transverse':
+        return _backproject_cartesian_azimuthal_generic(
+            azimuthal_mask_mm, azimuthal_view, out_path, desc,
             prefer_memory=bool(prefer_memory), reserve_bytes=int(reserve_bytes),
             workers=int(workers), out_shape_tyx=out_shape_tyx,
             projection_block_callback=projection_block_callback, sink_only=bool(sink_only),
         )
 
-    processing_grid = resolve_radial_processing_grid(radial_mask_mm, radial_view)
-    native_work_t = int(radial_view.src_h)
+    processing_grid = resolve_azimuthal_processing_grid(azimuthal_mask_mm, azimuthal_view)
+    native_work_t = int(azimuthal_view.src_h)
     work_t = int(processing_grid.processing_h)
-    work_h = int(radial_view.full_h)
-    work_w = int(radial_view.full_w)
+    work_h = int(azimuthal_view.full_h)
+    work_w = int(azimuthal_view.full_w)
     if out_shape_tyx is None:
         t_dim, out_h, out_w = native_work_t, work_h, work_w
     else:
@@ -3839,14 +3852,14 @@ def backproject_radial_volume_to_volume(
         )
     else:
         print(
-            f'{desc}: v13.3.17 C2 sink-only radial projection active; '
+            f'{desc}: v13.3.17 C2 sink-only azimuthal projection active; '
             f'skipping {array_nbytes((t_dim, out_h, out_w), np.uint8) / GIB:.2f} GiB dense workspace.'
         )
 
-    plan, plan_stats = build_radial_backprojection_plan(radial_view)
+    plan, plan_stats = build_azimuthal_backprojection_plan(azimuthal_view)
     if bool(plan_stats.get('densified', 0.0)):
         print(
-            f"{desc}: densifying radial backprojection for continuity "
+            f"{desc}: densifying azimuthal backprojection for continuity "
             f"from {int(plan_stats['source_frames'])} source frame(s) at "
             f"{float(plan_stats['provided_spacing_deg']):.6g}° spacing to "
             f"{int(plan_stats['backprojection_angles'])} backprojection angle(s) at "
@@ -3867,8 +3880,8 @@ def backproject_radial_volume_to_volume(
             return vol_mm
         return SinkOnlyProjectionResult((int(t_dim), int(out_h), int(out_w)))
 
-    dense_map = _radial_dense_map_for_processing(build_dense_radial_backprojection_map(
-        radial_view, plan, out_shape_hw=None if out_shape_tyx is None else (out_h, out_w)
+    dense_map = _azimuthal_dense_map_for_processing(build_dense_azimuthal_backprojection_map(
+        azimuthal_view, plan, out_shape_hw=None if out_shape_tyx is None else (out_h, out_w)
     ), processing_grid)
     valid = np.asarray(dense_map.valid_mask, dtype=bool)
     source_idx_map = np.asarray(dense_map.source_idx_map, dtype=np.int32)
@@ -3882,11 +3895,11 @@ def backproject_radial_volume_to_volume(
     )
 
     # flatten the dense gather once. valid_pos holds the flat output positions
-    # of in-ROI pixels; flat_src holds each one's flat (source_frame, u) index into a radial
+    # of in-ROI pixels; flat_src holds each one's flat (source_frame, u) index into a azimuthal
     # cross-section. Per slice this turns the 2-array fancy gather + two masked passes into one
-    # take + one indexed store, and empty radial cross-sections are skipped outright (the
+    # take + one indexed store, and empty azimuthal cross-sections are skipped outright (the
     # nearly-empty bridge layers become almost free).
-    u_len = int(radial_mask_mm.shape[2])
+    u_len = int(azimuthal_mask_mm.shape[2])
     valid_pos = np.flatnonzero(valid.reshape(-1))
     flat_src = (
         source_idx_map.reshape(-1)[valid_pos].astype(np.int64) * np.int64(u_len)
@@ -3896,7 +3909,7 @@ def backproject_radial_volume_to_volume(
     def _v_range_for_t(t_idx: int) -> Tuple[int, int]:
         if same_t_axis:
             return int(t_idx), int(t_idx) + 1
-        mapped = _radial_processing_rows_for_output(
+        mapped = _azimuthal_processing_rows_for_output(
             processing_grid, int(t_dim), int(t_idx),
         )
         if mapped.size <= 0:
@@ -3911,9 +3924,9 @@ def backproject_radial_volume_to_volume(
         row_occ = np.asarray(known_row_occupancy, dtype=bool).reshape(-1)
         if int(row_occ.shape[0]) != int(work_t):
             row_occ = None
-    radial_slice_bboxes = _validated_radial_slice_bboxes(
+    azimuthal_slice_bboxes = _validated_azimuthal_slice_bboxes(
         known_slice_bboxes,
-        int(radial_mask_mm.shape[0]),
+        int(azimuthal_mask_mm.shape[0]),
         int(work_t),
         int(u_len),
     )
@@ -3922,19 +3935,19 @@ def backproject_radial_volume_to_volume(
     if gpu_backproject_enabled():
         try:
             if not processing_grid.reduced:
-                gpu_done = _radial_backproject_gpu_resident(
-                    radial_mask_mm, vol_mm, valid, source_idx_map, u_idx_map, _v_range_for_t,
+                gpu_done = _azimuthal_backproject_gpu_resident(
+                    azimuthal_mask_mm, vol_mm, valid, source_idx_map, u_idx_map, _v_range_for_t,
                     int(t_dim), int(out_h), int(out_w), desc,
                     known_row_occupancy=row_occ,
                     projection_block_callback=projection_block_callback,
                     sink_only=bool(sink_only),
                 )
             if not gpu_done:
-                gpu_done = _radial_backproject_gpu_streaming(
-                    radial_mask_mm, vol_mm, valid_pos, flat_src, _v_range_for_t,
+                gpu_done = _azimuthal_backproject_gpu_streaming(
+                    azimuthal_mask_mm, vol_mm, valid_pos, flat_src, _v_range_for_t,
                     int(t_dim), int(out_h), int(out_w), desc,
                     known_row_occupancy=row_occ,
-                    known_slice_bboxes=radial_slice_bboxes,
+                    known_slice_bboxes=azimuthal_slice_bboxes,
                     projection_block_callback=projection_block_callback,
                     sink_only=bool(sink_only),
                 )
@@ -3950,7 +3963,7 @@ def backproject_radial_volume_to_volume(
 
     if not gpu_done:
         if row_occ is None:
-            row_occ = _radial_row_occupancy(radial_mask_mm, desc)
+            row_occ = _azimuthal_row_occupancy(azimuthal_mask_mm, desc)
         cpu_t_chunk = max(1, _env_int('YOLO_TTA_CPU_BACKPROJECT_T_CHUNK', 128))
         n_blocks = int(math.ceil(float(t_dim) / float(cpu_t_chunk)))
         stage_workers = max(1, min(8, int(worker_count), _cpu_count()))
@@ -3961,7 +3974,7 @@ def backproject_radial_volume_to_volume(
         # blocks generally saturate memory bandwidth without recreating that contention.
         max_block_rows = int(math.ceil(float(cpu_t_chunk) * float(work_t) / float(max(1, t_dim)))) + 2
         per_block_bytes = (
-            int(max_block_rows) * int(radial_mask_mm.shape[0]) * int(u_len)
+            int(max_block_rows) * int(azimuthal_mask_mm.shape[0]) * int(u_len)
             + int(max_block_rows) * int(valid_pos.shape[0])
         )
         block_workers = max(1, min(
@@ -3987,14 +4000,14 @@ def backproject_radial_volume_to_volume(
                 )
                 return
             t_major = np.empty(
-                (int(v1 - v0), int(radial_mask_mm.shape[0]), int(u_len)), dtype=np.uint8,
+                (int(v1 - v0), int(azimuthal_mask_mm.shape[0]), int(u_len)), dtype=np.uint8,
             )
-            _stage_radial_t_major_block(
-                radial_mask_mm,
+            _stage_azimuthal_t_major_block(
+                azimuthal_mask_mm,
                 int(v0),
                 int(v1),
                 t_major,
-                slice_bboxes=radial_slice_bboxes,
+                slice_bboxes=azimuthal_slice_bboxes,
                 stage_pool=stage_pool,
                 stage_workers=stage_workers,
             )
@@ -4289,6 +4302,12 @@ def backproject_tilted_volume_to_volume(
 
     return vol_mm
 
+def backproject_radial_volume_to_volume(*args, **kwargs):
+    """Dispatch radius-swept shell patches to their bounded source-space projector."""
+    from .cylindrical_projection import backproject_radial_volume_to_volume as project
+    return project(*args, **kwargs)
+
+
 @dataclass(frozen=True)
 class ViewBackprojectionQueueJob:
     model_name: str
@@ -4303,10 +4322,10 @@ class ViewBackprojectionQueueJob:
     out_shape_tyx: Optional[Tuple[int, int, int]] = None
 
 class HybridBackprojectionQueue:
-    """Sequential Radial/Tilted backprojection queue with a full CPU fallback budget.
+    """Sequential Azimuthal/Tilted backprojection queue with a full CPU fallback budget.
 
- Upright Radial views use orientation-aware dense or sink-only projection; transverse may also
- use the resident GPU backprojector. Tilted Radial jobs use the direct composed Radial/shear
+ Upright Azimuthal views use orientation-aware dense or sink-only projection; transverse may also
+ use the resident GPU backprojector. Tilted Azimuthal jobs use the direct composed Azimuthal/shear
  projector, while ordinary Tilted jobs use the shared CPU shear path. The historical
  class name is retained to avoid scheduler call-site churn."""
 
@@ -4315,14 +4334,20 @@ class HybridBackprojectionQueue:
 
     def _run_job(self, job: ViewBackprojectionQueueJob) -> Tuple[str, str, np.ndarray]:
         view_local = job.view
-        if view_local.family == 'radial':
-            projected = backproject_radial_volume_to_volume(
-                radial_mask_mm=job.native_source,
-                radial_view=view_local,
+        if view_local.family == 'azimuthal':
+            projected = backproject_azimuthal_volume_to_volume(
+                azimuthal_mask_mm=job.native_source,
+                azimuthal_view=view_local,
                 out_path=job.out_path,
                 desc=job.desc,
                 prefer_memory=True,
                 workers=int(job.workers),
+                out_shape_tyx=job.out_shape_tyx,
+            )
+        elif view_local.family == 'radial':
+            projected = backproject_radial_volume_to_volume(
+                radial_mask_mm=job.native_source, radial_view=view_local,
+                out_path=job.out_path, desc=job.desc, workers=int(job.workers),
                 out_shape_tyx=job.out_shape_tyx,
             )
         elif is_tilted_view(view_local):
@@ -4345,16 +4370,18 @@ class HybridBackprojectionQueue:
     def run(self, jobs: Sequence[ViewBackprojectionQueueJob]) -> List[Tuple[str, str, np.ndarray]]:
         results: List[Tuple[str, str, np.ndarray]] = []
         for job in jobs:
-            if is_radial_view(job.view):
-                if is_tilted_radial_view(job.view):
-                    backend_note = 'direct composed tilted-Radial projection'
-                elif radial_base_view_name(job.view) == 'transverse':
-                    backend_note = 'transverse Radial GPU backprojection path (CPU fallback)'
+            if is_azimuthal_view(job.view):
+                if is_tilted_azimuthal_view(job.view):
+                    backend_note = 'direct composed tilted-Azimuthal projection'
+                elif azimuthal_base_view_name(job.view) == 'transverse':
+                    backend_note = 'transverse Azimuthal GPU backprojection path (CPU fallback)'
                 else:
                     backend_note = (
-                        f'{radial_base_view_name(job.view)} Radial orientation-aware '
+                        f'{azimuthal_base_view_name(job.view)} Azimuthal orientation-aware '
                         'dense/sink-only CPU path'
                     )
+            elif job.view.family == 'radial':
+                backend_note = 'bounded CPU cylindrical shell projection'
             else:
                 backend_note = 'CPU tilted path'
             print(f'Backprojection queue: running {job.model_name}/{job.view.name} via {backend_note}')

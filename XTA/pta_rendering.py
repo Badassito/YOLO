@@ -26,7 +26,7 @@ from .unification.contracts import RasterPlan
 from .unification.sampling import forward_sampling_policy, require_forward_sampling
 
 
-RADIAL_LANCZOS_A = 3
+AZIMUTHAL_LANCZOS_A = 3
 
 
 @dataclass(frozen=True)
@@ -82,7 +82,7 @@ DEFAULT_CHANNEL_VARIANT = ChannelVariant(
 class ViewInfo:
     name: str
     display_name: str
-    family: str  # transverse, sagittal, coronal, radial, tilted_transverse
+    family: str  # transverse, sagittal, coronal, azimuthal, tilted_transverse
     num_slices: int
     src_h: int
     src_w: int
@@ -125,7 +125,7 @@ class AffineSpec:
 
 
 @dataclass(frozen=True)
-class RadialSampler:
+class AzimuthalSampler:
     angle_deg: float
     diameter: int
     lanczos_a: int
@@ -137,21 +137,21 @@ class RadialSampler:
     nn_y: np.ndarray
 
 
-_RADIAL_CACHE: Dict[Tuple[int, int, int, float, int], RadialSampler] = {}
-_RADIAL_CACHE_LOCK = threading.Lock()
+_AZIMUTHAL_CACHE: Dict[Tuple[int, int, int, float, int], AzimuthalSampler] = {}
+_AZIMUTHAL_CACHE_LOCK = threading.Lock()
 
 
 def lanczos_offsets(a: int) -> np.ndarray:
     """Offsets for a floor-centered 2a-tap Lanczos kernel.
 
-    For radial reslicing this returns six taps for Lanczos-3:
+    For azimuthal reslicing this returns six taps for Lanczos-3:
     [-2, -1, 0, 1, 2, 3].
     """
     radius = max(1, int(a))
     return np.arange(-(radius - 1), radius + 1, dtype=np.int32)
 
 
-def lanczos_kernel(x: np.ndarray, a: int = RADIAL_LANCZOS_A) -> np.ndarray:
+def lanczos_kernel(x: np.ndarray, a: int = AZIMUTHAL_LANCZOS_A) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     out = np.sinc(x) * np.sinc(x / float(a))
     out[np.abs(x) >= float(a)] = 0.0
@@ -165,15 +165,15 @@ def normalize_lanczos_weight_rows(weights: np.ndarray, *, axis_name: str) -> np.
     invalid = ~np.isfinite(sums) | (np.abs(sums) <= 1e-12)
     if np.any(invalid):
         rows = np.flatnonzero(invalid[:, 0])[:12].tolist()
-        raise RuntimeError(f"Invalid radial Lanczos {axis_name}-weight sums at sample rows {rows}")
+        raise RuntimeError(f"Invalid azimuthal Lanczos {axis_name}-weight sums at sample rows {rows}")
     return np.ascontiguousarray((values64 / sums).astype(np.float32))
 
 
-def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
-    lanczos_a = int(RADIAL_LANCZOS_A)
+def get_azimuthal_sampler(view: ViewInfo, angle_deg: float) -> AzimuthalSampler:
+    lanczos_a = int(AZIMUTHAL_LANCZOS_A)
     key = (int(view.full_w), int(view.full_h), int(view.diameter), round(float(angle_deg), 6), lanczos_a)
-    with _RADIAL_CACHE_LOCK:
-        cached = _RADIAL_CACHE.get(key)
+    with _AZIMUTHAL_CACHE_LOCK:
+        cached = _AZIMUTHAL_CACHE.get(key)
     if cached is not None:
         return cached
     diameter = int(view.diameter)
@@ -194,11 +194,11 @@ def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
     y_w *= y_valid.astype(np.float32)
     # The finite Lanczos tap sum varies with subpixel phase, and validity
     # clipping changes it further at the ROI boundary.  Normalize after
-    # clipping to prevent radial brightness gain/loss and endpoint ringing
+    # clipping to prevent azimuthal brightness gain/loss and endpoint ringing
     # from shifting the DC level.
     x_w = normalize_lanczos_weight_rows(x_w, axis_name="x")
     y_w = normalize_lanczos_weight_rows(y_w, axis_name="y")
-    sampler = RadialSampler(
+    sampler = AzimuthalSampler(
         float(angle_deg), diameter, lanczos_a,
         np.clip(x_idx_raw, 0, int(view.full_w) - 1).astype(np.int32),
         np.clip(y_idx_raw, 0, int(view.full_h) - 1).astype(np.int32),
@@ -206,15 +206,15 @@ def get_radial_sampler(view: ViewInfo, angle_deg: float) -> RadialSampler:
         np.clip(np.rint(xs).astype(np.int32), 0, int(view.full_w) - 1),
         np.clip(np.rint(ys).astype(np.int32), 0, int(view.full_h) - 1),
     )
-    with _RADIAL_CACHE_LOCK:
-        existing = _RADIAL_CACHE.get(key)
+    with _AZIMUTHAL_CACHE_LOCK:
+        existing = _AZIMUTHAL_CACHE.get(key)
         if existing is not None:
             return existing
-        _RADIAL_CACHE[key] = sampler
+        _AZIMUTHAL_CACHE[key] = sampler
         return sampler
 
 
-def radial_extract_lanczos(volume: np.ndarray, sampler: RadialSampler, *, binary_mask: bool = False) -> np.ndarray:
+def azimuthal_extract_lanczos(volume: np.ndarray, sampler: AzimuthalSampler, *, binary_mask: bool = False) -> np.ndarray:
     if binary_mask:
         # Categorical masks must not receive an oscillatory reconstruction
         # kernel.  The precomputed nearest coordinates preserve labels and are
@@ -248,9 +248,9 @@ def get_native_view_image(volume: np.ndarray, view: ViewInfo, idx: int) -> np.nd
         return np.ascontiguousarray(volume[:, i, :])
     if view.family == "coronal":
         return np.ascontiguousarray(volume[:, :, i])
-    if view.family == "radial":
-        sampler = get_radial_sampler(view, float(view.azimuths_deg[i]))
-        return radial_extract_lanczos(volume, sampler, binary_mask=False)
+    if view.family == "azimuthal":
+        sampler = get_azimuthal_sampler(view, float(view.azimuths_deg[i]))
+        return azimuthal_extract_lanczos(volume, sampler, binary_mask=False)
     raise ValueError(f"Native image frame for {view.family} requires a dedicated renderer")
 
 
@@ -263,9 +263,9 @@ def get_native_view_frame(volume: np.ndarray, mask: np.ndarray, view: ViewInfo, 
         return image, np.ascontiguousarray(mask[:, i, :])
     if view.family == "coronal":
         return image, np.ascontiguousarray(mask[:, :, i])
-    if view.family == "radial":
-        sampler = get_radial_sampler(view, float(view.azimuths_deg[i]))
-        return image, radial_extract_lanczos(mask, sampler, binary_mask=True)
+    if view.family == "azimuthal":
+        sampler = get_azimuthal_sampler(view, float(view.azimuths_deg[i]))
+        return image, azimuthal_extract_lanczos(mask, sampler, binary_mask=True)
     raise ValueError(f"Native frame for {view.family} requires a dedicated renderer")
 
 
@@ -397,7 +397,7 @@ def _shared_render_full_intensity(
     idx: int,
     aff: AffineSpec,
     *,
-    mirror_radial_u: bool = False,
+    mirror_azimuthal_u: bool = False,
 ) -> np.ndarray:
     if view.shared_view is None:
         raise ValueError("shared intensity rendering requires a canonical v18 view")
@@ -410,7 +410,7 @@ def _shared_render_full_intensity(
             M_out_to_src=aff.M_out_to_src,
             output_height=int(aff.out_h),
             output_width=int(aff.out_w),
-            mirror_radial_u=bool(mirror_radial_u),
+            mirror_azimuthal_u=bool(mirror_azimuthal_u),
         ),
         dtype=np.uint8,
     )
@@ -422,7 +422,7 @@ def _shared_render_canvas_intensity(
     idx: int,
     aff: AffineSpec,
     *,
-    mirror_radial_u: bool = False,
+    mirror_azimuthal_u: bool = False,
 ) -> np.ndarray:
     if view.shared_view is None or aff.shared_affine is None:
         raise ValueError("shared canvas rendering requires a canonical v18 view and affine")
@@ -436,9 +436,9 @@ def _shared_render_canvas_intensity(
     native = np.ascontiguousarray(
         shared_geometry.get_view_frame_by_index(volume, view.shared_view, int(idx))
     )
-    if bool(mirror_radial_u):
-        if not shared_geometry.is_radial_view(view.shared_view):
-            raise ValueError("radial-u mirroring requested for a non-radial view")
+    if bool(mirror_azimuthal_u):
+        if not shared_geometry.is_azimuthal_view(view.shared_view):
+            raise ValueError("azimuthal-u mirroring requested for a non-azimuthal view")
         native = np.ascontiguousarray(native[:, ::-1])
     return warp_image(
         native,
@@ -454,7 +454,7 @@ def _shared_render_full_mask(
     idx: int,
     aff: AffineSpec,
     *,
-    mirror_radial_u: bool = False,
+    mirror_azimuthal_u: bool = False,
 ) -> np.ndarray:
     if view.shared_view is None:
         raise ValueError("shared categorical rendering requires a canonical v18 view")
@@ -467,7 +467,7 @@ def _shared_render_full_mask(
             M_out_to_src=aff.M_out_to_src,
             output_height=int(aff.out_h),
             output_width=int(aff.out_w),
-            mirror_radial_u=bool(mirror_radial_u),
+            mirror_azimuthal_u=bool(mirror_azimuthal_u),
         ),
         dtype=np.uint8,
     )
@@ -812,7 +812,7 @@ def render_channel_formatted_images(
                 plan.view,
                 int(source_idx),
                 plan.aff,
-                mirror_radial_u=bool(mirror_u),
+                mirror_azimuthal_u=bool(mirror_u),
             )
             image_canvas = (
                 _shared_render_canvas_intensity(
@@ -820,7 +820,7 @@ def render_channel_formatted_images(
                     plan.view,
                     int(source_idx),
                     plan.aff,
-                    mirror_radial_u=bool(mirror_u),
+                    mirror_azimuthal_u=bool(mirror_u),
                 )
                 if need_canvas
                 else None
@@ -869,7 +869,7 @@ def render_shared_tile_images(
                 plan.view.shared_view,
                 tile.shared_job,
                 int(source_idx),
-                mirror_radial_u=bool(mirror_u),
+                mirror_azimuthal_u=bool(mirror_u),
             ),
             dtype=np.uint8,
         )
@@ -974,9 +974,9 @@ def get_native_view_mask(mask: np.ndarray, view: ViewInfo, idx: int) -> np.ndarr
         return np.ascontiguousarray(mask[:, i, :])
     if view.family == "coronal":
         return np.ascontiguousarray(mask[:, :, i])
-    if view.family == "radial":
-        sampler = get_radial_sampler(view, float(view.azimuths_deg[i]))
-        return radial_extract_lanczos(mask, sampler, binary_mask=True)
+    if view.family == "azimuthal":
+        sampler = get_azimuthal_sampler(view, float(view.azimuths_deg[i]))
+        return azimuthal_extract_lanczos(mask, sampler, binary_mask=True)
     raise ValueError(f"Native mask frame for {view.family} requires a dedicated renderer")
 
 

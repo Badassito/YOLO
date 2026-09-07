@@ -8,16 +8,16 @@ from XTA import cuda_backend, geometry
 from XTA.config import resolve_channel_format
 
 
-class RadialChannelSeamTests(unittest.TestCase):
+class AzimuthalChannelSeamTests(unittest.TestCase):
     @staticmethod
-    def _radial_view(num_slices: int = 4) -> geometry.ViewInfo:
+    def _azimuthal_view(num_slices: int = 4) -> geometry.ViewInfo:
         return geometry.ViewInfo(
-            name="radial_transverse",
+            name="azimuthal_transverse",
             num_slices=int(num_slices),
             src_h=2,
             src_w=3,
             pad_mode="pad",
-            family="radial",
+            family="azimuthal",
             azimuths_deg=tuple(float(i * 180.0 / num_slices) for i in range(num_slices)),
         )
 
@@ -33,26 +33,26 @@ class RadialChannelSeamTests(unittest.TestCase):
         ]
 
     def test_source_resolution_tracks_wrap_parity_without_mirroring_cartesian(self) -> None:
-        radial = self._radial_view()
+        azimuthal = self._azimuthal_view()
 
         # No-crossing controls retain both the source index and native orientation.
-        self.assertEqual(geometry.channel_view_slice_source(radial, 0), (0, False))
-        self.assertEqual(geometry.channel_view_slice_source(radial, 3), (3, False))
+        self.assertEqual(geometry.channel_view_slice_source(azimuthal, 0), (0, False))
+        self.assertEqual(geometry.channel_view_slice_source(azimuthal, 3), (3, False))
 
-        # Both directions across the 0/180 seam reverse radial-u.
-        self.assertEqual(geometry.channel_view_slice_source(radial, -1), (3, True))
-        self.assertEqual(geometry.channel_view_slice_source(radial, 4), (0, True))
+        # Both directions across the 0/180 seam reverse azimuthal-u.
+        self.assertEqual(geometry.channel_view_slice_source(azimuthal, -1), (3, True))
+        self.assertEqual(geometry.channel_view_slice_source(azimuthal, 4), (0, True))
 
         # Arbitrary custom strides can span whole periods: only odd wrap parity mirrors.
-        self.assertEqual(geometry.channel_view_slice_source(radial, -5), (3, False))
-        self.assertEqual(geometry.channel_view_slice_source(radial, 8), (0, False))
+        self.assertEqual(geometry.channel_view_slice_source(azimuthal, -5), (3, False))
+        self.assertEqual(geometry.channel_view_slice_source(azimuthal, 8), (0, False))
 
         cartesian = geometry.ViewInfo("transverse", 4, 2, 3, "clamp")
         self.assertEqual(geometry.channel_view_slice_source(cartesian, -1), (0, False))
         self.assertEqual(geometry.channel_view_slice_source(cartesian, 4), (3, False))
 
     def test_renderer_mirrors_only_width_axis_at_negative_and_positive_seams(self) -> None:
-        view = self._radial_view()
+        view = self._azimuthal_view()
         planes = self._planes()
         renderer = geometry.ChannelFormattedFrameRenderer(
             lambda index: planes[int(index)],
@@ -65,7 +65,7 @@ class RadialChannelSeamTests(unittest.TestCase):
         np.testing.assert_array_equal(negative_crossing[:, :, 0], planes[3][:, ::-1])
         np.testing.assert_array_equal(negative_crossing[:, :, 1], planes[0])
         np.testing.assert_array_equal(negative_crossing[:, :, 2], planes[1])
-        # Row order is unchanged: only radial-u (the frame-width axis) reverses.
+        # Row order is unchanged: only azimuthal-u (the frame-width axis) reverses.
         np.testing.assert_array_equal(negative_crossing[0, :, 0], planes[3][0, ::-1])
         np.testing.assert_array_equal(negative_crossing[1, :, 0], planes[3][1, ::-1])
 
@@ -78,8 +78,8 @@ class RadialChannelSeamTests(unittest.TestCase):
         for channel, expected in enumerate(planes[:3]):
             np.testing.assert_array_equal(no_crossing[:, :, channel], expected)
 
-    def test_nonunit_channel_stride_flips_both_radial_seams_in_one_stack(self) -> None:
-        view = self._radial_view(num_slices=5)
+    def test_nonunit_channel_stride_flips_both_azimuthal_seams_in_one_stack(self) -> None:
+        view = self._azimuthal_view(num_slices=5)
         planes = self._planes(num_slices=5)
         renderer = geometry.ChannelFormattedFrameRenderer(
             lambda index: planes[int(index)],
@@ -101,7 +101,7 @@ class RadialChannelSeamTests(unittest.TestCase):
             np.testing.assert_array_equal(rendered[:, :, channel], expected_plane)
 
     def test_cache_keeps_mirrored_and_unmirrored_orientation_separate(self) -> None:
-        view = self._radial_view(num_slices=1)
+        view = self._azimuthal_view(num_slices=1)
         plane = self._planes(num_slices=1)[0]
         calls: list[int] = []
 
@@ -125,7 +125,7 @@ class RadialChannelSeamTests(unittest.TestCase):
         self.assertEqual(calls, [0, 0])
 
     def test_fullframe_and_tile_factories_request_native_pre_affine_mirror(self) -> None:
-        view = self._radial_view()
+        view = self._azimuthal_view()
         planes = self._planes()
         fmt = resolve_channel_format("C3S1")
 
@@ -133,7 +133,7 @@ class RadialChannelSeamTests(unittest.TestCase):
 
         def fake_fullframe(*args: object, **kwargs: object) -> np.ndarray:
             index = int(kwargs["frame_idx"])
-            mirror_u = bool(kwargs.get("mirror_radial_u", False))
+            mirror_u = bool(kwargs.get("mirror_azimuthal_u", False))
             fullframe_calls.append((index, mirror_u))
             plane = planes[index]
             return np.ascontiguousarray(plane[:, ::-1] if mirror_u else plane)
@@ -157,7 +157,7 @@ class RadialChannelSeamTests(unittest.TestCase):
 
         def fake_tile(*args: object, **kwargs: object) -> np.ndarray:
             index = int(kwargs["frame_idx"])
-            mirror_u = bool(kwargs.get("mirror_radial_u", False))
+            mirror_u = bool(kwargs.get("mirror_azimuthal_u", False))
             tile_calls.append((index, mirror_u))
             plane = planes[index]
             return np.ascontiguousarray(plane[:, ::-1] if mirror_u else plane)
@@ -179,12 +179,12 @@ class RadialChannelSeamTests(unittest.TestCase):
 
     def test_slab_renderer_mirrors_native_plane_before_job_affine(self) -> None:
         view = geometry.ViewInfo(
-            name="radial_transverse",
+            name="azimuthal_transverse",
             num_slices=4,
             src_h=3,
             src_w=3,
             pad_mode="pad",
-            family="radial",
+            family="azimuthal",
             azimuths_deg=(0.0, 45.0, 90.0, 135.0),
         )
         planes = np.stack(
@@ -220,7 +220,7 @@ class RadialChannelSeamTests(unittest.TestCase):
             return np.asarray(plane).copy()
 
         with mock.patch.object(cuda_backend.cv2, "warpAffine", side_effect=fake_warp):
-            renderer = cuda_backend._radial_slab_channel_renderer(
+            renderer = cuda_backend._azimuthal_slab_channel_renderer(
                 planes,
                 tuple(range(4)),
                 view,
@@ -239,7 +239,7 @@ class RadialChannelSeamTests(unittest.TestCase):
         matrix = np.asarray(
             [[2.0, 3.0, 4.0], [5.0, 6.0, 7.0]], dtype=np.float32,
         )
-        mirrored = cuda_backend._GpuWorkerRenderEngine._mirror_radial_u_out_to_src(
+        mirrored = cuda_backend._GpuWorkerRenderEngine._mirror_azimuthal_u_out_to_src(
             matrix, source_width=11,
         )
         np.testing.assert_array_equal(mirrored[0], np.asarray([-2.0, -3.0, 6.0]))

@@ -95,8 +95,8 @@ class LtaRenderingTests(unittest.TestCase):
             H=4,
             W=4,
             cartesian_views=("transverse",),
-            radial_views=(),
-            radial_azimuth_angles=(),
+            azimuthal_views=(),
+            azimuthal_azimuth_angles=(),
             tilt_groups=(),
         )[0]
         runtime = expand_views_into_tta_variants((physical,), (0.0,))[0]

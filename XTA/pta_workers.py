@@ -72,7 +72,7 @@ from .pta_scheduler import (
     split_work_batch as _split_gpu_work_batch,
 )
 from .unification.contracts import RasterPlan
-from .workspace import radial_source_mode as _radial_source_mode
+from .workspace import azimuthal_source_mode as _azimuthal_source_mode
 
 
 class _StemmedSource(Protocol):
@@ -581,10 +581,12 @@ def projection_phase_summary(
             continue
         shared_view = plan.view.shared_view
         if shared_view is not None and shared_geometry.is_radial_view(shared_view):
+            family = 'radial'
+        elif shared_view is not None and shared_geometry.is_azimuthal_view(shared_view):
             family = (
-                "tilted-radial"
-                if shared_geometry.is_tilted_radial_view(shared_view)
-                else "upright-radial"
+                "tilted-azimuthal"
+                if shared_geometry.is_tilted_azimuthal_view(shared_view)
+                else "upright-azimuthal"
             )
         elif shared_view is not None and shared_geometry.is_tilted_view(shared_view):
             family = "tilted-cartesian"
@@ -681,13 +683,13 @@ def _gpu_runtime_for_worker() -> Dict[str, object]:
         batch_size=int(_WORKER_STATIC["gpu_batch_size"]),
     )
 
-    radial_renderer = None
-    radial_renderer_error = ""
+    azimuthal_renderer = None
+    azimuthal_renderer_error = ""
     try:
         cuda_backend = importlib.import_module(".cuda_backend", package=__package__)
-        radial_renderer = cuda_backend._GpuWorkerRenderEngine(device)
+        azimuthal_renderer = cuda_backend._GpuWorkerRenderEngine(device)
     except Exception as exc:
-        radial_renderer_error = f"{type(exc).__name__}: {exc}"
+        azimuthal_renderer_error = f"{type(exc).__name__}: {exc}"
 
     encoder = None
     nvimgcodec = None
@@ -753,16 +755,16 @@ def _gpu_runtime_for_worker() -> Dict[str, object]:
         "codec_error": codec_error,
         "nvtiff_encoder": nvtiff_encoder,
         "nvtiff_error": nvtiff_error,
-        "radial_renderer": radial_renderer,
-        "radial_renderer_error": radial_renderer_error,
-        "radial_render_lock": threading.Lock(),
-        "radial_renderer_announced": False,
-        "radial_renderer_manifest_announced": False,
+        "azimuthal_renderer": azimuthal_renderer,
+        "azimuthal_renderer_error": azimuthal_renderer_error,
+        "azimuthal_render_lock": threading.Lock(),
+        "azimuthal_renderer_announced": False,
+        "azimuthal_renderer_manifest_announced": False,
         "cartesian_renderer_announced": False,
         "cartesian_renderer_manifest_announced": False,
         "tilted_renderer_announced": False,
         "tilted_renderer_manifest_announced": False,
-        "radial_renderer_fallback_announced": False,
+        "azimuthal_renderer_fallback_announced": False,
         "cartesian_renderer_fallback_announced": False,
         "tilted_renderer_fallback_announced": False,
         "cuda_projection_disabled_families": set(),
@@ -1163,19 +1165,24 @@ def _gpu_projected_item_image(
     frame_idx: int,
     item_key: str,
 ) -> Optional[Tuple[object, object]]:
-    """Render one canonical Cartesian/Radial/Tilted intensity item on CUDA."""
+    """Render one canonical Cartesian/cylindrical/Tilted intensity item on CUDA."""
 
     shared_view = plan.view.shared_view
     radial_view = bool(
         shared_view is not None and shared_geometry.is_radial_view(shared_view)
     )
+    azimuthal_view = bool(
+        shared_view is not None and shared_geometry.is_azimuthal_view(shared_view)
+    )
     tilted_view = bool(
         shared_view is not None
         and shared_geometry.is_tilted_view(shared_view)
+        and not azimuthal_view
         and not radial_view
     )
     cartesian_view = bool(
         shared_view is not None
+        and not azimuthal_view
         and not radial_view
         and not tilted_view
         and shared_geometry.physical_view_name(shared_view)
@@ -1183,13 +1190,14 @@ def _gpu_projected_item_image(
     )
     if (
         shared_view is None
-        or not (cartesian_view or radial_view or tilted_view)
+        or not (cartesian_view or azimuthal_view or radial_view or tilted_view)
         or str(plan.channel_variant.kind) not in {"gray", "rgb", "custom"}
     ):
         return None
     gate_name = (
         "YOLO_TTA_PTA_GPU_RADIAL_RENDER"
-        if radial_view
+        if radial_view else "YOLO_TTA_PTA_GPU_AZIMUTHAL_RENDER"
+        if azimuthal_view
         else (
             "YOLO_TTA_PTA_GPU_TILTED_RENDER"
             if tilted_view
@@ -1200,22 +1208,24 @@ def _gpu_projected_item_image(
         "0", "false", "no", "off", "disabled",
     }:
         return None
-    if radial_view and _radial_source_mode() != "texture_linear":
+    if azimuthal_view and _azimuthal_source_mode() != "texture_linear":
         return None
     family_key = (
-        "radial" if radial_view else ("tilted" if tilted_view else "cartesian")
+        "radial" if radial_view else (
+            "azimuthal" if azimuthal_view else ("tilted" if tilted_view else "cartesian")
+        )
     )
     if family_key in runtime.get("cuda_projection_disabled_families", set()):
         return None
-    renderer = runtime.get("radial_renderer")
-    lock = runtime.get("radial_render_lock")
+    renderer = runtime.get("azimuthal_renderer")
+    lock = runtime.get("azimuthal_render_lock")
     if renderer is None or lock is None:
         fallback_key = f"{family_key}_renderer_fallback_announced"
         if isinstance(runtime, dict) and not bool(runtime.get(fallback_key)):
             runtime[fallback_key] = True
             print(
                 "Warning: PTA resident CUDA view renderer is unavailable "
-                f"({runtime.get('radial_renderer_error') or 'no diagnostic'}); using CPU projection."
+                f"({runtime.get('azimuthal_renderer_error') or 'no diagnostic'}); using CPU projection."
             )
         return None
     if str(item_key) == "full":
@@ -1253,8 +1263,8 @@ def _gpu_projected_item_image(
             mode = renderer.ensure_volume_array(  # type: ignore[union-attr]
                 volume,
                 identity=volume_identity,
-                require_radial_texture=bool(
-                    runtime.get("radial_texture_required", True)
+                require_azimuthal_texture=bool(
+                    runtime.get("azimuthal_texture_required", True)
                 ),
             )
             if str(mode) != "resident":
@@ -1286,16 +1296,27 @@ def _gpu_projected_item_image(
             with torch.cuda.stream(renderer._stream):  # type: ignore[union-attr]
                 for source_index, mirror_u in dict.fromkeys(addresses):
                     if radial_view:
-                        if shared_geometry.is_tilted_radial_view(shared_view):
-                            native = renderer._render_tilted_radial_native_resident(  # type: ignore[union-attr]
+                        if bool(mirror_u):
+                            raise RuntimeError('Radial shell channels clamp along radius and cannot mirror azimuthal-u')
+                        native = renderer._render_radial_native_resident(  # type: ignore[union-attr]
+                            shared_view, int(source_index),
+                        )
+                        native_u8 = native.round().clamp_(0.0, 255.0).to(torch.uint8)
+                        rendered_u8 = renderer.warp_native_uint8_frame(  # type: ignore[union-attr]
+                            native_u8.contiguous(), output_to_source,
+                            int(output_height), int(output_width),
+                        )
+                    elif azimuthal_view:
+                        if shared_geometry.is_tilted_azimuthal_view(shared_view):
+                            native = renderer._render_tilted_azimuthal_native_resident(  # type: ignore[union-attr]
                                 shared_view,
                                 int(source_index),
                             )
                         else:
-                            # Upright Radial uses TTA's allocation-free
+                            # Upright Azimuthal uses TTA's allocation-free
                             # hardware-linear texture projector, stopping at
                             # the native uint8 boundary before the PTA affine.
-                            native = renderer._render_radial_native_resident(  # type: ignore[union-attr]
+                            native = renderer._render_azimuthal_native_resident(  # type: ignore[union-attr]
                                 shared_view,
                                 int(source_index),
                             )
@@ -1308,7 +1329,7 @@ def _gpu_projected_item_image(
                         )
                     elif tilted_view:
                         if bool(mirror_u):
-                            raise RuntimeError("Tilted Cartesian addressing cannot mirror radial-u")
+                            raise RuntimeError("Tilted Cartesian addressing cannot mirror azimuthal-u")
                         rendered = renderer.render_tilted_grid_resident(  # type: ignore[union-attr]
                             shared_view,
                             output_to_source,
@@ -1321,7 +1342,7 @@ def _gpu_projected_item_image(
                         ).contiguous()
                     else:
                         if bool(mirror_u):
-                            raise RuntimeError("Cartesian addressing cannot mirror radial-u")
+                            raise RuntimeError("Cartesian addressing cannot mirror azimuthal-u")
                         rendered_u8 = renderer.render_cartesian_grid_resident(  # type: ignore[union-attr]
                             shared_view,
                             output_to_source,
@@ -1344,7 +1365,8 @@ def _gpu_projected_item_image(
                 ready_event.record(renderer._stream)  # type: ignore[union-attr]
             announced_key = (
                 "radial_renderer_announced"
-                if radial_view
+                if radial_view else "azimuthal_renderer_announced"
+                if azimuthal_view
                 else (
                     "tilted_renderer_announced"
                     if tilted_view
@@ -1355,7 +1377,8 @@ def _gpu_projected_item_image(
                 runtime[announced_key] = True
                 family_label = (
                     "Radial"
-                    if radial_view
+                    if radial_view else "Azimuthal"
+                    if azimuthal_view
                     else ("Tilted Cartesian" if tilted_view else "Cartesian")
                 )
                 print(
@@ -1792,9 +1815,9 @@ def execute_gpu_frame_batch_task(
     global _WORKER_GPU_BATCH_CAP_WARNING_EMITTED
     runtime = _gpu_runtime_for_worker()
     if isinstance(runtime, dict):
-        runtime["radial_texture_required"] = any(
+        runtime["azimuthal_texture_required"] = any(
             plan.view.shared_view is not None
-            and shared_geometry.is_radial_view(plan.view.shared_view)
+            and shared_geometry.is_azimuthal_view(plan.view.shared_view)
             for plan in plans
         )
     policy = runtime["policy"]
@@ -2036,11 +2059,21 @@ def execute_gpu_frame_batch_task(
         and not bool(runtime.get("radial_renderer_manifest_announced"))
     ):
         local_warnings.add(
-            "pta_cuda_radial_projection_active",
+            'pta_cuda_radial_projection_active',
+            'TTA resident Radial shell intensity projector; categorical masks retain CPU nearest sampling',
+        )
+        if isinstance(runtime, dict):
+            runtime['radial_renderer_manifest_announced'] = True
+    if (
+        bool(runtime.get("azimuthal_renderer_announced"))
+        and not bool(runtime.get("azimuthal_renderer_manifest_announced"))
+    ):
+        local_warnings.add(
+            "pta_cuda_azimuthal_projection_active",
             "TTA resident CUDA intensity projector; categorical masks retain CPU nearest sampling",
         )
         if isinstance(runtime, dict):
-            runtime["radial_renderer_manifest_announced"] = True
+            runtime["azimuthal_renderer_manifest_announced"] = True
     if (
         bool(runtime.get("tilted_renderer_announced"))
         and not bool(runtime.get("tilted_renderer_manifest_announced"))

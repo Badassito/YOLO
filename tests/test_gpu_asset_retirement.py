@@ -79,7 +79,7 @@ class _Cuda:
 def _renderer(events, host_source=None, fail=False):
     engine = object.__new__(cuda_backend._GpuWorkerRenderEngine)
     engine._stream = _Stream(events, fail=fail)
-    engine._radial_texture_lock = threading.RLock()
+    engine._azimuthal_texture_lock = threading.RLock()
     engine._inference_assets_released = False
     engine._volume_mm = host_source
     source = _Owner(4096)
@@ -87,19 +87,19 @@ def _renderer(events, host_source=None, fail=False):
     engine._volume_gpu = source
     engine._volume_flat = source
     engine._fused_volume_ref = source
-    engine._radial_texture_ref = SimpleNamespace(
+    engine._azimuthal_texture_ref = SimpleNamespace(
         source_ref=source, texture=_Owner(), descriptor=_Owner(), resource=image,
         cuda_array=image, channel=_Owner(), nbytes=4096,
     )
     for name in ('_native_t_map_cache', '_native_plane_cache', '_native_u8_plane_cache',
-                 '_fold_cache', '_tilted_plans', '_fused_radial_taps'):
+                 '_fold_cache', '_tilted_plans', '_fused_azimuthal_taps'):
         setattr(engine, name, {'buffer': _Owner()})
     for name in ('_fused_preflight_validated_families', '_fused_graph_rejected_keys', '_fused_validated_keys'):
         setattr(engine, name, {'entry'})
     engine._standalone_render_meta = _Owner()
     engine._standalone_render_meta_ref = engine._standalone_render_meta
     engine._fused_preflight_volume_key = 'source'
-    engine._radial_texture_admitted = True
+    engine._azimuthal_texture_admitted = True
     engine._resident_runtime_disabled = False
     engine._mode = 'resident'
     return engine, (weakref.ref(source), weakref.ref(image))
@@ -128,7 +128,7 @@ class GpuAssetRetirementTests(unittest.TestCase):
             host = np.memmap(path, dtype=np.uint8, mode='w+', shape=(2, 3, 4))
             host[:] = 7
             engine, references = _renderer(events, host)
-            namespace = engine._radial_texture_ref
+            namespace = engine._azimuthal_texture_ref
             try:
                 stats = engine.release_inference_assets()
                 gc.collect()
@@ -330,9 +330,9 @@ class CudaAssetRetirementSmokeTests(unittest.TestCase):
             original.tofile(path)
             engine = cuda_backend._GpuWorkerRenderEngine('cuda:0')
             try:
-                mode = engine.ensure_volume(str(path), original.shape, require_radial_texture=True)
+                mode = engine.ensure_volume(str(path), original.shape, require_azimuthal_texture=True)
                 self.assertEqual(mode, 'resident')
-                texture = engine._ensure_radial_texture(SimpleNamespace(cp=cp))
+                texture = engine._ensure_azimuthal_texture(SimpleNamespace(cp=cp))
                 source_ref = weakref.ref(engine._volume_gpu)
                 stats = engine.release_inference_assets()
                 gc.collect()

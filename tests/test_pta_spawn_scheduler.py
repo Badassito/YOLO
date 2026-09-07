@@ -454,10 +454,10 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
 
     def test_projection_phase_summary_reports_family_boundaries(self) -> None:
         views = {
-            "cart": types.SimpleNamespace(kind="cart"),
-            "radial": types.SimpleNamespace(kind="radial"),
-            "tilted": types.SimpleNamespace(kind="tilted"),
-            "tilted_radial": types.SimpleNamespace(kind="tilted_radial"),
+            "cart": types.SimpleNamespace(kind="cart", family='orthogonal'),
+            "azimuthal": types.SimpleNamespace(kind="azimuthal", family='azimuthal'),
+            "tilted": types.SimpleNamespace(kind="tilted", family='tilted'),
+            "tilted_azimuthal": types.SimpleNamespace(kind="tilted_azimuthal", family='azimuthal'),
         }
         plans = tuple(
             types.SimpleNamespace(
@@ -469,24 +469,24 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
         candidates = tuple(
             dataclasses.replace(self._candidate(index), parent_view_tag=tag)
             for index, tag in enumerate(
-                ("cart", "cart", "radial", "radial", "radial", "tilted", "tilted_radial")
+                ("cart", "cart", "azimuthal", "azimuthal", "azimuthal", "tilted", "tilted_azimuthal")
             )
         )
         with (
             mock.patch.object(
                 pta.shared_geometry,
-                "is_radial_view",
-                side_effect=lambda view: view.kind in {"radial", "tilted_radial"},
+                "is_azimuthal_view",
+                side_effect=lambda view: view.kind in {"azimuthal", "tilted_azimuthal"},
             ),
             mock.patch.object(
                 pta.shared_geometry,
-                "is_tilted_radial_view",
-                side_effect=lambda view: view.kind == "tilted_radial",
+                "is_tilted_azimuthal_view",
+                side_effect=lambda view: view.kind == "tilted_azimuthal",
             ),
             mock.patch.object(
                 pta.shared_geometry,
                 "is_tilted_view",
-                side_effect=lambda view: view.kind in {"tilted", "tilted_radial"},
+                side_effect=lambda view: view.kind in {"tilted", "tilted_azimuthal"},
             ),
         ):
             summary = pta.projection_phase_summary(plans, candidates)
@@ -495,9 +495,9 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
             summary,
             (
                 ("cartesian", 2, 2),
-                ("upright-radial", 3, 5),
+                ("upright-azimuthal", 3, 5),
                 ("tilted-cartesian", 1, 6),
-                ("tilted-radial", 1, 7),
+                ("tilted-azimuthal", 1, 7),
             ),
         )
 
@@ -829,7 +829,7 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
 
     def test_gpu_projected_view_route_bypasses_cpu_intensity_renderer(self) -> None:
         candidate = self._candidate(0)
-        plan = types.SimpleNamespace(tile_layout=(), tag="radial_sagittal")
+        plan = types.SimpleNamespace(tile_layout=(), tag="azimuthal_sagittal")
         projected = np.arange(64, dtype=np.uint8).reshape(8, 8)
         with (
             mock.patch.object(
@@ -911,12 +911,13 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                     Event=Event,
                 ),
             ),
-            "radial_renderer": renderer,
-            "radial_render_lock": threading.Lock(),
+            "azimuthal_renderer": renderer,
+            "azimuthal_render_lock": threading.Lock(),
             "cuda_projection_disabled_families": set(),
-            "radial_texture_required": True,
+            "azimuthal_texture_required": True,
         }
         with (
+            mock.patch.object(pta.shared_geometry, "is_azimuthal_view", return_value=False),
             mock.patch.object(pta.shared_geometry, "is_radial_view", return_value=False),
             mock.patch.object(pta.shared_geometry, "is_tilted_view", return_value=True),
             mock.patch.object(pta_workers, "_require_pta_canonical_plan"),
@@ -987,12 +988,13 @@ class PtaSpawnSchedulerTests(unittest.TestCase):
                     Event=Event,
                 ),
             ),
-            "radial_renderer": renderer,
-            "radial_render_lock": threading.Lock(),
+            "azimuthal_renderer": renderer,
+            "azimuthal_render_lock": threading.Lock(),
             "cuda_projection_disabled_families": set(),
-            "radial_texture_required": True,
+            "azimuthal_texture_required": True,
         }
         with (
+            mock.patch.object(pta.shared_geometry, "is_azimuthal_view", return_value=False),
             mock.patch.object(pta.shared_geometry, "is_radial_view", return_value=False),
             mock.patch.object(pta.shared_geometry, "is_tilted_view", return_value=False),
             mock.patch.object(

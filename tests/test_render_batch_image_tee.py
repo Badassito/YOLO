@@ -191,11 +191,11 @@ class CanonicalRenderBatchImageTests(unittest.TestCase):
             self.assertEqual(saved[0].read_bytes(), model_images[0][:, :, 0].tobytes())
             self.assertEqual(saved[1].read_bytes(), model_images[1][:, :, 0].tobytes())
 
-    def test_radial_seam_extension_is_model_only(self) -> None:
+    def test_azimuthal_seam_extension_is_model_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             view = geometry.ViewInfo(
-                'radial_transverse__tta_a15', 3, 2, 4, 'pad', family='radial',
+                'azimuthal_transverse__tta_a15', 3, 2, 4, 'pad', family='azimuthal',
                 azimuths_deg=(0.0, 60.0, 120.0),
             )
             sink = outputs.CanonicalRenderImageSink(
@@ -210,7 +210,7 @@ class CanonicalRenderBatchImageTests(unittest.TestCase):
             planes = np.arange(24, dtype=np.uint8).reshape(3, 2, 4)
             source = geometry.InMemoryYoloVolumeSource(
                 planes,
-                name='radial',
+                name='azimuthal',
                 batch_size=4,
                 view=view,
                 render_batch_sink=sink,

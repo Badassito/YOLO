@@ -61,7 +61,7 @@ def _artifacts(*, same_mask: bool = False, same_source: bool = False) -> TtaOutp
         final_output_mask_mm=final_union if same_mask else _Artifact("final_mask"),
         final_union_mm=final_union,
         native_view_support_by_model={"model": {"native": _Artifact("native")}},
-        radial_native_output_by_model={"model": {"radial": _Artifact("radial")}},
+        azimuthal_native_output_by_model={"model": {"azimuthal": _Artifact("azimuthal")}},
         tilted_native_output_by_model={"model": {"tilted": _Artifact("tilted")}},
         view_volumes_by_model={"model": {"view": _Artifact("view")}},
         parent_mask_support_by_model={"model": {"mask": _Artifact("parent_mask")}},
@@ -105,7 +105,7 @@ class TtaOutputOwnershipTests(unittest.TestCase):
             "close:final_mask",
             "close:final_union",
             "close:native",
-            "close:radial",
+            "close:azimuthal",
             "close:tilted",
             "close:view",
             "raw:parent_mask:False",
@@ -127,7 +127,7 @@ class TtaOutputOwnershipTests(unittest.TestCase):
         self.assertEqual(result.unloaded_models, 1)
         self.assertTrue(result.processing_volume_was_distinct)
         self.assertEqual(artifacts.native_view_support_by_model, {"model": {}})
-        self.assertEqual(artifacts.radial_native_output_by_model, {"model": {}})
+        self.assertEqual(artifacts.azimuthal_native_output_by_model, {"model": {}})
         self.assertEqual(artifacts.tilted_native_output_by_model, {"model": {}})
         self.assertEqual(artifacts.view_volumes_by_model, {"model": {}})
         self.assertEqual(artifacts.parent_mask_support_by_model, {"model": {}})

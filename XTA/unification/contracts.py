@@ -218,7 +218,11 @@ class TileLayout:
 
 @dataclass(frozen=True)
 class FrameAddress:
-    """Resolved source frame plus the radial odd-wrap reflection state."""
+    """Frame within one physical trajectory; only Azimuthal wraps can mirror u.
+
+    A Radial physical view is one periodic patch trajectory, so its index is a
+    radius sample and contextual indices clamp within that trajectory.
+    """
 
     index: int
     mirror_u: bool = False

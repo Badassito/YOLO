@@ -89,7 +89,7 @@ class PtaConfigTests(unittest.TestCase):
             "sagittal,transverse",
             "--enable_tilted",
             "coronal:15:horizontal",
-            "--enable_radial",
+            "--enable_azimuthal",
             "transverse:2.5",
             "tilted_coronal:auto",
             "--enable_tile",
@@ -98,7 +98,7 @@ class PtaConfigTests(unittest.TestCase):
 
         self.assertEqual(config.cartesian_views, ("sagittal", "transverse"))
         self.assertEqual(
-            [(request.view, request.azimuth_angle) for request in config.radial_requests],
+            [(request.view, request.azimuth_angle) for request in config.azimuthal_requests],
             [("transverse", 2.5), ("tilted_coronal", None)],
         )
         self.assertEqual(config.tilted_groups[0].views, ("coronal",))
