@@ -2740,6 +2740,11 @@ def _main_impl() -> None:
                             component_ref_dense_retirement_active
                             and not nrrd_layers_needed
                         ),
+                        retire_dense_after_prepare=bool(
+                            component_ref_dense_retirement_active
+                            and not dense_tiling_active
+                            and not keep_temp_artifacts
+                        ),
                         preinterpolation_layer_already_published=bool(
                             preinterpolation_layer_already_published
                         ),

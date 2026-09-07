@@ -190,6 +190,7 @@ def project_view_volume_to_orthogonal_volume(
             radial_mask_mm=view_mask_mm, radial_view=view, out_path=out_path,
             desc=desc, prefer_memory=prefer_memory, reserve_bytes=reserve_bytes,
             workers=workers, out_shape_tyx=out_shape_tyx,
+            known_slice_bboxes=known_slice_bboxes,
             projection_block_callback=projection_block_callback, sink_only=sink_only,
         )
 
@@ -418,25 +419,51 @@ def materialize_nrrd_view_layer(
         *,
         sink_only_mode: bool,
     ) -> np.ndarray | SinkOnlyProjectionResult:
-        return project_view_volume_to_orthogonal_volume(
-            view_volume_mm,
-            view,
-            raw_path,
-            desc=f'NRRD layer {key}',
-            workers=int(workers),
-            prefer_memory=bool(transient_projection_in_memory),
-            reserve_bytes=32 * GIB,
-            out_shape_tyx=projection_out_shape,
-            # transverse layers headed for a raw-bbox store are encoded straight
-            # from the source volume (identity projection, synchronous encode) — no copy.
-            allow_transverse_passthrough=bool(bbox_store_enabled),
-            # device-union row occupancy (azimuthal views only; valid for the
-            # pre-interpolation layer, which is the only caller that supplies it).
-            known_row_occupancy=known_row_occupancy,
-            known_slice_bboxes=known_slice_bboxes,
-            projection_block_callback=block_callback,
-            sink_only=bool(sink_only_mode),
-        )
+        try:
+            return project_view_volume_to_orthogonal_volume(
+                view_volume_mm,
+                view,
+                raw_path,
+                desc=f'NRRD layer {key}',
+                workers=int(workers),
+                prefer_memory=bool(transient_projection_in_memory),
+                reserve_bytes=32 * GIB,
+                out_shape_tyx=projection_out_shape,
+                # transverse layers headed for a raw-bbox store are encoded straight
+                # from the source volume (identity projection, synchronous encode) — no copy.
+                allow_transverse_passthrough=bool(bbox_store_enabled),
+                # device-union row occupancy (azimuthal views only; valid for the
+                # pre-interpolation layer, which is the only caller that supplies it).
+                known_row_occupancy=known_row_occupancy,
+                known_slice_bboxes=known_slice_bboxes,
+                projection_block_callback=block_callback,
+                sink_only=bool(sink_only_mode),
+            )
+        except BaseException as exc:
+            if isinstance(exc, Exception):
+                raise  # Recoverable failures retain the transaction retry below.
+            # Fatal device ownership failures bypass retry, including failures
+            # during a dense retry. The CPU sink still owns its partial store/fd.
+            # Do not settle/release quarantined GPU owners or replace the fatal
+            # exception with a recoverable cleanup failure.
+            cleanup_actions = []
+            if incremental_writer is not None:
+                cleanup_actions.extend((
+                    ('abort incremental store', lambda: incremental_writer.abort(exc)),
+                    ('discard incremental store', incremental_writer.discard),
+                ))
+            cleanup_actions.append(('remove projected scratch', lambda: raw_path.unlink(missing_ok=True)))
+            for cleanup_name, cleanup_action in cleanup_actions:
+                try:
+                    cleanup_action()
+                except BaseException as cleanup_exc:
+                    add_note = getattr(exc, 'add_note', None)
+                    if callable(add_note):
+                        try:
+                            add_note(f'NRRD layer {key}: could not {cleanup_name}: {cleanup_exc}')
+                        except BaseException:
+                            pass
+            raise
 
     try:
         projected = _project_layer(
@@ -1418,6 +1445,7 @@ def prepare_view_volume_after_fullframe(
     internal_final_layer_enabled: bool = False,
     preinterpolation_layer_already_published: bool = False,
     submit_component_projection: Optional[Callable[..., Future[NrrdLayerRef]]] = None,
+    retire_dense_after_prepare: bool = False,
 ) -> PreparedViewResult:
     # Local import keeps the package dependency graph acyclic.
     from .finalization import union_volume_into_volume
@@ -1765,7 +1793,20 @@ def prepare_view_volume_after_fullframe(
             # the existing backing in place; only anonymous/fallback arrays need a drain copy.
             old_volume = baseline_native_volume
             existing_backing = _interpolation_array_backing_path(old_volume)
-            if existing_backing is not None:
+            if (existing_backing is None and bool(retire_dense_after_prepare)
+                    and not bool(dense_tiling_active) and not bool(keep_temp)):
+                # The scheduler will consume the independent projected refs and retire
+                # this original canvas. A second multi-GiB native backing would be
+                # discarded immediately; keep the original owner alive until then.
+                runtime_telemetry().add(
+                    'projection.noninterpolated_drain_avoided_bytes', int(np.asarray(old_volume).nbytes),
+                )
+                print(
+                    f'{model_name}/{view.name}: native drain copy avoided; '
+                    'original canvas retained until terminal component-ref retirement.',
+                    flush=True,
+                )
+            elif existing_backing is not None:
                 print(
                     f'{model_name}/{view.name} non-interpolated native retention (v16.1.3): '
                     f'reusing {existing_backing}; no full-volume drain copy.'

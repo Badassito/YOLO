@@ -128,6 +128,20 @@ from .backprojection import (
 _GPU_WORKER_NUMA_PIN: Optional[set] = None
 _GPU_WORKER_NUMA_FULL: Optional[set] = None
 
+_WORKER_RENDER_PATHS_ANNOUNCED: set[tuple[str, str, str, str]] = set()
+
+def _announce_worker_render_path(view: ViewInfo, kind: str, render_path: str, result_mode: str) -> None:
+    """Expose selected paths before buffered SLURM output hides the active family."""
+    key = (str(view.family), str(kind), str(render_path), str(result_mode))
+    if key in _WORKER_RENDER_PATHS_ANNOUNCED:
+        return
+    _WORKER_RENDER_PATHS_ANNOUNCED.add(key)
+    print(
+        f'Inference path selected [pid={os.getpid()}]: family={view.family}, '
+        f'kind={kind}, render={render_path}, result={result_mode}, view={view.name}',
+        flush=True,
+    )
+
 def _canonical_image_sink_for_task(
     task: Dict[str, object], *, backend: str,
 ) -> Optional[object]:
@@ -1475,6 +1489,7 @@ def run_prediction_volume_in_worker(
         # Keep the source/native view plane resident whenever the worker has VRAM headroom.
         # Full-frame and tile tasks use separate source classes but the same cached native
         # planes; a tile is cropped/warped/resized directly on device before inference.
+        render_path = 'cpu'
         gpu_engine = _worker_gpu_render_engine()
         if gpu_engine is not None:
             try:
@@ -1510,6 +1525,7 @@ def run_prediction_volume_in_worker(
                     )
 
                 if render_mode == 'resident' and resident_view_supported and kind == 'tile':
+                    render_path = 'gpu_resident'
                     request_affine_grid_cache_entries(10)
                     if is_tilted_view(view):
                         gpu_engine.request_tilted_plan_cache_entries(5)
@@ -1527,6 +1543,7 @@ def run_prediction_volume_in_worker(
                         render_batch_sink=render_batch_sink,
                     )
                 elif render_mode == 'resident' and resident_view_supported:
+                    render_path = 'gpu_resident'
                     source = GpuRenderedYoloSource(
                         gpu_engine,
                         view,
@@ -1545,6 +1562,7 @@ def run_prediction_volume_in_worker(
                     and is_azimuthal_view(view)
                     and azimuthal_streaming_gpu_render_supported(view)
                 ):
+                    render_path = 'gpu_slab_then_cpu_affine'
                     slab_indices = _azimuthal_slab_context_indices(
                         view, slice_offset, num_frames, channel_format,
                         batch_size=max(1, int(cfg.batch)),
@@ -1583,6 +1601,7 @@ def run_prediction_volume_in_worker(
                 source = None
 
         if source is None:
+            render_path = 'cpu'
             if (
                 is_tilted_azimuthal_view(view)
                 and str(view.name) not in _WORKER_TILTED_AZIMUTHAL_CPU_WARNED
@@ -1595,6 +1614,8 @@ def run_prediction_volume_in_worker(
                     'Look earlier for a resident-upload or CUDA-renderer failure.'
                 )
             source_mm, source = _open_cpu_render_source()
+
+        _announce_worker_render_path(view, kind, render_path, str(task.get('result_mode', 'file')))
 
         if task.get('M_out_to_processing') is not None:
             task_affine = np.asarray(task['M_out_to_processing'], dtype=np.float32)
@@ -1677,6 +1698,7 @@ def run_prediction_volume_in_worker(
                 except Exception:
                     pass
             source_mm, source = _open_cpu_render_source()
+            _announce_worker_render_path(view, kind, 'cpu_after_gpu_failure', str(task.get('result_mode', 'file')))
             stats = _predict(source)
 
         public_stats: Dict[str, object] = {

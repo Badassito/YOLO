@@ -196,6 +196,124 @@ def azimuthal_texture_source_copy_reserve_enabled() -> bool:
     """Reserve a second source-volume allocation when admitting GPU residency."""
     return _env_flag('YOLO_TTA_AZIMUTHAL_TEXTURE_SOURCE_COPY_RESERVE', True)
 
+def radial_native_kernel_enabled() -> bool:
+    """Compute native Radial patch geometry and interpolation in one CUDA launch."""
+    return _env_flag('YOLO_TTA_GPU_RADIAL_NATIVE_KERNEL', True)
+
+_RADIAL_NATIVE_KERNELS: Optional[object] = None
+_RADIAL_NATIVE_KERNELS_FAILED = False
+_RADIAL_NATIVE_KERNELS_ERROR = ''
+
+def _radial_native_kernels() -> Optional[object]:
+    """Compile the scalar-geometry Radial sampler independently of legacy kernels."""
+    global _RADIAL_NATIVE_KERNELS, _RADIAL_NATIVE_KERNELS_FAILED, _RADIAL_NATIVE_KERNELS_ERROR
+    if _RADIAL_NATIVE_KERNELS is not None:
+        return _RADIAL_NATIVE_KERNELS
+    if _RADIAL_NATIVE_KERNELS_FAILED:
+        return None
+    try:
+        import cupy as cp  # type: ignore
+        source = r'''
+        __device__ __forceinline__ int radial_clip_index(int i, int length) {
+            return i < 0 ? 0 : (i >= length ? length - 1 : i);
+        }
+
+        __device__ __forceinline__ float radial_logical_voxel(
+            const unsigned char* source, int t, int y, int x,
+            int native_t, int logical_t, int full_h, int full_w) {
+            const unsigned long long stride = (unsigned long long)full_h * full_w;
+            const unsigned long long spatial = (unsigned long long)y * full_w + x;
+            if (native_t == logical_t)
+                return (float)source[(unsigned long long)t * stride + spatial];
+            // Reproduce the integer logical-T cube first, including its uint8
+            // rounding. Interpolating native T directly changes the source data.
+            double rf = __dadd_rn(__dmul_rn(__dadd_rn((double)t, 0.5),
+                                           __ddiv_rn((double)native_t, (double)logical_t)), -0.5);
+            int t0 = radial_clip_index((int)floor(rf), native_t);
+            int t1 = radial_clip_index(t0 + 1, native_t);
+            float alpha = __double2float_rn(fmin(1.0, fmax(0.0, rf - (double)t0)));
+            float f0 = (float)source[(unsigned long long)t0 * stride + spatial];
+            float f1 = (float)source[(unsigned long long)t1 * stride + spatial];
+            float value = __fadd_rn(f0, __fmul_rn(alpha, __fsub_rn(f1, f0)));
+            return (float)__float2uint_rn(fminf(255.0f, fmaxf(0.0f, value)));
+        }
+
+        extern "C" __global__ void radial_native_f32(
+            const unsigned char* source, float* out,
+            int native_t, int logical_t, int full_h, int full_w,
+            int rows, int columns, int base_id, int direction_id,
+            int height_origin, double radius, double arc_origin,
+            double center_x, double center_y, double shear) {
+            int u = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+            int row = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
+            if (u >= columns || row >= rows) return;
+            unsigned long long q = (unsigned long long)row * columns + u;
+            int height_length = base_id == 0 ? logical_t : (base_id == 1 ? full_h : full_w);
+            double height = (double)height_origin + (double)row;
+            // Padding belongs to the unsheared height axis. Tilt must never
+            // turn a padded row back into a valid source sample.
+            if (height < 0.0 || height > (double)(height_length - 1)) {
+                out[q] = 0.0f;
+                return;
+            }
+            const double two_pi = 6.283185307179586476925286766559;
+            double theta = fmod(__ddiv_rn(__dadd_rn(arc_origin, (double)u), radius), two_pi);
+            if (theta < 0.0) theta += two_pi;
+            double px = __dadd_rn(center_x, __dmul_rn(radius, cos(theta)));
+            double py = __dadd_rn(center_y, __dmul_rn(radius, sin(theta)));
+            double offset = direction_id == 0 ? py - center_y : px - center_x;
+            double stack = __dadd_rn(height, __dmul_rn(shear, offset));
+            double tt = base_id == 0 ? stack : py;
+            double yy = base_id == 0 ? py : (base_id == 1 ? stack : px);
+            double xx = base_id == 2 ? stack : px;
+            if (!(tt > -1.0 && tt < (double)logical_t &&
+                  yy > -1.0 && yy < (double)full_h &&
+                  xx > -1.0 && xx < (double)full_w)) {
+                out[q] = 0.0f;
+                return;
+            }
+            int t0 = (int)floor(tt), y0 = (int)floor(yy), x0 = (int)floor(xx);
+            float dt = __double2float_rn(tt - (double)t0);
+            float dy = __double2float_rn(yy - (double)y0);
+            float dx = __double2float_rn(xx - (double)x0);
+            float value = 0.0f;
+            // Explicit rounded float32 operations retain NumPy's eight-tap
+            // accumulation order instead of silently introducing fused multiply-add.
+            #pragma unroll
+            for (int it = 0; it < 2; ++it) {
+                int ti = t0 + it;
+                float wt = it ? dt : __fsub_rn(1.0f, dt);
+                #pragma unroll
+                for (int iy = 0; iy < 2; ++iy) {
+                    int yi = y0 + iy;
+                    float wy = iy ? dy : __fsub_rn(1.0f, dy);
+                    #pragma unroll
+                    for (int ix = 0; ix < 2; ++ix) {
+                        int xi = x0 + ix;
+                        float wx = ix ? dx : __fsub_rn(1.0f, dx);
+                        if (ti >= 0 && ti < logical_t && yi >= 0 && yi < full_h &&
+                            xi >= 0 && xi < full_w) {
+                            float voxel = radial_logical_voxel(source, ti, yi, xi,
+                                native_t, logical_t, full_h, full_w);
+                            float weight = __fmul_rn(__fmul_rn(wt, wy), wx);
+                            value = __fadd_rn(value, __fmul_rn(voxel, weight));
+                        }
+                    }
+                }
+            }
+            out[q] = (float)__float2uint_rn(fminf(255.0f, fmaxf(0.0f, value)));
+        }
+        '''
+        module = cp.RawModule(code=source, options=('--std=c++11', '--fmad=false'))
+        _RADIAL_NATIVE_KERNELS = argparse.Namespace(
+            cp=cp, module=module, radial_native_f32=module.get_function('radial_native_f32'),
+        )
+        return _RADIAL_NATIVE_KERNELS
+    except Exception as exc:
+        _RADIAL_NATIVE_KERNELS_FAILED = True
+        _RADIAL_NATIVE_KERNELS_ERROR = f'{type(exc).__name__}: {exc}'
+        return None
+
 _FUSED_DIRECT_RENDER_KERNELS: Optional[object] = None
 
 _FUSED_DIRECT_RENDER_KERNELS_FAILED = False
@@ -3309,6 +3427,79 @@ class _GpuWorkerRenderEngine:
         raise ValueError(f'Unsupported view for GPU native plane: {name}')
 
     def _render_radial_native_resident(self, view: ViewInfo, frame_idx: int) -> object:
+        """Prefer one scalar-geometry CUDA launch; retain the explicit Torch reference."""
+        if not is_radial_view(view):
+            raise ValueError('Radial shell rendering requires a Radial view')
+        volume = self._volume_gpu
+        # The CPU Torch route is used by numerical tests without CUDA initialization.
+        if not bool(getattr(volume, 'is_cuda', False)):
+            return self._render_radial_native_resident_torch(view, int(frame_idx))
+        disabled = bool(getattr(self, '_radial_native_kernel_disabled', False))
+        if radial_native_kernel_enabled() and not disabled:
+            try:
+                return self._render_radial_native_resident_cuda(view, int(frame_idx))
+            except Exception as exc:
+                self._radial_native_kernel_disabled = True
+                reason = f'{type(exc).__name__}: {exc}'
+        else:
+            reason = ('disabled after an earlier failure' if disabled
+                      else 'YOLO_TTA_GPU_RADIAL_NATIVE_KERNEL=0')
+        if not bool(getattr(self, '_radial_native_fallback_warned', False)):
+            self._radial_native_fallback_warned = True
+            print(f'Warning: Radial native CUDA kernel unavailable ({reason}); '
+                  'using the resident Torch reference renderer.', flush=True)
+        return self._render_radial_native_resident_torch(view, int(frame_idx))
+
+    def _render_radial_native_resident_cuda(self, view: ViewInfo, frame_idx: int) -> object:
+        """Render with scalar metadata, one source pointer, and no host coordinate maps."""
+        if not is_radial_view(view):
+            raise ValueError('Radial native CUDA sampling requires a Radial view')
+        index = int(frame_idx)
+        if index < 0 or index >= len(view.radial_radii):
+            raise ValueError(f'Invalid radial frame {index} for {view.name!r}')
+        torch = self.torch
+        volume = self._volume_gpu
+        if volume is None or volume.dtype != torch.uint8 or not bool(volume.is_contiguous()):
+            raise RuntimeError('Radial native CUDA sampling requires a contiguous resident uint8 source')
+        native_t, full_h, full_w = (int(v) for v in volume.shape)
+        logical_t = int(self._logical_t)
+        if (logical_t, full_h, full_w) != (int(view.full_t), int(view.full_h), int(view.full_w)):
+            raise ValueError('Radial shell source shape does not match physical view geometry')
+        base_id = {'transverse': 0, 'sagittal': 1, 'coronal': 2}.get(str(view.radial_base_view))
+        if base_id is None:
+            raise ValueError(f'Unsupported Radial base {view.radial_base_view!r}')
+        radius = float(view.radial_radii[index])
+        if not math.isfinite(radius) or radius <= 0.0:
+            raise ValueError('Radial shell radius must be finite and positive')
+        rows, columns = int(view.src_h), int(view.src_w)
+        if min(rows, columns) <= 0:
+            raise ValueError('Radial native patch dimensions must be positive')
+        shear = (math.tan(math.radians(float(view.tilt_angle_deg)))
+                 if bool(view.radial_tilted_source) else 0.0)
+        direction_id = 0 if str(view.tilt_direction) == 'vertical' else 1
+        kernels = _radial_native_kernels()
+        if kernels is None:
+            raise RuntimeError('Radial CuPy/NVRTC kernel unavailable: ' + _RADIAL_NATIVE_KERNELS_ERROR)
+        out = torch.empty((rows, columns), dtype=torch.float32, device=self.device)
+        cp_source = self._fused_cupy_volume(kernels)
+        cp_out = kernels.cp.asarray(out)
+        block = (32, 8)
+        kernels.radial_native_f32(
+            ((columns + block[0] - 1) // block[0], (rows + block[1] - 1) // block[1]), block,
+            (cp_source, cp_out,
+             np.int32(native_t), np.int32(logical_t), np.int32(full_h), np.int32(full_w),
+             np.int32(rows), np.int32(columns), np.int32(base_id), np.int32(direction_id),
+             np.int32(view.radial_height_origin), np.float64(radius), np.float64(view.radial_arc_origin),
+             np.float64(view.center_x), np.float64(view.center_y), np.float64(shear)),
+            stream=_cupy_external_stream(kernels.cp, self._stream),
+        )
+        if not bool(getattr(self, '_radial_native_kernel_announced', False)):
+            self._radial_native_kernel_announced = True
+            print('Radial native CUDA renderer active: scalar shell geometry and '
+                  'source interpolation in one launch per patch.', flush=True)
+        return out
+
+    def _render_radial_native_resident_torch(self, view: ViewInfo, frame_idx: int) -> object:
         """Sample one periodic shell patch from the resident uint8 source.
 
         Coordinates are shared with CPU rendering and backprojection. Gather only

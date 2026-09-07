@@ -235,6 +235,43 @@ class TerminalReferenceTests(unittest.TestCase):
         self.assertIs(result.final_view_volume_mm, mutated)
         self.assertFalse(seen.telemetry)
 
+    def test_pending_retirement_retains_original_canvas_without_native_drain(self):
+        with mock.patch.object(assembly, '_drain_volume_to_mmap', side_effect=AssertionError('unexpected drain')):
+            result, seen, initial, original = self.run_prepare(
+                interpolate=0, preinterpolation_layer_already_published=False,
+                retire_dense_after_prepare=True,
+            )
+        self.assertIs(result.final_view_volume_mm, original)
+        self.assertIs(result.native_support_mm, original)
+        np.testing.assert_array_equal(original, initial)
+        self.assertEqual(seen.telemetry['projection.noninterpolated_drain_avoided_bytes'], original.nbytes)
+        self.assertFalse(seen.closed)
+
+    def test_native_drain_is_preserved_without_retirement_or_for_debug_artifacts(self):
+        for retire, keep in ((False, False), (True, True)):
+            with self.subTest(retire=retire, keep=keep), mock.patch.object(
+                assembly, '_drain_volume_to_mmap', side_effect=lambda volume, *_args, **_kw: volume.copy(),
+            ) as drain:
+                result, seen, initial, original = self.run_prepare(
+                    interpolate=0, preinterpolation_layer_already_published=False,
+                    retire_dense_after_prepare=retire, keep_temp=keep,
+                )
+                drain.assert_called_once()
+                self.assertIsNot(result.final_view_volume_mm, original)
+                np.testing.assert_array_equal(result.final_view_volume_mm, initial)
+                self.assertNotIn('projection.noninterpolated_drain_avoided_bytes', seen.telemetry)
+
+    def test_existing_backing_is_not_counted_as_a_newly_avoided_copy(self):
+        with mock.patch.object(assembly, '_interpolation_array_backing_path', return_value=Path('already_backed.dat')), \
+                mock.patch.object(assembly, '_drain_volume_to_mmap', side_effect=AssertionError('unexpected drain')):
+            result, seen, initial, original = self.run_prepare(
+                interpolate=0, preinterpolation_layer_already_published=False,
+                retire_dense_after_prepare=True,
+            )
+        self.assertIs(result.final_view_volume_mm, original)
+        np.testing.assert_array_equal(original, initial)
+        self.assertNotIn('projection.noninterpolated_drain_avoided_bytes', seen.telemetry)
+
     def test_missing_duplicate_or_underreported_component_coverage_fails_before_retirement(self):
         for malformed in ('missing', 'duplicate', 'counts'):
             with self.subTest(malformed=malformed), self.assertRaises(RuntimeError):

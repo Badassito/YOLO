@@ -6,6 +6,7 @@ import contextlib
 import json
 import math
 import mmap
+import operator
 import os
 import shutil
 import sys
@@ -3781,7 +3782,9 @@ class IncrementalRawBBoxMaskStoreWriter:
  writes its normalized crop in bounded row slabs with ``pwrite``; neither block-sized nor
  whole-crop payload objects are retained. Finalization is allowed only after every output
  slice has been delivered exactly once, so its index, foreground count, and segment extent
- have the same semantics as:func:`write_raw_bbox_mask_store`."""
+    have the same semantics as:func:`write_raw_bbox_mask_store`."""
+
+    _fallback_pwrite_lock = threading.Lock()
 
     def __init__(
         self,
@@ -3854,6 +3857,94 @@ class IncrementalRawBBoxMaskStoreWriter:
     def __call__(self, z0: int, block: np.ndarray) -> None:
         self.consume(int(z0), block)
 
+    @property
+    def encoded_slice_format(self) -> str:
+        """Opt in to the exact, already-normalized device encoder protocol."""
+        return 'packbits_little' if self._packbits_payload else 'raw_u8'
+
+    def consume_encoded_block(self, z0: int, records: Sequence[object], payload: np.ndarray, *, packed: bool) -> None:
+        """Append validated device-encoded crops without scanning source pixels.
+
+        The encoder supplies exact tight boxes, binary foreground counts and
+        normalized uint8 crops (or little-endian row packbits with zero padding).
+        This method checks the complete addressing contract before reserving any
+        store state, then performs one contiguous append for the whole block.
+        """
+        first = operator.index(z0)
+        count = len(records)
+        if first < 0 or first + count > self.shape[0]:
+            raise IndexError(f'{self.desc}: encoded block is outside source slices')
+        if bool(packed) != self._packbits_payload:
+            raise ValueError(f'{self.desc}: encoded payload format does not match the store')
+        data = np.asarray(payload)
+        if data.dtype != np.uint8 or data.ndim != 1 or not data.flags.c_contiguous:
+            raise ValueError(f'{self.desc}: encoded payload must be contiguous uint8 bytes')
+        entries = []
+        cursor = 0
+        for index, record in enumerate(records):
+            z, y0, y1, x0, x1, foreground, offset, size = (
+                operator.index(getattr(record, field))
+                for field in ('z', 'y0', 'y1', 'x0', 'x1', 'foreground', 'offset', 'size')
+            )
+            if z != first + index or not (0 <= y0 <= y1 <= self.shape[1] and 0 <= x0 <= x1 <= self.shape[2]):
+                raise ValueError(f'{self.desc}: encoded slice coordinates are invalid')
+            area = (y1 - y0) * (x1 - x0)
+            row_bytes = ((x1 - x0 + 7) // 8) if packed else (x1 - x0)
+            expected_size = (y1 - y0) * row_bytes
+            if (offset != cursor or size != expected_size or foreground < 0 or foreground > area
+                    or (foreground == 0 and (area != 0 or (y0, y1, x0, x1) != (0, 0, 0, 0)))
+                    or (foreground > 0 and area == 0)):
+                raise ValueError(f'{self.desc}: encoded crop size/count/offset is invalid')
+            cursor += size
+            if cursor > data.size:
+                raise ValueError(f'{self.desc}: encoded payload ends inside a slice')
+            if packed and size and (x1 - x0) % 8:
+                tail_mask = (0xff << ((x1 - x0) % 8)) & 0xff
+                tail_bytes = data[offset:cursor].reshape(y1 - y0, row_bytes)[:, -1]
+                if np.any(tail_bytes & tail_mask):
+                    raise ValueError(f'{self.desc}: encoded row padding bits must be zero')
+            entries.append((z, y0, y1, x0, x1, foreground, offset, size, area))
+        if cursor != data.size:
+            raise ValueError(f'{self.desc}: encoded payload has unclaimed bytes')
+        with self._lock:
+            if self._failed_reason is not None:
+                return
+            if self._finalized or self._fd is None:
+                raise RuntimeError(f'{self.desc}: encoded block arrived after store closure')
+            if np.any(self._slice_state[first:first + count] != 0):
+                raise ValueError(f'{self.desc}: encoded slices were delivered more than once')
+            fd, base_offset = self._fd, self._next_offset
+            self._next_offset += int(data.size)
+            self._slice_state[first:first + count] = np.uint8(1)
+            self._active_callbacks += 1
+        try:
+            if data.size:
+                self._pwrite_all(fd, memoryview(data).cast('B'), int(base_offset))
+            with self._lock:
+                if self._failed_reason is not None:
+                    return
+                for z, y0, y1, x0, x1, foreground, offset, size, area in entries:
+                    rec = self.index[z]
+                    if foreground:
+                        rec['kind'] = np.uint8(1)
+                        rec['offset'] = np.uint64(base_offset + offset)
+                        rec['payload_size'] = np.uint64(size)
+                        rec['y0'], rec['y1'] = np.uint32(y0), np.uint32(y1)
+                        rec['x0'], rec['x1'] = np.uint32(x0), np.uint32(x1)
+                        rec['payload_nbytes'] = np.uint64(area)
+                        self._nonempty_slices += 1
+                        self._foreground_voxels += foreground
+                        self._min_t, self._max_t = min(self._min_t, z), max(self._max_t, z)
+                        self._min_y, self._max_y = min(self._min_y, y0), max(self._max_y, y1 - 1)
+                        self._min_x, self._max_x = min(self._min_x, x0), max(self._max_x, x1 - 1)
+                    self._slice_state[z] = np.uint8(2)
+        except BaseException as exc:
+            self.abort(exc)
+            raise
+        finally:
+            with self._lock:
+                self._active_callbacks -= 1
+
     def consume_empty_range(self, z0: int, count: int) -> None:
         """Register a proven-empty contiguous slice range without scanning dense planes."""
         start = int(z0)
@@ -3872,9 +3963,26 @@ class IncrementalRawBBoxMaskStoreWriter:
 
     @staticmethod
     def _pwrite_all(fd: int, data: memoryview, offset: int) -> None:
+        pwrite = getattr(os, 'pwrite', None)
+        if not callable(pwrite):
+            # Windows has no os.pwrite. Serialize seek/write/restore on the
+            # writer-owned descriptors while preserving positional semantics.
+            with IncrementalRawBBoxMaskStoreWriter._fallback_pwrite_lock:
+                prior = os.lseek(int(fd), 0, os.SEEK_CUR)
+                try:
+                    os.lseek(int(fd), int(offset), os.SEEK_SET)
+                    written = 0
+                    while written < len(data):
+                        n = int(os.write(int(fd), data[written:]))
+                        if n <= 0:
+                            raise OSError(f'write returned {n} before completing {len(data)} bytes')
+                        written += n
+                finally:
+                    os.lseek(int(fd), prior, os.SEEK_SET)
+            return
         written = 0
         while int(written) < int(len(data)):
-            n = int(os.pwrite(int(fd), data[int(written):], int(offset) + int(written)))
+            n = int(pwrite(int(fd), data[int(written):], int(offset) + int(written)))
             if n <= 0:
                 raise OSError(f'pwrite returned {n} before completing {len(data)} bytes')
             written += int(n)

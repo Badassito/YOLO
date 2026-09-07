@@ -1118,6 +1118,9 @@ class _ResidentTensorRTRingExecutor:
             raise RuntimeError('TensorRT returned an aliased execution context')
 
         self._borrowed_context = original_context
+        self._generic_suspended = False
+        self._borrowed_graph_recapture_needed = False
+        self._borrowed_ring_addresses: Dict[str, int] = {}
         self._restore_tensor_addresses: Dict[str, int] = {}
         if callable(getattr(original_context, 'set_tensor_address', None)):
             for name in self.binding_names:
@@ -1135,6 +1138,12 @@ class _ResidentTensorRTRingExecutor:
             for slot, context in zip(self.slots, contexts):
                 slot.context = context
                 output_tensors = self._configure_context_and_buffers(slot)
+                if context is original_context and callable(getattr(context, 'set_tensor_address', None)):
+                    self._borrowed_ring_addresses = {self.input_name: int(slot.input.data_ptr())}
+                    self._borrowed_ring_addresses.update({
+                        name: int(tensor.data_ptr())
+                        for name, tensor in zip(self.output_names, output_tensors)
+                    })
                 split = _split_segmentation_backend_outputs(output_tensors)
                 if split is None:
                     # Output order is not guaranteed across TensorRT exporter versions; identify
@@ -1708,6 +1717,95 @@ class _ResidentTensorRTRingExecutor:
             slot.synthetic = False
             self._set_slot_unit_descriptor(slot, self.default_descriptor)
 
+    def _backend_tensor_addresses(self) -> Dict[str, int]:
+        """Snapshot currently owned AutoBackend tensors before a context handoff."""
+        if not callable(getattr(self._borrowed_context, 'set_tensor_address', None)):
+            return {}  # TensorRT v2 receives binding addresses on every enqueue.
+        addresses = {}
+        for name in self.binding_names:
+            binding = getattr(self.backend, 'bindings', {}).get(str(name))
+            tensor = getattr(binding, 'data', None)
+            pointer = getattr(tensor, 'data_ptr', None)
+            if not callable(pointer) or int(pointer()) <= 0:
+                raise RuntimeError(f'Cannot restore current AutoBackend tensor {name!r}')
+            addresses[str(name)] = int(pointer())
+        return addresses
+
+    def suspend_for_generic(self) -> None:
+        """Return the borrowed context to AutoBackend without freeing the idle ring."""
+        if self._closed or getattr(self.backend, 'context', None) is not self._borrowed_context:
+            raise RuntimeError('Cannot suspend a closed or replaced TensorRT context')
+        if bool(getattr(self, '_generic_suspended', False)):
+            return
+        # Unlike reset_for_task, this fences every stream even after per-slot
+        # valid flags were cleared at release. Generic inference borrows slot 0's
+        # context, so it must not overlap any earlier ring command.
+        for slot in self.slots:
+            for stream in (slot.infer_stream, slot.post_stream):
+                stream.synchronize()
+        # TensorRT graphs capture execution-context state and binding locations.
+        # Generic inference changes the borrowed context: restoring addresses is
+        # not permission to replay its old graph. The independent slot-1 graph
+        # and source-keyed render graphs remain valid and retain their owners.
+        borrowed_slot = self.slots[0]
+        self._borrowed_graph_recapture_needed = borrowed_slot.infer_graph is not None
+        borrowed_slot.infer_graph = None
+        self.infer_graph_count = sum(slot.infer_graph is not None for slot in self.slots)
+        addresses = self._backend_tensor_addresses()
+        self._restore_tensor_addresses = addresses
+        for name, address in addresses.items():
+            if self._borrowed_context.set_tensor_address(name, address) is False:
+                raise RuntimeError(f'TensorRT rejected generic address for {name!r}')
+        self._generic_suspended = True
+
+    def _recapture_borrowed_inference_graph(self) -> None:
+        """Refresh the changed context's graph without recreating either context."""
+        slot = self.slots[0]
+        torch = self.torch
+        try:
+            with torch.cuda.stream(slot.infer_stream):
+                slot.input.zero_()
+                self._execute_context(slot)
+            slot.infer_stream.synchronize()
+        except BaseException as exc:
+            raise RuntimeError('TensorRT borrowed-context warmup failed after generic inference') from exc
+        try:
+            graph = torch.cuda.CUDAGraph()
+            with _cuda_graph_capture_context(torch, graph, slot.infer_stream):
+                self._execute_context(slot)
+            slot.infer_stream.synchronize()
+            slot.infer_graph = graph
+        except Exception:
+            slot.infer_graph = None
+            try:
+                slot.infer_stream.synchronize()
+            except BaseException as exc:
+                raise _ResidentTensorRTRingFatalError(
+                    'TensorRT borrowed-context stream did not recover after graph capture'
+                ) from exc
+        self.infer_graph_count = sum(item.infer_graph is not None for item in self.slots)
+
+    def resume_after_generic(self) -> None:
+        """Rebind retained static ring buffers after an ordinary backend task."""
+        if not bool(getattr(self, '_generic_suspended', False)):
+            return
+        if self._closed or getattr(self.backend, 'context', None) is not self._borrowed_context:
+            raise RuntimeError('Cannot resume a closed or replaced TensorRT context')
+        # Generic inference may use a stream not owned by this executor. Fence
+        # that work before changing addresses on its borrowed execution context.
+        self.torch.cuda.synchronize(self.device)
+        self._restore_tensor_addresses = self._backend_tensor_addresses()
+        if self._restore_tensor_addresses:
+            if set(self._borrowed_ring_addresses) != set(self.binding_names):
+                raise RuntimeError('Retained TensorRT ring address map is incomplete')
+            for name, address in self._borrowed_ring_addresses.items():
+                if self._borrowed_context.set_tensor_address(name, address) is False:
+                    raise RuntimeError(f'TensorRT rejected resumed ring address for {name!r}')
+        if bool(getattr(self, '_borrowed_graph_recapture_needed', False)):
+            self._recapture_borrowed_inference_graph()
+        self._borrowed_graph_recapture_needed = False
+        self._generic_suspended = False
+
     def close(self) -> None:
         """Drain ring streams, then restore borrowed AutoBackend binding addresses.
 
@@ -1718,6 +1816,11 @@ class _ResidentTensorRTRingExecutor:
             return
         self._closed = True
         drain_error: Optional[BaseException] = None
+        if bool(getattr(self, '_generic_suspended', False)):
+            try:
+                self.torch.cuda.synchronize(self.device)
+            except BaseException as exc:
+                drain_error = exc
         for slot in getattr(self, 'slots', []):
             for stream in (getattr(slot, 'infer_stream', None), getattr(slot, 'post_stream', None)):
                 if stream is None:
@@ -1730,6 +1833,11 @@ class _ResidentTensorRTRingExecutor:
         context = getattr(self, '_borrowed_context', None)
         restore = getattr(self, '_restore_tensor_addresses', {})
         restore_error: Optional[BaseException] = None
+        if bool(getattr(self, '_generic_suspended', False)):
+            try:
+                restore = self._backend_tensor_addresses()
+            except BaseException as exc:
+                restore_error = exc
         if context is not None and restore:
             for name, address in restore.items():
                 try:
@@ -1782,6 +1890,9 @@ class _ResidentTensorRTRingExecutor:
             pass
         self._borrowed_context = None
         self._restore_tensor_addresses = {}
+        self._borrowed_ring_addresses = {}
+        self._borrowed_graph_recapture_needed = False
+        self._generic_suspended = False
         gc.collect()
         try:
             cp = getattr(getattr(self, 'kernels', None), 'cp', None)
@@ -1863,6 +1974,38 @@ def _resident_trt_pipeline_decline(backend: Optional[object]) -> None:
     if backend is not None:
         _resident_trt_pipeline_invalidate(backend)
 
+def _resident_trt_pipeline_suspend_for_radial(backend: Optional[object], source: object) -> bool:
+    """Soft bypass only for a Radial source sharing an idle ring's source/model."""
+    if (
+        not isinstance(source, (GpuRenderedYoloSource, GpuTileRenderedYoloSource))
+        or getattr(getattr(source, 'view', None), 'family', '') != 'radial'
+        or not resident_trt_pipeline_persistence_enabled()
+    ):
+        return False
+    with _RESIDENT_TRT_PIPELINE_CACHE_LOCK:
+        entry = _RESIDENT_TRT_PIPELINE_CACHE.get(id(backend))
+        if entry is None:
+            return True
+        if bool(entry.get('in_use', False)):
+            raise _ResidentTensorRTRingFatalError('Cannot hand an active TensorRT ring to generic inference')
+        executor = entry['executor']
+        render_engine = getattr(source, 'engine', None)
+        if (
+            entry.get('backend') is not backend
+            or _trt_engine_from_autobackend(backend) is not getattr(executor, 'engine', None)
+            or getattr(backend, 'context', None) is not getattr(executor, '_borrowed_context', None)
+            or entry.get('render_engine') is not render_engine
+            or entry.get('render_volume_key') != getattr(render_engine, '_volume_key', None)
+        ):
+            return False
+        try:
+            executor.suspend_for_generic()
+        except Exception as exc:
+            _resident_trt_pipeline_invalidate(backend, exc)
+            raise _ResidentTensorRTRingFatalError('Failed to hand the retained TensorRT context to generic inference') from exc
+        entry['last_used'] = time.monotonic()
+        return True
+
 def _resident_trt_pipeline_acquire(
     backend: object,
     source: object,
@@ -1910,6 +2053,7 @@ def _resident_trt_pipeline_acquire(
 
     if executor is not None:
         try:
+            executor.resume_after_generic()
             executor.reset_for_task()
             executor.configure_slice_bbox_collection(bool(collect_slice_bboxes))
             executor.reconfigure_destination(
@@ -1922,6 +2066,8 @@ def _resident_trt_pipeline_acquire(
             slots = source.prepare_direct_ring(input_dtype=input_dtype)
             if len(slots) != 2 or any(a is not b for a, b in zip(slots, executor.slots)):
                 raise RuntimeError('cached TensorRT executor did not retain its static ring slots')
+            entry['render_engine'] = getattr(source, 'engine', None)
+            entry['render_volume_key'] = getattr(getattr(source, 'engine', None), '_volume_key', None)
             return executor, True
         except Exception as exc:
             source._direct_ring = None
@@ -1946,6 +2092,8 @@ def _resident_trt_pipeline_acquire(
             _RESIDENT_TRT_PIPELINE_CACHE[id(backend)] = {
                 'backend': backend, 'signature': signature, 'executor': executor,
                 'in_use': True, 'last_used': time.monotonic(),
+                'render_engine': getattr(source, 'engine', None),
+                'render_volume_key': getattr(getattr(source, 'engine', None), '_volume_key', None),
             }
     else:
         executor._resident_trt_transient = True
@@ -2045,6 +2193,8 @@ def _try_resident_trt_ring_accumulate(
     if not resident_trt_ring_enabled() or device_union is None:
         return _decline()
     if not bool(getattr(source, 'resident_ring_supported', True)):
+        if _resident_trt_pipeline_suspend_for_radial(backend, source):
+            return None
         return _decline()
     if not isinstance(source, (GpuRenderedYoloSource, GpuTileRenderedYoloSource)):
         return _decline()

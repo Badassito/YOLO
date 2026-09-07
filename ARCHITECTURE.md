@@ -1,10 +1,16 @@
 # XTA architecture
 
-`GPT-6-Astra-Ultra_v20.0.0_SLURM.py` is the sole versioned launcher. It, the
+`GPT-6-Astra-Ultra_v20.0.1_SLURM.py` is the sole versioned launcher. It, the
 installed `xta` console script, and `python -m XTA` all dispatch
 through `XTA.cli.run()`.
 The implementation lives in the importable `XTA` package so spawned processes
 resolve worker functions and data types through canonical module paths.
+
+Main v20.0.1 promotes the completed v20.0.4 source from
+`codex/v20-cylindrical-views`. Main v20.0.0 preserves the original cylindrical
+release. The development v20.0.1 through v20.0.3 changes are included in main
+v20.0.1 without separate main releases. Version references in the correction
+history below retain their development branch numbering.
 
 ## Cylindrical view family (v20)
 
@@ -49,13 +55,182 @@ occurrence contributes by OR, retaining differing model predictions in repeated
 wraps. Existing native/LQ layer publication and final source-space union apply.
 New shell inference supports the generic CPU/CUDA routes; CUDA rendering uses
 bounded source sampling. Shells do not enter the old Azimuthal sparse projector,
-fused resident ring or D1 bitset kernels. Their parent-owned CPU projection is the
-functional v20 path; further acceleration is separate optimization work.
+fused resident ring or D1 bitset kernels. Their parent-owned terminal projection
+selects CUDA when a device can be admitted, retaining the compiled CPU projector
+and bounded NumPy reference as fallbacks.
 
 PTA requires positive `--imgsz` with Radial shells, while its existing `--imgsz 0`
 native raster mode still works for the other families. LTA geometry/planning can
 describe shells at its 1008-pixel model raster, but production LTA retains its
 existing single-Transverse/angle-zero restriction.
+
+### Development v20.0.1 GPU feeding correction
+
+The native Radial CUDA renderer computes shell coordinates and source interpolation
+on the GPU in one kernel per patch. It passes scalar geometry instead of uploading
+the previous per-pixel index/weight maps (about 657 MiB per 3072-square frame).
+Deferred source-T reconstruction, its intermediate uint8 rounding, periodic arc
+coordinates, zero extension and final rounding retain the reference contract.
+`YOLO_TTA_GPU_RADIAL_NATIVE_KERNEL=0` selects the retained Torch reference renderer.
+A compiler/runtime fallback prints a flushed warning.
+
+Radial tasks temporarily return the borrowed TensorRT context to ordinary inference
+without destroying compatible idle ring contexts and buffers. The borrowed
+context's inference graph is retired before its state changes and recaptured after
+rebinding; independent context/source-keyed graphs can remain cached. Changed
+source/model/binding signatures and failed synchronization still invalidate safely.
+The context handoff is covered by protocol tests; actual TensorRT/H100 replay
+qualification remains a cluster check.
+
+Workers print a flushed `Inference path selected` line for each first family,
+source-rendering path and result-mode combination. The fast shell kernel announces
+`Radial native CUDA renderer active`. Run with `python -u` to make the remaining
+SLURM stdout progress immediate as well.
+
+Local renderer-only comparison at 3072 square, using 24 real source frames with
+logical T=2911, measured 0.894–0.914 s for the reference path and 0.017–0.020 s for
+the scalar CUDA kernel on the RTX 4090 Laptop GPU. All 9,437,184 output pixels
+matched. This is a component measurement, not a prediction of H100 utilization
+or whole-job speed. A mixed real-model smoke retained identical decoded payloads
+in all 64 native/LQ NRRDs. Aggregate regression: 834 passed, 75 skipped, with
+explicit CUDA and context-handoff checks run separately.
+
+### Development v20.0.2 source projection correction
+
+Job 142404 completed in 15,555.5 seconds, of which 14,913.9 seconds were after
+inference-result drain. All 155,365 frames had been collected after approximately
+641.6 seconds, while 45 parent postprocess jobs remained. The log shows 40
+nonempty shell layers; the original serial projector repeated source geometry
+calculations across 17,879,916,848 output voxels for each layer.
+
+Radial source projection now builds exact 2D plane ownership and periodic-column
+tables once and reuses them across the source stack. Compiled, nogil CPU gathers
+honor the requested worker count within explicit output-buffer limits. Tables
+are immutable and shared across compatible tilt/height variants; per-layer
+metadata retains the precise ideal and rounded-sample shear rules. Known source
+bounding boxes skip impossible mask reads. Callback delivery stays ordered,
+bounded and fully settled before borrowed input or output ownership can end.
+The original NumPy implementation remains the numerical reference and bounded
+fallback for unavailable compilation or unusually large geometry plans.
+
+For non-tiled, non-interpolated views whose dense canvas will immediately retire,
+the original canvas remains alive until terminal-ref validation. It is no longer
+copied to an additional multi-GiB native file only to delete that file. Existing
+backings, retained debug artifacts and tile ownership keep their previous rules.
+
+The projector prints flushed planning/start/completion lines including backend,
+actual workers, plan size, cache hits, setup time, total time and sink wall time.
+Use these to distinguish source projection from final NRRD/video output.
+
+`tools/benchmark_radial_projection.py` exercises true 3072-square mask strides
+and the production output geometry with deterministic synthetic masks. Sampled
+slabs across all three bases matched the unchanged reference exactly; four-worker
+comparisons were 7.4–9.6x faster without source bounds and 10.0–15.5x with bounds.
+A complete 17,879,916,848-voxel compiled stream took 82.9 seconds with eight local
+CPU workers and a checksum sink; sampled slices were independently compared.
+These measurements exclude model inference and NRRD encoding and are not a
+prediction of cluster wall time. Full cluster timing remains to be checked.
+
+### Development v20.0.3 CUDA source projection
+
+The completed v20.0.2 cluster job 142444 took 1,927.5 seconds, including a
+1,249.0-second post-inference tail. All 40 nonempty Radial layers completed on
+the compiled CPU backend. That implementation remains the CPU fallback.
+
+Radial source projection now attempts CUDA by default. It uploads the cleaned
+uint8 mask and the exact existing plane/metadata tables to an admitted device,
+then applies the same periodic OR gather in bounded output blocks. Geometry and
+trigonometry remain in the verified host tables; device height arithmetic uses
+float64 round-to-nearest operations, ties-to-even height selection and 64-bit
+source addresses. Numba is not required for this CUDA route.
+
+The existing main-process stage coordinator chooses among the configured worker
+GPUs and holds an exclusive lease through upload, projection, sink callbacks and
+cleanup. Normal inference-priority and terminal asset-retirement rules apply;
+the legacy idle-device backprojection exception is not used. A layer that cannot
+obtain a device proceeds on CPU without blocking inference or other parent jobs.
+Actual free VRAM must cover the full mask, geometry, bounded output and reserve.
+Unsupported masks, absent CUDA/CuPy, insufficient VRAM or settled setup failures
+select the retained CPU route before publishing any output.
+
+Private device and pinned-memory pools avoid global allocator-cache flushes.
+Upload and output staging are capped at 64 MiB each, with up to two independent
+host result blocks. One GPU producer overlaps the current block's CPU mask-store
+callback. Callback order and source ownership are preserved on cancellation and
+failure. A late GPU error is propagated to the caller's transaction rather than
+restarting into a partially populated sink; a stream that cannot be fenced is
+fatal and retains its device lease and allocation owners.
+
+`Radial projection start ... backend=cuda_factored ... device=cuda:N` identifies
+successful CUDA admission. A flushed `Radial CUDA fallback` line explains a busy
+device or failed admission. Set `YOLO_TTA_GPU_RADIAL_BACKPROJECT=0` to force the
+v20.0.2 CPU route. `tools/benchmark_radial_projection.py` remains CPU-only;
+`tools/benchmark_radial_cuda_projection.py` qualifies CUDA with production mask
+strides, independently checked source slices and an optional full output stream.
+
+Local CUDA qualification covers all three bases, tilted views, reduced processing
+grids, periodic repeats, empty masks, half-even ties and neighboring float64
+values. The full 17,879,916,848-voxel transverse stream matched the v20.0.2 CPU
+stream's complete SHA-256 and independently checked NumPy reference slices.
+It took 12.35 seconds including upload from a warm host cache and checksum work;
+the earlier eight-worker CPU stream took 82.88 seconds. A separate initial source
+upload took 10.71 seconds on the local Oculink-connected GPU. These are synthetic
+component measurements excluding inference and NRRD/CVOL encoding, not cluster
+wall-time predictions.
+
+Thirty actual native masks captured from the cropped real-volume PT pipeline
+were replayed through public CUDA dispatch after inference drained. All 47,185,920
+output voxels matched the unchanged NumPy pull oracle exactly. The normal small
+pipeline run exercised busy-device CPU fallback while inference owned the GPU;
+its 64 decoded native/LQ NRRDs retained identical payloads.
+
+### Development v20.0.4 compact CUDA publication
+
+Job 142462 completed 36 Radial layers on CUDA and four on the early CPU fallback,
+using all four configured GPUs. Its application timer recorded 1,364.5 seconds,
+including a 696.1-second post-inference tail. CUDA layers had median total/setup/
+sink times of 54.38/13.11/35.94 seconds. These phases overlap across workers; the
+remaining time after subtracting setup and sink is not a GPU kernel timer.
+
+For an incremental CVOL sink, CUDA now derives tight slice bounds and foreground
+counts from its completed mask blocks, then concatenates normalized crops or
+little-endian row-packed bytes on device. It transfers only those bytes and small
+metadata records. The writer validates slice order, bounds, counts, payload layout
+and packed-row padding before reserving one append for the block. It updates the
+same CVOL index/extents without a CPU bounding-box scan, normalization, foreground
+recount or packing pass. Public NRRD layers retain raw CVOL payloads; packed output
+remains an internal retention format. Generic callbacks and dense return values
+continue to receive dense blocks.
+
+Two device output buffers are capped at 64 MiB each, alongside bounded metadata
+and independent readonly host payloads. Compact output is preflighted before
+publication; the existing admission, failure transaction and device-fence rules
+remain in force. Completion logs identify `backend=cuda_factored_compact`, the
+payload format, device-event timings and actual metadata/payload/dense D2H byte
+counts. These distinguish GPU computation, transfer and CPU publication waits.
+
+Concurrent requests for identical plane geometry now share one build Future.
+Unrelated keys still build concurrently. Cache clearing detaches older requests
+without cancelling their waiters or allowing old builds to repopulate a new cache
+generation. The 256 MiB readonly LRU and numerical plane construction are unchanged.
+`plan_s` includes waiting on a shared build, so a slow reported hit need not imply
+repeated computation. On Windows, the incremental writer uses serialized
+seek/write/restore when `os.pwrite` is absent; POSIX positional writes are unchanged.
+
+Qualification through the actual CVOL writer decoded the entire 17,879,916,848-voxel
+synthetic fixture to the same SHA-256 for dense/raw-compact/packed-compact output
+and the previous CPU stream. D2H fell from 17,879,916,848 bytes to 246,161,064 bytes
+for raw crops and 30,847,944 bytes for internal packed crops, including metadata.
+The fixture has only 48 nonempty source slices; production masks are less sparse.
+Dense and compact benchmark source uploads had different cache warmth, so their
+total-time ratio is not a controlled speedup claim. Cluster wall time remains to
+be measured. `tools/benchmark_radial_cuda_sink.py` records upload, device, sink and
+decode timings separately.
+
+Twenty-nine actual PT masks were replayed through compact CUDA dispatch and the
+real CVOL writer after inference drained. All 45,613,056 decoded voxels matched
+the unchanged NumPy oracle. All 64 real-run NRRD payloads and both videos' decoded
+frames/timestamps matched the v20.0.2 baseline.
 
 ## Default sparse execution
 
@@ -485,7 +660,7 @@ one-versus-four-device scheduling and final bytes are covered by deterministic s
 representative H100 execution remains a hardware qualification step:
 
 ```bash
-python -u GPT-6-Astra-Ultra_v20.0.0_SLURM.py \
+python -u GPT-6-Astra-Ultra_v20.0.1_SLURM.py \
   --mode lta \
   --input <target-video> \
   --exemplar <aligned-image-yolo-directory> \

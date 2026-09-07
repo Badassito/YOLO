@@ -227,8 +227,8 @@ LOCAL_IMPORT_SEAM_MARKER = "# Local import keeps the package dependency graph ac
 # already-existing local import without review.
 REVIEWED_LOCAL_IMPORT_SEAMS = {
     ('assembly', 'prepare_view_volume_after_fullframe'): (
-        '8c00e3949e69d5428f6bc946d11febbbd2763ce4acad285b378e9e960ea633f0',
-        '322145486bb7f21b5f9ea590068bd323184072c7c7e9b2968473349950200ebe',
+        'd52de78c1ba5464c0fb4b0234b96c9c0cdf430e93100974defce364d55001721',
+        'c9595db954da98f5df4678a2bbf2416a70dc432e38c05097ed3396e6d0c823f6',
     ),
     ('assembly', 'finalize_consolidated_tile_volume_for_parent'): (
         'bc3ecd1d7d9f2d9e9f158a290d0e075bae85565b2b299cfe84f08b08ec7491a4',
@@ -239,7 +239,7 @@ REVIEWED_LOCAL_IMPORT_SEAMS = {
         '101a6fb2b4446cf0d71be4e025f1224cfecb863185f21e3482bfcfc9cf3a3231',
     ),
     ('cuda_backend', '_GpuWorkerRenderEngine'): (
-        'f3f2605d857dbbabe839f06c9a17bef2d89e6c47173fec85e8eb912f1005ced5',
+        '369e578af8e515cc079c738f58d91518a06a6e834e1f55d74533dffad1ea4d35',
         'e25d3d3f292164aee026e8e9c8d49caf37a2be6241c7c36f65aca52d31d3bbf5',
     ),
     ('geometry', 'GpuPrefetchingYoloSource'): (
@@ -476,6 +476,282 @@ REVIEWED_V20_STATEMENT_REPLACEMENTS = {
         '1ca4b7224262330ee4bc332ca2f16571a87fdb0abbde91321edb17ce60a38ce7',
         'Accept the measured current Ultralytics PyTorch ((head, prototype), auxiliary dict) segmentation layout while retaining flat exported and legacy tuple outputs; reject unsupported tensor dimensions.',
     ),
+    ('backprojection', '5530061ab3afe471577e68c8c7466e0147b9da5ac845fe5f93cb8ddfe16fff69'): (
+        '_ResidentTensorRTRingExecutor',
+        '3645e9c5a49b9fd9f74c3fa325f4d9d6f2ba872bbbb6d7de10f9d5a848179041',
+        'Retain idle TensorRT ring buffers across radial generic tasks; fence context handoffs, restore/rebind tensor addresses, and discard/recapture the changed borrowed-context inference graph before reuse.',
+    ),
+    ('backprojection', '9b514b1cfc81798ca0b8ac84760457aa09df110e5294af349e7b9743c8871671'): (
+        '_resident_trt_pipeline_acquire',
+        'f13530361829bad0e0f79b7db8cd47cd838b002bd97837b30a9ef12f6da87a14',
+        'Resume retained ring contexts and track source renderer/volume identity before reuse.',
+    ),
+    ('backprojection', '7a65755d524b14876ed83f1b64ebcfabe777ba3690f855b09c84e267a5924509'): (
+        '_try_resident_trt_ring_accumulate',
+        'a19f4eb0d7c6dc7395e792abd2934b67d9ecc27f8a35aba35d8a75e0763c9d08',
+        'Soft-suspend compatible radial generic tasks and run all-view fused preflight only after single-channel static TensorRT admission, before borrowing context bindings.',
+    ),
+    ('workers', 'f6c091cc8da972d22cd13d9135cc862ecbcc92b2c9ccca540d48d8a7b6eeb794'): (
+        'run_prediction_volume_in_worker',
+        '0bdc55513468799cba2ce21a433802935419fae01c888bef1e100fc8f9746524',
+        'Avoid irrelevant eager fused preflight for generic paths and emit flushed per-family render/result provenance, including CPU fallback.',
+    ),
+    ('assembly', 'fbe3c9b679863c1c1e49085f5e3b98ca730c8bc2f6d96979ed390a7a2b190a05'): (
+        'project_view_volume_to_orthogonal_volume',
+        '75a39a1f829c04ed66d55c9da77ebcfc41df8a5bd12c1690874f16c100e5975e',
+        'Forward existing exact per-shell mask bounding boxes into the factored Radial projector without changing other view dispatch.',
+    ),
+    ('pipeline', 'a2c4a36ea39c43fb451b6667bdb8aa0507d56f849d4d7b3768dd46476af98fc2'): (
+        '_main_impl',
+        '28327a4faf3ce0f844c09b808a38d240ba69705a44f82aa9f08d3062e5e00a5a',
+        'Authorize skipped non-interpolated drain copies only when component-ref retirement is active, tiling is absent and temporary artifacts are not retained; existing terminal ownership retires the original.',
+    ),
+    ('assembly', '43e838c80f5d1abeb35369a50161eb5363f95cfaa560d9b6f7cf437dc1c20567'): (
+        'materialize_nrrd_view_layer',
+        '487f1f3d7a8af4456500621fb6e18ccf2b791967b93851267b12b23d0eeb4f81',
+        'Fatal projection failures abort/discard incomplete CPU sink stores and raw scratch without retry, including fatal failures during a transactional dense retry; preserve the original fatal exception and quarantined GPU owners.',
+    ),
+    ('interpolation', '7780e8aa5a241f9942c17c57e60f3acb446da4da3fb7396dd8bd01ddcd146b17'): (
+        'IncrementalRawBBoxMaskStoreWriter',
+        '478a421542d68fa16ea0d75f859ab37d909822b7c7504add9505b853893e7dd2',
+        'Validate complete encoded raw/packed record addressing and padding before atomic reservation; append owned payload synchronously without rescanning pixels, preserve failure invalidation, and provide serialized positional-write fallback on Windows.',
+    ),
+}
+
+
+# New v20 helpers are authenticated separately from historical accounting.
+# Kernel source is a string constant inside its factory's AST, so its digest
+# covers the actual CUDA arithmetic as well as Python compilation/fallback logic.
+REVIEWED_V20_ADDED_DEFINITIONS = {
+    ('cuda_backend', 'radial_native_kernel_enabled'): (
+        '5fb5888625044f859e03b198d29f1f06f1180ecf2c6b7fb3c617f3dc6fbda0ad',
+        'Explicit opt-out for the scalar native radial CUDA renderer; default enablement retains a logged Torch fallback.',
+    ),
+    ('cuda_backend', '_radial_native_kernels'): (
+        'd452ff9b1a55bb4ce7d57da2830fb3c6570601e71b7b018bd992e23113e2e5bd',
+        'Compile and cache the bounded scalar-geometry radial CUDA sampler; preserve float32 accumulation/uint8 rounding, deferred logical-T values and zero-extended taps.',
+    ),
+    ('backprojection', '_resident_trt_pipeline_suspend_for_radial'): (
+        'fb076a9d5e579a9900ee47e7fbe50e126fb1c28b55ac12e7f2869c1cb196d03f',
+        'Suspend only idle matching model/source radial ring contexts; mismatches retain full invalidation and active/failed handoffs fail closed.',
+    ),
+    ('workers', '_announce_worker_render_path'): (
+        'd587d682581704f2d325c323d443c89884b941955efeb2b3c85b2224c90f33a2',
+        'Emit one flushed render/result route record per family and task-kind combination in each worker.',
+    ),
+    ('cylindrical_projection', '_RadialPlanePlanTooLarge'): (
+        '0df1909707cf449838365cfd7cd18ecc011e63b0194b2147fb5124397f2612e3',
+        'Explicit bounded-plan admission exception selects the unchanged reference before any output is delivered.',
+    ),
+    ('cylindrical_projection', 'RadialPlanePlan'): (
+        'f0ef083a324833515f2888a4cecf76bb6cabf61d225b1287ec007530c7d1ea1a',
+        'Readonly 2D shell ownership and CSR periodic-column plan with explicit resident byte accounting.',
+    ),
+    ('cylindrical_projection', 'clear_radial_plane_plan_cache'): (
+        'fcffb209a2ab00bb2137946a1d00fc33f0aa22c76f483659a2a5f6a3222ab54e',
+        'Advance the cache generation and detach active build Futures without cancellation; old callers complete without repopulating or removing newer-generation entries.',
+    ),
+    ('cylindrical_projection', '_plane_geometry'): (
+        'a795e43d7e1dea439d1e80c025602c89901cdf8d40a816c10593988f75936e43',
+        'Resolve source/processing base-plane axes independently of the varying stack axis.',
+    ),
+    ('cylindrical_projection', '_plane_occurrence_strips'): (
+        'b7ed386dbcc9cc30f9069d71ea238bbfb75c4b46ccd8c5055478667ddf624cdc',
+        'Evaluate the unchanged nearest-shell and periodic-occurrence equations once per bounded 2D strip, preserving repeated-addition rounding.',
+    ),
+    ('cylindrical_projection', '_build_radial_plane_plan'): (
+        '9fcf4e1f9438bf5dd5b48dcced61be59fada9d1ea040d82bfb812b57dde5c4fa',
+        'Build readonly bounded shell/CSR column maps with exact occurrence ownership and admission checks.',
+    ),
+    ('cylindrical_projection', '_radial_plane_plan'): (
+        '4733fa3e98aea57e1fef235f2da26754ef44228a60af9f5e3552dea7acc26144',
+        'Share one Future per concurrent exact plane key, complete outside the cache lock, preserve original build errors and retry eligibility, keep unrelated keys parallel, and retain readonly bounded LRU ownership.',
+    ),
+    ('cylindrical_projection', '_radial_projection_metadata'): (
+        '8ae4d34643f65f66b5eeb321135e7e6b76d8558d9634297ad6c1b7cb5013e1c1',
+        'Prepare exact stack centers, ideal and discrete-sample tilt offsets, and processing-grid row/column mappings.',
+    ),
+    ('cylindrical_projection', '_gather_radial_pixel'): (
+        '865c22ec8d83336bc596b6dae0dce1ea08d4f9277d3fee27e9707382cbe18e5a',
+        'Gather nearest mapped mask pixels with original height ties and periodic OR; valid caller-supplied bounds only skip known-zero reads.',
+    ),
+    ('cylindrical_projection', '_project_radial_block'): (
+        'acc24813912d8759bca03f78fc7b3903e15c0e61ba2615ea77110305aa5d0601',
+        'Apply the same factored pixel gather across each axis orientation in bounded source-output blocks.',
+    ),
+    ('cylindrical_projection', '_radial_block_schedule'): (
+        '00299ca499d5d419dc25f26762132750698cd4e38ced577d5fe02ad58363892f',
+        'Bound output block depth and concurrency by requested/allocated CPUs and the explicit in-flight byte budget.',
+    ),
+    ('cylindrical_projection', '_ordered_radial_blocks'): (
+        'd6c2d1e36d7ff36676f1e6e97f6cf3a15d3ed422f7c4edc2b848985aba3adcca',
+        'Deliver concurrent projection blocks in source order, cancelling/draining remaining work before borrowed-input retirement on failure.',
+    ),
+    ('cylindrical_projection', 'backproject_radial_volume_to_volume'): (
+        '4534d51dea0be2e361117c6aebf07392c54d3a098dc25a2a4cc270323106a8de',
+        'Select compact CUDA publication only for explicit compatible sink-only callbacks; validate encoded block identity, format and exact record count before delivery; preserve dense/private callback paths and fatal ownership cleanup.',
+    ),
+    ('cylindrical_projection', '_nearest_global_shell'): (
+        'cb42c5d91613549ba8ad3fd2d644ed2f4e7ff67ebfd526371b00c162266cd07f',
+        'Unchanged v20.0.1 reference nearest-global-shell ownership, including inner-shell midpoint ties.',
+    ),
+    ('cylindrical_projection', '_processing_index'): (
+        '0370c22c421c00617b6434802420e7b57029cfad1c21d21513b2125d4a9c55b1',
+        'Unchanged v20.0.1 nearest processing-mask index mapping.',
+    ),
+    ('cylindrical_projection', '_occurrence_rows'): (
+        'a30e06657361bc2dfd8686b405ca0810177a9565bf6628833c3e95226f964ea8',
+        'Unchanged v20.0.1 per-occurrence inverse-shear reference and global height rounding.',
+    ),
+    ('cylindrical_projection', '_pull_radial_chunk'): (
+        '0425fba0d265589fd0500e2a865b17dc623a5e74a19dc7563173137015d8d09f',
+        'Unchanged v20.0.1 NumPy scalar-grid reference retained as the independent oracle and oversized-plan fallback.',
+    ),
+    ('cylindrical_projection', 'radial_cuda_backproject_enabled'): (
+        '3a1b0fba08221b9f0796c968770c7d99739fba94d6bf1fbf695ec9498967d32c',
+        'Explicit opt-out for Radial CUDA projection while retaining the unchanged CPU projector.',
+    ),
+    ('cylindrical_projection', '_RadialCudaStage'): (
+        '559197c333d917c55321816e00d2bc8ea48840f86b7978bba2f450fb86ef6b64',
+        'Hold the device lease across dense or encoded block production and consumption; forward encoded format explicitly and preserve unsafe fence quarantine.',
+    ),
+    ('cylindrical_projection', '_close_radial_cuda_resources'): (
+        'c7101d75a1756a95a86bf12666620e66d4f8049c068eca0f3cea4bd3c4fe7894',
+        'Fence and release resources uniformly for normal exits and constructor/wrapper failure; unsafe fences preserve projector and lease instead of re-admitting the device.',
+    ),
+    ('cylindrical_projection', '_try_radial_cuda_stage'): (
+        '1ed7bea44466397b00deb2e6f945f395e90b802201fd936904740bd709549772',
+        'Respect ordinary inference-priority/retirement admission; fallback to CPU only after safe prepublication construction cleanup.',
+    ),
+    ('cylindrical_projection', '_ordered_radial_cuda_blocks'): (
+        'aa0f49b0efda3841a9f9bd47860d2230ce982d5045c31dfd87ca7dba89e4accf',
+        'Prefetch dense or encoded blocks with one GPU producer and independent host ownership; settle pending work before cleanup on consumer failure.',
+    ),
+    ('cylindrical_cuda_projection', 'RadialCudaProjectionUnavailable'): (
+        '327436e46a1747c7d221807e7e58762cf0cdc7d21743d5f023ac5b9bb2db08b0',
+        'Recoverable prepublication CUDA admission failure distinct from unsafe device ownership.',
+    ),
+    ('cylindrical_cuda_projection', 'RadialCudaProjectionUnsafeFailure'): (
+        'e1225e7a8ab44ffbab8fe12d069404123f8f47fb92fda547b5917e3afd9eb7a5',
+        'Fatal BaseException retains the unfenced projector and bypasses ordinary retry handlers.',
+    ),
+    ('cylindrical_cuda_projection', '_ProjectionContract'): (
+        '3d2099ea7f63e74a92a816452173fd0b1636a2cf270e638e36f2bb64658c572a',
+        'Explicit validated host-plan/source/output geometry and bounded device-buffer accounting.',
+    ),
+    ('cylindrical_cuda_projection', '_positive_shape'): (
+        'f2e346180fb107cbfb7ec1cba507825c83caac4571aa7ea38c0b9d49e587a341',
+        'Require integer positive int32 dimensions before CUDA address construction.',
+    ),
+    ('cylindrical_cuda_projection', '_contract_array'): (
+        'bbae841e3f206f9ddd72ca2dc60e917ef515a8c403330fe98283ab351ce33772',
+        'Require exact contiguous dtype/shape for every borrowed host lookup array.',
+    ),
+    ('cylindrical_cuda_projection', '_validate_projection_contract'): (
+        'f785ed939e83db39d0bcbbe149f4af576143d3189607579f48859d01d3369288',
+        'Validate exact host-plan addresses and dimensions before CUDA allocation; enforce int32/grid-height limits, 64 MiB maximum block budget and 4096-slice encoded metadata capacity.',
+    ),
+    ('cylindrical_cuda_projection', 'RadialCudaProjector'): (
+        '79f3fcdd69b505cede685e8d9a5c04015a206a3d3bf638366470926cb8eeb6df',
+        'Own bounded private source/dense/compact/metadata buffers and host returns; preflight dense/raw/packed equivalence, reduce exact device crops/counts, encode without CPU rescans, preserve stream fences and expose phase/D2H metrics.',
+    ),
+    ('cylindrical_cuda_projection', 'RadialEncodedSlice'): (
+        'bc52167c2887163a857a68a9bb873901c53ba29312558d3d56100868717620e4',
+        'Immutable per-slice crop bounds, exact foreground count and payload offset/size metadata.',
+    ),
+    ('cylindrical_cuda_projection', 'RadialEncodedBlock'): (
+        '471701be9affe1da43e554088140a728865b7c5fed88b637d3ef13272ed1987f',
+        'Immutable encoded block identity/format with independently owned readonly concatenated host payload.',
+    ),
+    ('cylindrical_cuda_projection', '_encoded_records'): (
+        '8b984daf20133cf42ad805c476925031d5b1c87fb3bb7cac81eb9ddbfc52d4e8',
+        'Validate device crop bounds/counts, normalize empty slices, and prefix bounded raw or little-endian row-packbits payload offsets before device encoding.',
+    ),
+}
+
+# Compile policy and bounded resource constants live outside function bodies.
+# Pin their complete AST statements so helper hashes cannot mask policy drift.
+REVIEWED_V20_ADDED_STATEMENTS = {
+    ('cylindrical_projection', 'numba_compile_policy'): (
+        'a00fd59c3a0ef57a76f093e34ec03927219de47f7f0ad44fe7c22b21bc713347',
+        'Numba compilation retains cache=True/nogil=True/fastmath=False and inlines the exact pixel gather; no relaxed floating-point reassociation.',
+    ),
+    ('cylindrical_projection', '_PULL_CHUNK_VOXELS'): (
+        '92570f47d7a6bc732f8519a8171b4a369d8b4565c378b819e7f6e4d37f913191',
+        'Explicit bounded projection/plan resource policy; authenticate values outside function bodies.',
+    ),
+    ('cylindrical_projection', '_PLANE_PLAN_CACHE_BYTES'): (
+        '06c9fc845d716743a26e1300257b98422676643431557777b3df8345cb237591',
+        'Explicit bounded projection/plan resource policy; authenticate values outside function bodies.',
+    ),
+    ('cylindrical_projection', '_PLANE_PLAN_MAX_BYTES'): (
+        '074d4ff4b7a21a7b54aca28e3418535238ba6ab5807b15c33cb93009c94e842c',
+        'Explicit bounded projection/plan resource policy; authenticate values outside function bodies.',
+    ),
+    ('cylindrical_projection', '_OUTPUT_BLOCK_BYTES'): (
+        'bf8f6f6165a78206c9c57c5d280b4154c1a81a74f2ef70db2c1bb8318887c002',
+        'Explicit bounded projection/plan resource policy; authenticate values outside function bodies.',
+    ),
+    ('cylindrical_projection', '_INFLIGHT_OUTPUT_BYTES'): (
+        '61a8484d4af12b9ffcdea6c7d29178336c7c1e93c5e590adefff6db39892b91c',
+        'Explicit bounded projection/plan resource policy; authenticate values outside function bodies.',
+    ),
+    ('cylindrical_cuda_projection', '_BLOCK_BYTES'): (
+        '2f39654da65e61d24adab7838ee405a85d095361e889e4e73826b29fb7f02d16',
+        'Explicit bounded private CUDA/pinned staging and admission reserve policy.',
+    ),
+    ('cylindrical_cuda_projection', '_UPLOAD_BYTES'): (
+        'e40900fa2a6f0fc6a68b8f654bf86342ab930f214b05a494c8bdaadff982f81c',
+        'Explicit bounded private CUDA/pinned staging and admission reserve policy.',
+    ),
+    ('cylindrical_cuda_projection', '_RESERVE_BYTES'): (
+        'b1dcdc89cbca2b1e25e13f67a7844a474b129eb0d81ea3bc53806dd1a1745fb2',
+        'Explicit bounded private CUDA/pinned staging and admission reserve policy.',
+    ),
+    ('cylindrical_cuda_projection', '_SETUP_BYTES'): (
+        'c06d5b317b175243352d3c3519e3ddfa7e0ae74e090087d86086836d213d8aec',
+        'Explicit bounded private CUDA/pinned staging and admission reserve policy.',
+    ),
+    ('cylindrical_cuda_projection', '_KERNEL_SOURCE'): (
+        'eacc90621dd926a899ac8ba211c2891014dbed1cf453b216050c97126f9afb4e',
+        'Preserve exact host-plan gather mathematics; append device tight-bbox/foreground reduction and normalized raw or zero-padded little-endian row-packbits crop encoding with bounded 64-bit payload addresses.',
+    ),
+    ('cylindrical_projection', '_PLANE_PLAN_CACHE'): (
+        'dda54f3a989503868661b93cc95518d3728061aae4a0c40bcf152e5fa990d316',
+        'Initial bounded LRU and generation-scoped shared-build state with one common lock.',
+    ),
+    ('cylindrical_projection', '_PLANE_PLAN_CACHE_SIZE'): (
+        '17894c39f5d5d8acfa6c95744f1fcac6d246e182cd559f8d5f63cd0fde3bfa1d',
+        'Initial bounded LRU and generation-scoped shared-build state with one common lock.',
+    ),
+    ('cylindrical_projection', '_PLANE_PLAN_INFLIGHT'): (
+        '581530db643eaabdcf4f9772aec89497a9b01a927a43cdefb7274dfaa815bfb7',
+        'Initial bounded LRU and generation-scoped shared-build state with one common lock.',
+    ),
+    ('cylindrical_projection', '_PLANE_PLAN_CACHE_GENERATION'): (
+        '10e839a0d670a2f9adff107705216624be23d07018b4448754806389f1d3b808',
+        'Initial bounded LRU and generation-scoped shared-build state with one common lock.',
+    ),
+    ('cylindrical_projection', '_PLANE_PLAN_LOCK'): (
+        'bda5024f36dde3b97e50ccb2aee349e0decab14bccec493d2401329d3854ff7b',
+        'Initial bounded LRU and generation-scoped shared-build state with one common lock.',
+    ),
+    ('cylindrical_cuda_projection', '_MAX_ENCODED_SLICES'): (
+        'c5a08a0217c3c75befe725137cbc60a52a3fcd01f6bc6c7a8ae7be45f2673a01',
+        'Bound compact metadata to 4096 slices with the exact aligned 24-byte crop/count device ABI.',
+    ),
+    ('cylindrical_cuda_projection', '_CROP_METADATA_DTYPE'): (
+        '49ee0788784009e994d9a3be35539f969e78601744e0590b4568c789d36c9e62',
+        'Bound compact metadata to 4096 slices with the exact aligned 24-byte crop/count device ABI.',
+    ),
+    ('cylindrical_projection', 'shared_future_import'): (
+        '7785747cb9647444f6bf0c7aae1df3a2a18fc2b09299d488ca78744db5dfecc7',
+        'Use the standard concurrent Future and executor for shared plan-build ownership and ordered producers.',
+    ),
+    ('interpolation', 'encoded_operator_import'): (
+        '60e489325a19bee8be6a450945dd253634f01297b803d2869e489219288b5372',
+        'Use integer-index validation for device-encoded records before reserving writer state.',
+    ),
 }
 
 
@@ -641,7 +917,12 @@ def main() -> None:
     trees: dict[str, ast.Module] = {}
     top_level: dict[str, list[ast.stmt]] = {}
     local_import_seams: dict[tuple[str, str], tuple[str, str]] = {}
-    for module in {str(item["module"]) for item in manifest["statements"]}:
+    audited_modules = (
+        {str(item["module"]) for item in manifest["statements"]}
+        | {module for module, _name in REVIEWED_V20_ADDED_DEFINITIONS}
+        | {module for module, _label in REVIEWED_V20_ADDED_STATEMENTS}
+    )
+    for module in audited_modules:
         module_path = PACKAGE / f"{module}.py"
         module_source = module_path.read_text(encoding="utf-8")
         tree = ast.parse(module_source, filename=str(module_path))
@@ -649,6 +930,14 @@ def main() -> None:
         top_level[module] = list(tree.body)
         available[module] = Counter(digest(node) for node in tree.body)
         local_import_seams.update(reviewed_local_import_seams(module, module_source, tree))
+
+    for (module, name), (expected_hash, reason) in REVIEWED_V20_ADDED_DEFINITIONS.items():
+        matches = [node for node in top_level.get(module, ()) if getattr(node, 'name', None) == name]
+        if not reason or len(matches) != 1 or digest(matches[0]) != expected_hash:
+            raise RuntimeError(f'v20 reviewed added definition changed or is missing: {module}.{name}')
+    for (module, label), (expected_hash, reason) in REVIEWED_V20_ADDED_STATEMENTS.items():
+        if not reason or available.get(module, Counter())[expected_hash] != 1:
+            raise RuntimeError(f'v20 reviewed added statement changed or is missing: {module}.{label}')
 
     unexpected_local_import_seams = sorted(
         set(local_import_seams) - set(REVIEWED_LOCAL_IMPORT_SEAMS)

@@ -7,12 +7,14 @@ import io
 import math
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
 import numpy as np
 
-from XTA import assembly, backprojection, geometry, tta_terminal
+from XTA import assembly, backprojection, geometry, tta_terminal, cylindrical_projection as cp
 from XTA.config import TiltedViewGroup, resolve_tilted_view_groups
 from XTA.cylindrical_projection import backproject_radial_volume_to_volume
 from XTA.interpolation import RawBBoxMaskStore, write_raw_bbox_mask_store
@@ -80,6 +82,12 @@ def scalar_oracle(data, view, shape):
 
 class CylindricalProjectionTests(unittest.TestCase):
     def setUp(self):
+        cpu_only = mock.patch.dict('os.environ', {'YOLO_TTA_GPU_RADIAL_BACKPROJECT': '0'})
+        cpu_only.start()
+        self.addCleanup(cpu_only.stop)
+        stdout = contextlib.redirect_stdout(io.StringIO())
+        stdout.__enter__()
+        self.addCleanup(stdout.__exit__, None, None, None)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
@@ -156,7 +164,7 @@ class CylindricalProjectionTests(unittest.TestCase):
             projection_block_callback=lambda z, b: blocks.append((z, b.copy())),
         )
         self.assertIsInstance(result, backprojection.SinkOnlyProjectionResult)
-        self.assertEqual([z for z, _ in blocks], [0, 1, 2])
+        self.assertEqual([z + i for z, block in blocks for i in range(len(block))], [0, 1, 2])
         np.testing.assert_array_equal(np.concatenate([b for _, b in blocks]), scalar_oracle(data, view, result.shape))
         self.assertFalse((self.root / 'unused.dat').exists())
         self.assertFalse(assembly.view_interpolation_wrap_axis(view))
@@ -277,6 +285,97 @@ class CylindricalProjectionTests(unittest.TestCase):
                                     np.testing.assert_array_equal(union.astype(bool), wanted)
                                 cases += 1
         self.assertEqual(cases, 312)
+
+    def test_factored_kernel_matches_unchanged_pull_for_random_reduced_and_restored_grids(self):
+        rng = np.random.default_rng(202)
+        for base in ('transverse', 'sagittal', 'coronal'):
+            views = shells(base, shape=(7, 9, 11), size=6, minimum=.1, tilt=True)
+            for view in views[::max(1, len(views) // 5)]:
+                for processing_size in (4, 6):
+                    data = (rng.random((view.num_slices, processing_size, processing_size)) < .17).astype(np.uint8)
+                    for output_shape in ((7, 9, 11), (5, 7, 8), (9, 11, 13)):
+                        radii = np.asarray(geometry.radial_global_radii(view))
+                        expected = np.stack([cp._pull_radial_chunk(
+                            data, view, radii, output_shape, z, 0, output_shape[1] * output_shape[2],
+                        ).reshape(output_shape[1:]) for z in range(output_shape[0])])
+                        with self.subTest(view=view.name, processing_size=processing_size, output_shape=output_shape):
+                            with mock.patch.object(cp, '_OUTPUT_BLOCK_BYTES', output_shape[1] * output_shape[2]):
+                                blocks = []
+                                cp.backproject_radial_volume_to_volume(
+                                    data, view, self.root / 'unused.dat', 'factored oracle',
+                                    out_shape_tyx=output_shape, workers=3, sink_only=True,
+                                    projection_block_callback=lambda z, block: blocks.append((z, block.copy())),
+                                )
+                            np.testing.assert_array_equal(np.concatenate([b for _, b in blocks]), expected)
+
+    def test_plane_cache_is_readonly_and_reuses_tilt_and_height_metadata(self):
+        cp.clear_radial_plane_plan_cache()
+        view = shells(shape=(7, 9, 11), size=6)[0]
+        radii = np.asarray(geometry.radial_global_radii(view))
+        first, hit = cp._radial_plane_plan(view, radii, (7, 9, 11))
+        self.assertFalse(hit)
+        changed = replace(view, radial_tilted_source=True, tilt_angle_deg=-23,
+                          tilt_direction='horizontal', radial_height_origin=1)
+        second, hit = cp._radial_plane_plan(changed, radii, (7, 9, 11))
+        self.assertTrue(hit)
+        self.assertIs(first, second)
+        self.assertFalse(first.shell_index.flags.writeable)
+        self.assertFalse(first.native_columns.flags.writeable)
+        shifted, hit = cp._radial_plane_plan(replace(view, center_x=view.center_x + .1), radii, (7, 9, 11))
+        self.assertFalse(hit)
+        self.assertIsNot(shifted, first)
+
+    def test_source_bboxes_skip_empty_frames_without_changing_results(self):
+        view = shells(shape=(7, 9, 11), size=6)[0]
+        data = np.zeros((view.num_slices, 6, 6), np.uint8)
+        data[::2, 1:4, 2:5] = 1
+        boxes = np.zeros((view.num_slices, 4), np.int64)
+        boxes[::2] = (1, 4, 2, 5)
+        expected = self.project(data, view)
+        blocks = []
+        cp.backproject_radial_volume_to_volume(
+            data, view, self.root / 'unused.dat', 'bbox oracle', workers=3,
+            known_slice_bboxes=boxes, sink_only=True,
+            projection_block_callback=lambda z, block: blocks.append(block.copy()),
+        )
+        np.testing.assert_array_equal(np.concatenate(blocks), expected)
+        boxes[0, 1] = 7
+        with self.assertRaisesRegex(ValueError, 'bounding boxes'):
+            cp.backproject_radial_volume_to_volume(data, view, self.root / 'invalid.dat', 'bad bbox', known_slice_bboxes=boxes)
+
+    def test_callback_failure_waits_for_running_blocks_before_returning_borrowed_input(self):
+        view = shells(shape=(7, 9, 11), size=6)[0]
+        data = np.ones((view.num_slices, 6, 6), np.uint8)
+        live = [0, 0]
+        lock = threading.Lock()
+        started_together = threading.Barrier(3)
+        def project(*args):
+            count = args[-3]
+            if not count:
+                return np.empty((0, 9, 11), np.uint8)
+            with lock:
+                live[0] += 1
+                live[1] = max(live[1], live[0])
+            try:
+                started_together.wait(timeout=3.0)
+                time.sleep(.02)
+                return np.ones((count, 9, 11), np.uint8)
+            finally:
+                with lock:
+                    live[0] -= 1
+        with mock.patch.object(cp, '_project_radial_block', side_effect=project), \
+                mock.patch.object(cp, '_numba', object()), \
+                mock.patch.object(cp, '_OUTPUT_BLOCK_BYTES', 99), \
+                mock.patch.object(cp, '_cpu_count', return_value=3):
+            with self.assertRaisesRegex(RuntimeError, 'sink rejected'):
+                cp.backproject_radial_volume_to_volume(
+                    data, view, self.root / 'unused.dat', 'failure', workers=3, sink_only=True,
+                    projection_block_callback=mock.Mock(side_effect=RuntimeError('sink rejected')),
+                )
+        self.assertEqual(live[0], 0)
+        self.assertGreater(live[1], 1)
+        self.assertLessEqual(live[1], 3)
+        self.assertTrue(data.all())
 
 
 if __name__ == '__main__':

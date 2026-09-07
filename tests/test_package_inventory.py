@@ -13,6 +13,8 @@ from tools.verify_package_inventory import (
     INTENTIONALLY_CHANGED_BINDINGS,
     LOCAL_IMPORT_SEAM_MARKER,
     MANIFEST,
+    REVIEWED_V20_ADDED_DEFINITIONS,
+    REVIEWED_V20_ADDED_STATEMENTS,
     azimuthal_rename_replacements,
     digest,
     main as verify_inventory,
@@ -27,6 +29,20 @@ def inspect_seams(source: str):
 
 
 class PackageInventoryTests(unittest.TestCase):
+    def test_numba_compile_policy_is_pinned_outside_function_bodies(self) -> None:
+        key = ('cylindrical_projection', 'numba_compile_policy')
+        _expected_hash, reason = REVIEWED_V20_ADDED_STATEMENTS[key]
+        with mock.patch.dict(REVIEWED_V20_ADDED_STATEMENTS, {key: ('0' * 64, reason)}):
+            with self.assertRaisesRegex(RuntimeError, 'reviewed added statement changed or is missing: cylindrical_projection.numba_compile_policy'):
+                verify_inventory()
+
+    def test_scalar_cuda_kernel_has_an_independent_review_pin(self) -> None:
+        key = ('cuda_backend', '_radial_native_kernels')
+        _expected_hash, reason = REVIEWED_V20_ADDED_DEFINITIONS[key]
+        with mock.patch.dict(REVIEWED_V20_ADDED_DEFINITIONS, {key: ('0' * 64, reason)}):
+            with self.assertRaisesRegex(RuntimeError, 'reviewed added definition changed or is missing: cuda_backend._radial_native_kernels'):
+                verify_inventory()
+
     def test_azimuthal_rename_pins_exact_ast_without_accepting_shell_names_or_changed_math(self) -> None:
         old = ast.parse('def radial_sample(value):\n    return value + 1\n').body[0]
         renamed = ast.parse('def azimuthal_sample(value):\n    return value + 1\n').body[0]
