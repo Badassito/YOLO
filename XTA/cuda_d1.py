@@ -26,6 +26,8 @@ from typing import (
     Tuple,
 )
 import numpy as np
+from .packed_publication import encode_owner_packed_block, _packed_owner_metadata
+from .publication_memory import publication_ram_headroom
 
 from .geometry import (
     ViewInfo,
@@ -824,6 +826,9 @@ def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionA
             expected_ranges=tuple(expected_ranges),
             bitset_owner=bitset_owner,
         )
+        state.memory_payload_path = task.get('d1_memory_payload_path')
+        state.memory_payload_limit = int(task.get('d1_memory_payload_limit', 0))
+        state.memory_payload_reserve = int(task.get('d1_memory_payload_reserve', 0))
         _D1_WORKER_VIEW_STATES[key] = state
         if not _D1_PIPELINE_ANNOUNCED:
             _D1_PIPELINE_ANNOUNCED = True
@@ -878,16 +883,23 @@ def _d1_finalize_bitset_layer(
     model_name: str,
     view: ViewInfo,
     projection_kind: str = 'legacy',
+    memory_payload_path: Optional[str] = None,
+    memory_payload_limit: int = 0,
+    memory_payload_reserve: int = 0,
 ) -> Dict[str, object]:
     """Stream the completed owner bitset into a path-backed cvol and return its layer ref."""
     key = _nrrd_layer_key(
         view_name=str(view.name), source='fullframe', mask_kind='yolo',
         pass_index=0, stage='pre_interpolation',
     )
+    packed = _env_flag('YOLO_TTA_PACKED_OWNER_PUBLICATION', True)
+    store_format = INTERNAL_PACKED_CVOL_FORMAT if packed else CVOL_FORMAT
+    direct_packed = bool(packed and _packed_owner_metadata is not None)
     writer = IncrementalRawBBoxMaskStoreWriter(
         shape=tuple(int(v) for v in output_shape),
         store_dir=Path(store_dir),
-        format_name=CVOL_FORMAT,
+        format_name=store_format,
+        payload_backing=memory_payload_path if packed else None,
         desc=f'D1 source-space layer {model_name}/{view.name}',
         extra_meta={
             'nrrd_layer_key': str(key),
@@ -904,12 +916,29 @@ def _d1_finalize_bitset_layer(
     try:
         for z0 in range(0, int(output_shape[0]), int(block_z)):
             z1 = min(int(output_shape[0]), int(z0) + int(block_z))
+            if writer._ram_payload:
+                growth = (z1 - z0) * int(output_shape[1]) * ((int(output_shape[2]) + 7) // 8)
+                if (writer._next_offset + growth > int(memory_payload_limit)
+                        or publication_ram_headroom() < int(memory_payload_reserve) + growth):
+                    writer.spill_payload_to_disk()
             start = int(z0) * int(plane_bytes)
             stop = int(z1) * int(plane_bytes)
             w0 = int(start // 32)
             w1 = int((stop + 31) // 32)
             if not bool(np.any(words[w0:w1])):
                 writer.consume_empty_range(int(z0), int(z1 - z0))
+                continue
+            encoded = None
+            if direct_packed:
+                try:
+                    encoded = encode_owner_packed_block(words, output_shape, z0, z1 - z0)
+                except Exception as exc:
+                    direct_packed = False
+                    print(f'Direct packed publication unavailable; using bounded NumPy packing: {exc}', flush=True)
+            if encoded is not None:
+                records, payload = encoded
+                writer.consume_encoded_block(z0, records, payload, packed=True)
+                del records, payload, encoded
                 continue
             block = _d1_unpack_bitset_z_block(words, output_shape, int(z0), int(z1))
             writer.consume(int(z0), block)
@@ -936,7 +965,7 @@ def _d1_finalize_bitset_layer(
         path=Path(store_dir),
         shape=tuple(int(v) for v in output_shape),
         dtype='uint8',
-        storage_format=CVOL_FORMAT,
+        storage_format=store_format,
         model_name=str(model_name),
         view_name=str(view.name),
         physical_view_name=physical_view_name(view),
@@ -983,6 +1012,9 @@ def _d1_submit_publication(
                 model_name=state.key[0],
                 view=state.view,
                 projection_kind=getattr(state, 'projection_kind', 'legacy'),
+                memory_payload_path=getattr(state, 'memory_payload_path', None),
+                memory_payload_limit=getattr(state, 'memory_payload_limit', 0),
+                memory_payload_reserve=getattr(state, 'memory_payload_reserve', 0),
             )
             result['d1_publication_seconds'] = max(0.0, time.perf_counter() - started)
             return result

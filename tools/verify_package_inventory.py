@@ -421,9 +421,21 @@ INTENTIONALLY_PRUNED_REPLACEMENTS = {
 # are semantic changes, never accepted by the mechanical Azimuthal rename map.
 # Key: immutable (module, baseline AST digest). Value: current name/digest/reason.
 REVIEWED_V20_STATEMENT_REPLACEMENTS = {
+    ('interpolation', '7f10eb5c476c42205a2aa865d3465c1ebabcad7a5a7d2a7042f4bd0d00c27187'): (
+        '_raw_store_chunks_cache_key',
+        'b8948f64f81c29198edc73b608230a46a89e633957a2074ae88ddf6d0334fd30',
+        'Keep logical layer-path cache identities distinct across equally named memfds and stable through backing-descriptor retirement; retain per-layer shared mmap refcounts.',
+    ),
+
+    ('outputs', '9a9119faff78922a2fb2f826ef0ee290c9612194bb6ca984490a77420bede185'): (
+        '_write_one_decomposed_nrrd_layer_payload',
+        'c5ff52a5c1982a4eed513b1c35a01fa9fd385313515ac03049a394ab39291984',
+        'Stream native bbox row bands and cached zero spans only for software member writers with no dense-block observer; retain restored, dense-observer and hardware routes.',
+    ),
+
     ('cuda_d1', 'bb0b1ecf37d4c52647a15defe499c22667663ca95fb7de4ec6cfbf0021143061'): (
         '_d1_submit_publication',
-        '9af2021486da0d0e0b3910b4bfc2f79fa0ab6fe00791e9a3ec99d06afc6e0ae2',
+        '5c92d44692a1f8910a8b8e332c06102828089a552de95881345de07d23d7f4d8',
         'Reuse bounded source-bitset publication with explicit native-shell provenance while preserving legacy output semantics.',
     ),
     ('geometry', 'c8e5256bd662acf22cc3768a96593fce8084353e0c54c2bb00f80c64d771075a'): (
@@ -508,7 +520,7 @@ REVIEWED_V20_STATEMENT_REPLACEMENTS = {
     ),
     ('pipeline', 'a2c4a36ea39c43fb451b6667bdb8aa0507d56f849d4d7b3768dd46476af98fc2'): (
         '_main_impl',
-        '77c8fb4a692638ce0f7912308e95a3b902fdee05a3b6ea2c278c7d9f6f5985a2',
+        '60496d3e8cc73cceb8d0608c33dfb7c6510671379bfd07fab7cf70ddba47e6a4',
         'Authorize skipped non-interpolated drain copies only when component-ref retirement is active, tiling is absent and temporary artifacts are not retained; existing terminal ownership retires the original.',
     ),
     ('assembly', '43e838c80f5d1abeb35369a50161eb5363f95cfaa560d9b6f7cf437dc1c20567'): (
@@ -518,7 +530,7 @@ REVIEWED_V20_STATEMENT_REPLACEMENTS = {
     ),
     ('interpolation', '7780e8aa5a241f9942c17c57e60f3acb446da4da3fb7396dd8bd01ddcd146b17'): (
         'IncrementalRawBBoxMaskStoreWriter',
-        '478a421542d68fa16ea0d75f859ab37d909822b7c7504add9505b853893e7dd2',
+        'fc3eeba9edd8e3982f4cc2c7ac90f94a0d5d8f80ddaab98acef7f24d3a3cba4c',
         'Validate complete encoded raw/packed record addressing and padding before atomic reservation; append owned payload synchronously without rescanning pixels, preserve failure invalidation, and provide serialized positional-write fallback on Windows.',
     ),
 }
@@ -528,6 +540,73 @@ REVIEWED_V20_STATEMENT_REPLACEMENTS = {
 # Kernel source is a string constant inside its factory's AST, so its digest
 # covers the actual CUDA arithmetic as well as Python compilation/fallback logic.
 REVIEWED_V20_ADDED_DEFINITIONS = {
+    ('interpolation', '_raw_store_chunks_cache_key'): (
+        'b8948f64f81c29198edc73b608230a46a89e633957a2074ae88ddf6d0334fd30',
+        'Keep logical layer-path cache identities distinct across equally named memfds and stable through backing-descriptor retirement; retain per-layer shared mmap refcounts.',
+    ),
+
+    ('nrrd_spans', 'canonical_zero_member'): (
+        'c1c7188458aa910ccf03590a1f551763090a650b3465d63629cdf5b843e664a5',
+        'Encode native bbox row spans and cached compact zero members without changing decoded bytes, sparse observers, hardware codec policy or failure ownership.',
+    ),
+    ('nrrd_spans', 'stream_native_crop_spans'): (
+        '9eeda37617a222f06413c78a3d15d45c1a0040876ded2da1cec031d12fc84011',
+        'Encode native bbox row spans and cached compact zero members without changing decoded bytes, sparse observers, hardware codec policy or failure ownership.',
+    ),
+    ('outputs', '_MemberParallelGzipPayloadWriter'): (
+        'f18fc29b7bb1c13a73e8cbc8260ca228561bdc6c611447347cc1ab9df8426d7d',
+        'Encode native bbox row spans and cached compact zero members without changing decoded bytes, sparse observers, hardware codec policy or failure ownership.',
+    ),
+    ('outputs', '_write_one_decomposed_nrrd_layer_payload'): (
+        'c5ff52a5c1982a4eed513b1c35a01fa9fd385313515ac03049a394ab39291984',
+        'Encode native bbox row spans and cached compact zero members without changing decoded bytes, sparse observers, hardware codec policy or failure ownership.',
+    ),
+    ('publication_memory', 'publication_output_reserve'): (
+        'de3daa4868896f867ad2a826766d692c70e92ddfe1b5a71c29d29af0a8c408e1',
+        'Reserve actual gzip windows, mirror canvases and global compressed spools before retained RAM admission.',
+    ),
+
+    ('cuda_d1', '_d1_get_or_create_state'): (
+        '37cff0c7bc9c3e636a5fe68f5bc75fd180835667ab091371dce8a132db5ce6cf',
+        'Publish exact packed source crops without dense expansion; carry bounded parent RAM grants and preserve NumPy/raw fallbacks.',
+    ),
+    ('interpolation', 'IncrementalRawBBoxMaskStoreWriter'): (
+        'fc3eeba9edd8e3982f4cc2c7ac90f94a0d5d8f80ddaab98acef7f24d3a3cba4c',
+        'Support parent-owned RAM payloads with private prepublication disk spill, bounded copying and binary descriptor writes.',
+    ),
+    ('packed_publication', 'PackedOwnerCrop'): (
+        'a23fcab310937aecd6e0bd5a10bbcf42efb49da674ac56c1ff1faf217a56b8ac',
+        'Direct source-bitset bbox/count and row-packbits encoding with exact addressing, padding and bounded output blocks.',
+    ),
+    ('packed_publication', 'encode_owner_packed_block'): (
+        '5584fce731c199ad90439018360b8f346a04ac6f528e68a4552973a62b498d0d',
+        'Direct source-bitset bbox/count and row-packbits encoding with exact addressing, padding and bounded output blocks.',
+    ),
+    ('publication_memory', 'plan_native_publication_memory'): (
+        '3fc6e04c0fee91391d33b66d6f0f5f500894044d93740899513f7938a0c98420',
+        'Pre-dispatch worst-case retained-layer admission, physical/cgroup headroom, future-work reserve, parent descriptor lifetime and disk spill policy.',
+    ),
+    ('publication_memory', 'publication_ram_headroom'): (
+        'c019bc77c877709c2106e25116cb8cc47c3ff255ce4f53613f232dc268fc4ea3',
+        'Pre-dispatch worst-case retained-layer admission, physical/cgroup headroom, future-work reserve, parent descriptor lifetime and disk spill policy.',
+    ),
+    ('publication_memory', 'retained_payload_plan'): (
+        '7a06a971b4815a9fbc9777cae369dc78d724206725e677297ece64bd8cd76555',
+        'Pre-dispatch worst-case retained-layer admission, physical/cgroup headroom, future-work reserve, parent descriptor lifetime and disk spill policy.',
+    ),
+    ('topology', '_compiled_adjacent_gid_pair_codes'): (
+        '5f6698213b323cc9b2cfa6b4ae4846b328efc7d0ac17cf71267e11b8a32f80df',
+        'Use exact bounded row-run intersections before the retained pixel-hash adjacency fallback.',
+    ),
+    ('topology_runs', '_run_adjacent_pair_codes'): (
+        '68093630d4d287bc4d316feb8b30cefdd752275b812588f37b60091546fe3b1c',
+        'Bounded equal-label run intersection preserves all touching pairs and falls back on fragmentation or optional compiler failure.',
+    ),
+    ('topology_runs', 'run_adjacent_pair_codes'): (
+        '2e3bf434f38c21856f794382ea355c18a76a39580bd070f422401a469a8e8619',
+        'Bounded equal-label run intersection preserves all touching pairs and falls back on fragmentation or optional compiler failure.',
+    ),
+
     ('cylindrical_owner', '_bucket_shell_pixels_numpy'): (
         'f247ed177d854a52dad612649a85d5ee3f19d81f427e8eb19b2acb9edb586f68',
         'Stable vectorized shell buckets preserve exact pixel order when optional JIT compilation is unavailable.',
@@ -545,7 +624,7 @@ REVIEWED_V20_ADDED_DEFINITIONS = {
         'Native-shell owner boundary: exact cleanup/projection, coverage, bounded resource ownership or runtime provenance.',
     ),
     ('cylindrical_owner', 'consume_radial_device_union'): (
-        '5b8435cbdb92feb449a6fbab2c347835bfc5e27bf32ebcdcac924685dc79a933',
+        'd6a6f408781926417ded5fe2eb809e94fb9d2a23fe7dfe41dcbb1f26c38e9b88',
         'Native-shell owner boundary: exact cleanup/projection, coverage, bounded resource ownership or runtime provenance.',
     ),
     ('cylindrical_owner', 'RadialOwner'): (
@@ -565,7 +644,7 @@ REVIEWED_V20_ADDED_DEFINITIONS = {
         'Native-shell owner boundary: exact cleanup/projection, coverage, bounded resource ownership or runtime provenance.',
     ),
     ('cylindrical_owner', 'radial_runtime_provenance'): (
-        '6e68af07ea98d011bc9e7040d7d7d6a95909b065a0e588e23f374df0f75a9cf2',
+        'f84efc29da511d5b2cad028396a7fb1aca93973c381393de1c96b14862ae4c16',
         'Native-shell owner boundary: exact cleanup/projection, coverage, bounded resource ownership or runtime provenance.',
     ),
     ('cylindrical_owner', 'radial_owner_enabled'): (
@@ -581,11 +660,11 @@ REVIEWED_V20_ADDED_DEFINITIONS = {
         'Keep native radial tasks on one owner even when the multi-owner experiment is requested.',
     ),
     ('cuda_d1', '_d1_submit_publication'): (
-        '9af2021486da0d0e0b3910b4bfc2f79fa0ab6fe00791e9a3ec99d06afc6e0ae2',
+        '5c92d44692a1f8910a8b8e332c06102828089a552de95881345de07d23d7f4d8',
         'Reuse bounded source-bitset publication with explicit native-shell provenance while preserving legacy output semantics.',
     ),
     ('cuda_d1', '_d1_finalize_bitset_layer'): (
-        'bf97418ee95e4d194de9b8d27cd010dabb644bd1204db64d33aef948d411a551',
+        '44ef5a4b81c1630ca48eee683bf10622e49b8cade7ebedff33db8daf867c0a43',
         'Reuse bounded source-bitset publication with explicit native-shell provenance while preserving legacy output semantics.',
     ),
     ('inference', '_prediction_accumulation_target'): (
@@ -609,7 +688,7 @@ REVIEWED_V20_ADDED_DEFINITIONS = {
         'Dispatch native shell consumers without old D1 geometry/proto cleanup; retain native-owner retirement barriers and fatal CUDA ownership.',
     ),
     ('pipeline', '_main_impl'): (
-        '77c8fb4a692638ce0f7912308e95a3b902fdee05a3b6ea2c278c7d9f6f5985a2',
+        '60496d3e8cc73cceb8d0608c33dfb7c6510671379bfd07fab7cf70ddba47e6a4',
         'Route eligible shell views through the native owner contract, preserve compatibility and empty-layer policy, and log effective execution provenance.',
     ),
     ('cylindrical_cuda_projection', '_pack_radial_source_block'): (
@@ -769,6 +848,19 @@ REVIEWED_V20_ADDED_DEFINITIONS = {
 # Compile policy and bounded resource constants live outside function bodies.
 # Pin their complete AST statements so helper hashes cannot mask policy drift.
 REVIEWED_V20_ADDED_STATEMENTS = {
+    ('packed_publication', 'optional_compiled_kernels'): (
+        '832ee0081e592b680682d6a7182c671420ed965717ed8c673a35bdd0b2932bd5',
+        'Direct source-bitset bbox/count and row-packbits encoding with exact addressing, padding and bounded output blocks.',
+    ),
+    ('topology_runs', '_TOPOLOGY_RUNS_DISABLED'): (
+        '914bd52d8607bfd7d187e0e84a1b98fe50e5de2536576ee006ee079f564eaf71',
+        'Bounded equal-label run intersection preserves all touching pairs and falls back on fragmentation or optional compiler failure.',
+    ),
+    ('topology_runs', 'optional_compiled_kernels'): (
+        '6824f9609888b53198dac49de1d9ce860e0894d8c36a2d16c926c7a75a872ddc',
+        'Bounded equal-label run intersection preserves all touching pairs and falls back on fragmentation or optional compiler failure.',
+    ),
+
     ('cylindrical_owner', '_OWNER_KERNEL_SOURCE'): (
         '4d833c54ff172cfc150730b1ed57f574aac648051198623231368939af4b0877',
         'Pin the native owner protocol, kernel, optional compile policy and resource limits.',

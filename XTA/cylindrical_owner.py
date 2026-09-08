@@ -63,7 +63,8 @@ def radial_owner_enabled():
 def radial_runtime_provenance():
     from . import outputs
     modules = {}
-    for name in ('pipeline', 'workers', 'inference', 'cuda_d1', 'cylindrical_owner', 'outputs'):
+    for name in ('pipeline', 'workers', 'inference', 'cuda_d1', 'cylindrical_owner', 'outputs',
+                 'packed_publication', 'publication_memory', 'nrrd_spans', 'topology_runs', 'topology'):
         module = sys.modules.get('XTA.' + name)
         raw_path = getattr(module, '__file__', None)
         if raw_path:
@@ -434,6 +435,9 @@ def consume_radial_device_union(task, accumulator, *, target=None):
                 raise RuntimeError('This worker already retains a native Radial owner')
             owner = RadialOwner(view, shape[1:], output_shape)
             owner.key, owner.store_dir = key, Path(task['d1_store_dir'])
+            owner.memory_payload_path = task.get('d1_memory_payload_path')
+            owner.memory_payload_limit = int(task.get('d1_memory_payload_limit', 0))
+            owner.memory_payload_reserve = int(task.get('d1_memory_payload_reserve', 0))
             owner.projection_kind = RADIAL_OWNER_CONTRACT
             _RADIAL_OWNER_STATES[key] = owner
             print(f'Radial owner admitted {key}: bitset_MiB={owner.words.nbytes / 2**20:.2f}, '

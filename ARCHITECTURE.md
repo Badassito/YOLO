@@ -1,10 +1,15 @@
 # XTA architecture
 
-`GPT-6-Astra-Ultra_v20.0.2_SLURM.py` is the sole versioned launcher. It, the
+`GPT-6-Astra-Ultra_v20.0.3_SLURM.py` is the sole versioned launcher. It, the
 installed `xta` console script, and `python -m XTA` all dispatch
 through `XTA.cli.run()`.
 The implementation lives in the importable `XTA` package so spawned processes
 resolve worker functions and data types through canonical module paths.
+
+Main v20.0.3 promotes packed source publication, native NRRD crop-row streaming,
+planned RAM retention with disk spill, and bounded run-based topology adjacency.
+It also fixes Linux memfd cache identity. Cluster job 142621 completed all
+outputs in 620.5 seconds, 44.8% less walltime than the accepted v20.0.2 run.
 
 Main v20.0.2 promotes native shell cleanup and source-bitset projection inside
 inference workers, together with bounded Radial planning and publication
@@ -431,6 +436,101 @@ zero parent postprocess jobs at inference drain. The time through the drain
 increased from 632.6 to 689.6 seconds as shell cleanup/projection moved into
 the workers. These are individual end-to-end runs; exact output parity was
 qualified separately with the local decoded-output comparisons above.
+
+### Main v20.0.3 output tail and memory planning
+
+Owner publication now scans source words directly for exact slice bounds and
+foreground counts, then writes cropped, row-packed bits. It avoids constructing
+the dense uint8 publication blocks. The existing packed CVOL reader supplies
+final union and all requested layer products. Optional compilation failure uses
+bounded NumPy unpack/pack; `YOLO_TTA_PACKED_OWNER_PUBLICATION=0` restores raw CVOL
+publication. Packed Windows descriptors explicitly use binary mode so byte 0x0a
+cannot be translated into CRLF.
+
+For native CVOL NRRDs using software member codecs, the writer emits only the
+nonempty crop's row bands to the regular codec. Empty top/bottom rows and slices
+use reusable gzip zero members, restricted to 21 power-of-two sizes through
+1 MiB. These zero members use compression level 9 once per cached size; ordinary
+data retains the configured codec. The completion queue remains bounded, and
+every sparse mirror observer receives its complete crop once. Restored geometry,
+dense-block observers and hardware minimum-input policies retain their existing
+paths. `YOLO_TTA_NRRD_CROP_ROW_SPANS=0` restores whole-slice assembly.
+
+Linux native shell payloads can use parent-owned memfds under a run-wide plan.
+Every selected future layer is charged its full worst-case packed source size
+before dispatch, so workers cannot independently claim the same free RAM. The
+plan counts physical/cgroup headroom without swap, reserves the final union and
+uint32 topology labels, all host publication credits, configured gzip windows,
+mirror canvases and global spools, and leaves half the remaining headroom unused.
+The standard geometry with 950 GiB headroom reserves 291.42 GiB for other work
+and admits 50 layers under a 104.14 GiB worst-case retained-payload reservation.
+Actual sparse payloads are much smaller. Parent descriptors survive worker exit;
+existing consumer retirement closes them. Between producer callbacks, inadequate
+headroom or grant exhaustion spills the unfinished payload to disk and releases
+its RAM pages. Disk-write failure preserves the original payload and propagates.
+Retained-debug runs and memory-backed scratch use their existing backing policy.
+`YOLO_TTA_PUBLICATION_RAM=0` disables this tier; a positive
+`YOLO_TTA_PUBLICATION_RAM_GIB` adds a retained-payload cap. Existing anonymous
+workspace caps are also respected.
+
+Topology adjacency can intersect equal-label row runs rather than inspect every
+foreground pixel's neighboring labels. Exact sorted pair codes retain the same
+union-find result. Small overlap windows use the existing pixel hash, while
+fragmented inputs exceeding bounded run/pair buffers fall back to it.
+`YOLO_TTA_TOPOLOGY_RUN_ADJACENCY=0` disables the run path. The 3072-square coherent
+fixture was about five times faster for adjacency; this is not a measurement of
+the full production keep_objects pass.
+
+The full 17,879,916,848-voxel synthetic publication comparison measured 17.5–18.1 s
+for raw publication plus native/mirror NRRDs, versus 10.1–10.6 s for packed
+publication and crop-row streams. Temporary payloads fell from 3.223 to 0.404 GiB;
+native NRRDs fell from 91,726,928 to 53,183,381 bytes. Complete decoded native and
+mirror hashes matched. All 52 NRRDs and both videos from the 50-trajectory local
+real-model qualification matched the prior implementation, including decoded
+video frames and timestamps. These results exclude cluster scheduling and RAM
+backing speedups. The Linux memfd spawn/retirement test is included but needs a
+Linux host; the Windows run qualifies admission arithmetic, real spill copies,
+failed-write recovery, packing, and the GPU worker/consumer pipeline.
+
+### Cluster 142619: RAM payload cache identity
+
+Job 142619 passed the original single-store Linux memfd ownership test and
+admitted all 50 native layers to planned RAM. It later failed while reading a
+Radial payload for NRRD export. The shared-mmap cache used `Path.resolve()` as
+its key: distinct, equally named memfds resolve through `/proc/<pid>/fd/N` to
+the same diagnostic `/memfd:xta-packed-publication (deleted)` string. A reader
+could therefore receive another layer's mapping. Different payload lengths
+produced a short read; equal-length payloads could produce incorrect pixels
+without a read error. The per-view exports from that failed run are untrusted.
+
+The cache now uses the absolute logical layer path without following its payload
+symlink. Repeated readers of one layer still share a mapping, separate layers
+remain separate, and release/invalidation keep the same key after descriptor
+retirement. Cross-platform regressions reproduce the old collision, including
+equal-length/different-content layers, and compare concurrent native/mirror
+exports against uncached output. The existing `tests.test_publication_memory`
+preflight now also checks several real Linux memfds after their producer exits,
+through concurrent cached NRRD export. This extends the original one-store test.
+
+The inference/projection and optimization policies are unchanged by this fix.
+In 142619, keep_objects took 27.057 s versus 81.903 s in 142565; both report
+408,973,828 retained voxels. This count is not a full-volume parity proof, and
+142619 did not complete successfully or report a completed pipeline walltime.
+
+### Cluster 142621: completed tail qualification
+
+The corrected candidate completed successfully in 620.5 s, versus 1,124.5 s in
+142565: 504.0 s (44.8%) less walltime. The post-inference tail fell from 434.9 to
+83.5 s (80.8%), and keep_objects fell from 81.903 to 21.535 s. Time through the
+drain fell from 689.6 to 537.0 s.
+
+All 12 preflight tests passed on Linux, including concurrent cached exports from
+multiple parent-owned memfds after producer exit. All 155,365 model frames and
+71 NRRD write jobs completed, no traceback was logged, and the run released all
+50 RAM-backed payloads before reporting Done. The production payloads did not
+spill to disk. The retained voxel count remains 408,973,828; this count and the
+successful writes establish logged completion, not a separate full-volume byte
+comparison. These changes are promoted in main v20.0.3.
 
 ## Default sparse execution
 
@@ -860,7 +960,7 @@ one-versus-four-device scheduling and final bytes are covered by deterministic s
 representative H100 execution remains a hardware qualification step:
 
 ```bash
-python -u GPT-6-Astra-Ultra_v20.0.2_SLURM.py \
+python -u GPT-6-Astra-Ultra_v20.0.3_SLURM.py \
   --mode lta \
   --input <target-video> \
   --exemplar <aligned-image-yolo-directory> \

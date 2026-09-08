@@ -3544,8 +3544,15 @@ _NRRD_RAW_STORE_CHUNKS_RAM_CACHE_LOCK = threading.Lock()
 _NRRD_RAW_STORE_CHUNKS_LOAD_EVENTS: Dict[Path, threading.Event] = {}
 
 def _raw_store_chunks_cache_key(chunks_path: Path) -> Path:
+    """Identify the logical layer path without following its payload symlink.
+
+    Distinct Linux memfds with the same name resolve through /proc to the same
+    diagnostic '/memfd:name (deleted)' string. That is not file identity. Keep
+    layer aliases separate, and keep release/invalidation keys stable even after
+    the backing descriptor disappears.
+    """
     try:
-        return Path(chunks_path).resolve()
+        return Path(chunks_path).absolute()
     except Exception:
         return Path(chunks_path)
 
@@ -3794,6 +3801,7 @@ class IncrementalRawBBoxMaskStoreWriter:
         format_name: str,
         desc: str,
         extra_meta: Optional[Dict[str, object]] = None,
+        payload_backing: Optional[str] = None,
     ) -> None:
         fmt = str(format_name)
         if fmt not in MASK_STORE_FORMATS:
@@ -3827,15 +3835,65 @@ class IncrementalRawBBoxMaskStoreWriter:
         self._finalized = False
 
         _invalidate_raw_store_chunks_ram_cache(self.chunks_path)
-        release_memfd_owners_under(self.store_dir)
+        if not payload_backing:
+            release_memfd_owners_under(self.store_dir)
         if self.store_dir.exists():
             shutil.rmtree(self.store_dir, ignore_errors=True)
         self.store_dir.mkdir(parents=True, exist_ok=True)
-        self._fd: Optional[int] = os.open(
-            self.chunks_path,
-            os.O_CREAT | os.O_TRUNC | os.O_RDWR,
-            0o666,
-        )
+        self._ram_payload = False
+        self._fd: Optional[int] = None
+        if payload_backing:
+            try:
+                self._fd = os.open(str(payload_backing), os.O_RDWR | getattr(os, 'O_BINARY', 0))
+                os.ftruncate(self._fd, 0)
+                self.chunks_path.symlink_to(str(payload_backing))
+                self._ram_payload = True
+            except OSError as exc:
+                if self._fd is not None:
+                    os.close(self._fd)
+                    self._fd = None
+                self.chunks_path.unlink(missing_ok=True)
+                print(f'Publication RAM backing could not be opened; using disk: {exc}', flush=True)
+        if self._fd is None:
+            self._fd = os.open(self.chunks_path, os.O_CREAT | os.O_TRUNC | os.O_RDWR | getattr(os, 'O_BINARY', 0), 0o666)
+
+    def spill_payload_to_disk(self) -> None:
+        """Move a private, unfinished RAM payload to disk between callbacks.
+
+        No consumer may open an incremental store before finalize. Only that
+        producer boundary permits replacing the backing and releasing its pages.
+        """
+        with self._lock:
+            if not self._ram_payload:
+                return
+            if self._active_callbacks or self._finalized or self._fd is None:
+                raise RuntimeError('Cannot spill an active or published mask payload')
+            old_fd = self._fd
+            pending = self.chunks_path.with_name('chunks.spill-pending')
+            new_fd = os.open(pending, os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, 'O_BINARY', 0), 0o666)
+            try:
+                os.lseek(old_fd, 0, os.SEEK_SET)
+                copied = 0
+                while copied < self._next_offset:
+                    data = os.read(old_fd, min(1024 * 1024, self._next_offset - copied))
+                    if not data:
+                        raise IOError('Short read while spilling a private mask payload')
+                    self._pwrite_all(new_fd, memoryview(data), copied)
+                    copied += len(data)
+                os.replace(pending, self.chunks_path)
+            except BaseException:
+                os.close(new_fd)
+                pending.unlink(missing_ok=True)
+                raise
+            self._fd = new_fd
+            self._ram_payload = False
+            try:
+                # The parent retains a descriptor, but no published reader exists;
+                # release the old pages immediately rather than waiting for retirement.
+                os.ftruncate(old_fd, 0)
+            finally:
+                os.close(old_fd)
+            print(f'Publication RAM budget/headroom exhausted: spilled {copied / GIB:.3f} GiB to {self.chunks_path}', flush=True)
 
     @property
     def failed(self) -> bool:
@@ -4262,6 +4320,7 @@ class IncrementalRawBBoxMaskStoreWriter:
             'index_bytes': int(self.index.nbytes),
             'segment_extent_ijk': _segment_extent_to_json(extent),
             'segment_extent_shape_tyx': [int(v) for v in self.shape],
+            'payload_backing': 'planned_memfd' if self._ram_payload else 'disk',
         }
         meta: Dict[str, object] = {
             'format': self.format_name,
@@ -4298,7 +4357,9 @@ class IncrementalRawBBoxMaskStoreWriter:
         print(
             f'{self.desc}: incremental raw bbox mask store {self.store_dir} '
             f'(logical_raw={raw_logical_bytes / GIB:.2f} GiB, '
-            f'payload={payload_bytes / GIB:.2f} GiB, nonempty_slices={nonempty_slices})'
+            f'payload={payload_bytes / GIB:.2f} GiB, nonempty_slices={nonempty_slices}, '
+            f'encoding={"row-packbits" if self._packbits_payload else "uint8"}, '
+            f'backing={"planned_memfd" if self._ram_payload else "disk"})'
         )
         return stats
 

@@ -42,6 +42,7 @@ from typing import (
     Tuple,
 )
 import numpy as np
+from .nrrd_spans import canonical_zero_member, stream_native_crop_spans
 from ._deps import _numba, cv2, tifffile, tqdm
 
 from .config import (
@@ -1812,6 +1813,31 @@ class _MemberParallelGzipPayloadWriter:
             self._abandon_and_settle()
             raise
         return int(len(mv))
+
+    def write_canonical_zeros(self, nbytes: int) -> int:
+        """Use at most 21 reusable zero-member sizes for arbitrary sparse gaps.
+
+        Software codecs accept these small complete gzip members. Hardware codecs
+        retain their existing minimum-input/lookbehind policy through write_zeros.
+        """
+        if self.closed:
+            raise RuntimeError('Cannot write to a closed gzip payload stream')
+        remaining = int(nbytes)
+        if remaining < 0:
+            raise ValueError('A zero run cannot have negative length')
+        if self.minimum_input_bytes > 1:
+            return self.write_zeros(remaining)
+        try:
+            while remaining:
+                size = 1 << min(20, remaining.bit_length() - 1)
+                self._enqueue_completed(canonical_zero_member(size))
+                remaining -= size
+                self._drain(block=len(self._completed) >= 128)
+        except BaseException:
+            self.closed = True
+            self._abandon_and_settle()
+            raise
+        return int(nbytes)
 
     def write_aligned_zeros(self, nbytes: int) -> int:
         """Emit one complete cached zero member matching a whole-slice sparse member."""
@@ -4217,6 +4243,20 @@ def _write_one_decomposed_nrrd_layer_payload(
             raw_store_stream
             and (int(in_t), int(in_h), int(in_w)) == (int(out_t), int(out_h), int(out_w))
         )
+        if (raw_store_native_stream and block_consumer is None
+                and _env_flag('YOLO_TTA_NRRD_CROP_ROW_SPANS', True)
+                and callable(getattr(payload_writer, 'write_canonical_zeros', None))
+                and int(getattr(payload_writer, 'minimum_input_bytes', 0)) == 1):
+            encoded = stream_native_crop_spans(
+                src, payload_writer, z_begin, z_end, nrrd_gzip_chunk_bytes(), sparse_consumer)
+            if pbar is not None:
+                pbar.update(z_end-z_begin)
+            runtime_telemetry().add('nrrd.crop_row_codec_input_bytes', encoded)
+            print(f'NRRD crop-row stream {Path(ref.path).name}: '
+                  f'codec_input={encoded / GIB:.3f} GiB of '
+                  f'{(z_end-z_begin)*out_h*out_w / GIB:.3f} GiB; '
+                  'empty row spans use cached gzip members.', flush=True)
+            return
         # z-blocks fully outside this window are emitted as cached zero
         # members/chunks through write_zeros — no fill, no tee, no source page reads.
         zero_window = _nrrd_layer_zero_skip_window(ref, (out_t, out_h, out_w))

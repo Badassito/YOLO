@@ -24,6 +24,7 @@ from typing import (
 )
 import numpy as np
 from ._deps import _numba, cv2, tqdm
+from .topology_runs import run_adjacent_pair_codes
 
 from .config import (
     GIB,
@@ -470,6 +471,10 @@ def _compiled_adjacent_gid_pair_codes(
     offsets = _normalized_adjacency_offsets(xy_offsets, prev_gid.shape)
     if not prev_gid.size or not len(offsets):
         return np.empty(0, dtype=np.uint64)
+    if prev_gid.size >= 262144 and _env_flag('YOLO_TTA_TOPOLOGY_RUN_ADJACENCY', True):
+        run_codes = run_adjacent_pair_codes(prev_gid, curr_gid, offsets, prev_offset, curr_offset)
+        if run_codes is not None:
+            return run_codes
     table = np.zeros(initial, dtype=np.uint64)
     used, position, neighbor = 0, 0, 0
     last_code = np.uint64(0)

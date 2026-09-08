@@ -38,6 +38,7 @@ from typing import (
 import numpy as np
 from ._deps import _numba, cv2
 from .cylindrical_owner import RADIAL_OWNER_CONTRACT, radial_owner_eligible, radial_runtime_provenance
+from .publication_memory import plan_native_publication_memory, publication_output_reserve
 
 # Explicit lower-layer dependencies keep imports one-way.
 from .config import (
@@ -260,6 +261,8 @@ from .interpolation import (
     materialize_raw_bbox_mask_store_workspace,
 )
 from .cuda_d1 import (
+    d1_publication_max_pending_per_worker,
+    d1_unpack_target_mib,
     _memmap_backing_path,
     _nrrd_layer_key,
     archive_or_delete_binary_volume_storage,
@@ -304,6 +307,8 @@ from .outputs import (
     nrrd_layer_output_suffix,
     nrrd_layer_sink,
     nrrd_layer_sink_workers,
+    nrrd_member_gzip_window_bytes,
+    nrrd_gzip_chunk_bytes,
     resolve_low_quality_downbin_specs,
     set_nrrd_layer_sink,
     shutdown_nrrd_gzip_executors,
@@ -4974,6 +4979,14 @@ def _main_impl() -> None:
                     )
                 next_task_id += 1
         scheduler_state.gpu_worker_total_tasks = int(next_task_id)
+        plan_native_publication_memory(
+            gpu_worker_tasks_by_id.values(), keep_temp=bool(keep_temp_artifacts),
+            worker_count=int(gpu_device_count),
+            publication_pending=d1_publication_max_pending_per_worker(),
+            unpack_bytes=d1_unpack_target_mib() * 1024 * 1024,
+            output_reserve_bytes=publication_output_reserve(
+                nrrd_layer_sink(), nrrd_member_gzip_window_bytes(), nrrd_gzip_chunk_bytes()),
+        )
         print('Execution provenance: ' + json.dumps(radial_runtime_provenance(), sort_keys=True), flush=True)
         radial_owner_tasks = [task for task in gpu_worker_tasks_by_id.values()
                               if task.get('projection_contract') == RADIAL_OWNER_CONTRACT]
