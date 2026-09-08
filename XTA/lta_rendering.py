@@ -383,7 +383,7 @@ def build_lta_rendered_view(
 ) -> LtaRenderedView:
     """Bind one expanded LTA runtime view to canonical geometry and RGB policy."""
 
-    from .unification.tta_manifest import radial_view_plan_metadata
+    from .unification.tta_manifest import radial_view_plan_metadata, spherical_view_plan_metadata
     volume = np.asarray(volume_u8)
     if volume.dtype != np.uint8 or volume.ndim != 3:
         raise ValueError("LTA source volume must be uint8 with (t,Y,X) shape")
@@ -407,6 +407,7 @@ def build_lta_rendered_view(
             "channel_policy": "implicit_rgb_v1",
             "source_shape_tyx": [int(value) for value in volume.shape],
             **radial_view_plan_metadata(view),
+            **spherical_view_plan_metadata(view),
         },
     )
     return LtaRenderedView(

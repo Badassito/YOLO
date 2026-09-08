@@ -1503,11 +1503,12 @@ def gpu_worker_task_cost_key(task: Dict[str, object]) -> Tuple[object, ...]:
     )
 
 def cpu_inference_supports_view(view: object) -> bool:
-    """OpenVINO accepts Cartesian, Tilted Cartesian, and native Radial shell patches."""
+    """OpenVINO accepts Cartesian, Tilted Cartesian, and native shell patches."""
     # Local import keeps the package dependency graph acyclic.
     from .geometry import (
         TILTED_VIEW_FAMILY,
         RADIAL_VIEW_FAMILY,
+        SPHERICAL_VIEW_FAMILY,
         ViewInfo,
         is_azimuthal_view,
     )
@@ -1515,7 +1516,7 @@ def cpu_inference_supports_view(view: object) -> bool:
     return bool(
         isinstance(view, ViewInfo)
         and not is_azimuthal_view(view)
-        and str(view.family) in {'orthogonal', TILTED_VIEW_FAMILY, RADIAL_VIEW_FAMILY}
+        and str(view.family) in {'orthogonal', TILTED_VIEW_FAMILY, RADIAL_VIEW_FAMILY, SPHERICAL_VIEW_FAMILY}
     )
 
 def cpu_inference_task_priority(task: Dict[str, object]) -> int:

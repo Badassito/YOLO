@@ -57,6 +57,7 @@ from .config import (
     resolve_quantize,
     resolve_azimuthal_view_requests,
     resolve_radial_view_requests,
+    resolve_spherical_view_requests,
     resolve_save_request,
     resolve_tilted_view_groups,
     resolve_tta_angles,
@@ -404,6 +405,41 @@ from .workers import (
 _PIPELINE_RUN_LOCK = threading.Lock()
 
 _ACTIVE_PIPELINE_RUN_RESOURCES: Optional[_PipelineRunResources] = None
+
+def _spherical_workload_groups(views: Sequence[ViewInfo]) -> List[Dict[str, object]]:
+    """Count canonical cube groups and their patches, independent of request aliases."""
+    groups: Dict[str, Dict[str, object]] = {}
+    for view in views:
+        if view.family != 'spherical':
+            continue
+        group = groups.setdefault(str(view.spherical_group), {
+            'group': str(view.spherical_group), 'request_tokens': [], 'faces': [],
+            'patch_trajectories': 0, 'frames_per_angle': 0,
+            'radius_count': int(view.num_slices),
+            'minimum_radius': float(view.spherical_min_radius),
+            'maximum_radius': float(view.spherical_max_radius),
+            'radius_step': float(view.spherical_step),
+            'face_intervals': int(view.spherical_face_intervals),
+            'rotation_xyz': list(view.spherical_rotation_xyz),
+        })
+        group['patch_trajectories'] += 1
+        group['frames_per_angle'] += int(view.num_slices)
+        if int(view.spherical_face) not in group['faces']:
+            group['faces'].append(int(view.spherical_face))
+        for token in view.spherical_request_tokens:
+            if str(token) not in group['request_tokens']:
+                group['request_tokens'].append(str(token))
+    return list(groups.values())
+
+
+def _legacy_d1_model_supported(model_path: Optional[str]) -> bool:
+    """Legacy D1 requires the TensorRT ring's proto-topology stage.
+
+    Native Radial owners have their own cleanup/projection contract and do not
+    use this model restriction. Other model formats retain native task unions.
+    """
+    return model_path is not None and Path(str(model_path)).suffix.lower() == '.engine'
+
 
 def _run_resources() -> _PipelineRunResources:
     resources = _ACTIVE_PIPELINE_RUN_RESOURCES
@@ -976,6 +1012,9 @@ def _main_impl() -> None:
         tilt_groups = resolve_tilted_view_groups(args.enable_tilted)
         azimuthal_requests = resolve_azimuthal_view_requests(args.enable_azimuthal)
         radial_requests = resolve_radial_view_requests(args.enable_radial)
+        spherical_requests = resolve_spherical_view_requests(args.enable_spherical)
+        if spherical_requests and int(args.imgsz) <= 0:
+            raise ValueError('Spherical QSC patches require --imgsz > 0')
         tile_configs = resolve_tile_configs(args.enable_tile)
     except ValueError as exc:
         parser.error(str(exc))
@@ -985,6 +1024,7 @@ def _main_impl() -> None:
     tilt_views = tilted_group_base_views(tilt_groups)
     azimuthal_targets = [request.view for request in azimuthal_requests]
     radial_targets = [request.view for request in radial_requests]
+    spherical_targets = [request.view for request in spherical_requests]
     if azimuthal_requests and cpu_inference_enabled and not gpu_inference_enabled:
         skipped_targets = ', '.join(azimuthal_targets)
         print(
@@ -1009,7 +1049,12 @@ def _main_impl() -> None:
         not target.startswith('tilted_') or target.removeprefix('tilted_') in tilt_views
         for target in radial_targets
     )
-    if not (enabled_cartesian_views or concrete_tilt_requested or active_azimuthal_request or active_radial_request):
+    active_spherical_request = any(
+        not target.startswith('tilted_') or target.removeprefix('tilted_') in tilt_views
+        for target in spherical_targets
+    )
+    if not (enabled_cartesian_views or concrete_tilt_requested or active_azimuthal_request
+            or active_radial_request or active_spherical_request):
         for azimuthal_target in azimuthal_targets:
             if str(azimuthal_target).startswith('tilted_'):
                 azimuthal_base = azimuthal_target_base_view(azimuthal_target)
@@ -1021,7 +1066,7 @@ def _main_impl() -> None:
         raise ValueError(
             'No inference views are active. Enable at least one view with --enable_cartesian, '
             '--enable_tilted VIEW[:TILT_ANGLE[:TILT_DIRECTION]], or '
-            '--enable_azimuthal VIEWS[:AZIMUTH_ANGLE], or --enable_radial VIEWS. A tilted_* target requires '
+            '--enable_azimuthal VIEWS[:AZIMUTH_ANGLE], --enable_radial VIEWS, or --enable_spherical VIEWS. A tilted_* target requires '
             'a matching --enable_tilted base.'
         )
 
@@ -1447,6 +1492,7 @@ def _main_impl() -> None:
     v1613_d1_owner_active = bool(
         v1613_bundle_active and v1613_d1_owner_requested()
     )
+    legacy_d1_model_eligible = _legacy_d1_model_supported(gpu_model_path)
     configure_pipeline_modes(
         fast_bundle_active=bool(v1613_bundle_active),
         d1_pipeline_active=bool(v1613_d1_owner_active),
@@ -1464,6 +1510,12 @@ def _main_impl() -> None:
             'parent postprocess stage; the scheduler never owns a dense inference result. '
             'YOLO_TTA_V1613_FAST_BUNDLE=0 restores the compatibility paths.'
         )
+        if not legacy_d1_model_eligible:
+            print(
+                'Legacy D1 model routing: resident TensorRT requires an .engine model; '
+                f'{Path(str(gpu_model_path)).name} uses native task unions for '
+                'Cartesian, Tilted, and Azimuthal views.'
+            )
     elif v1613_bundle_active:
         print(
             'v16.1.8 fast bundle active with D1 disabled by '
@@ -1508,7 +1560,11 @@ def _main_impl() -> None:
         radial_requests=radial_requests,
         radial_min_radius=args.radial_min_radius,
         radial_patch_size=int(args.imgsz),
+        spherical_requests=spherical_requests,
+        spherical_min_radius=args.spherical_min_radius,
+        spherical_patch_size=int(args.imgsz),
     )
+    spherical_groups = _spherical_workload_groups(compiled_physical_views.views)
     azimuthal_diameters = list(compiled_physical_views.azimuthal_diameters)
     resolved_azimuth_angles = list(compiled_physical_views.azimuthal_azimuth_angles)
     for request, diameter, spacing in zip(
@@ -1534,7 +1590,7 @@ def _main_impl() -> None:
             'model_input_channels': int(channel_format.channel_count),
             'model_channel_stride': int(channel_format.stride),
             'model_channel_offsets': [int(v) for v in channel_format.offsets],
-            'model_channel_boundary_policy': 'azimuthal_wrap_mirror_u_cartesian_edge_clamp',
+            'model_channel_boundary_policy': 'azimuthal_wrap_mirror_u_radial_radius_clamp_spherical_radius_clamp_cartesian_edge_clamp',
             'model_prediction_slice_policy': 'center_N_only',
             'fps': fps,
             'enable_cartesian': list(enabled_cartesian_views),
@@ -1563,6 +1619,10 @@ def _main_impl() -> None:
             'enable_radial': list(radial_targets),
             'radial_min_radius': args.radial_min_radius,
             'radial_patch_size': int(args.imgsz),
+            'enable_spherical': list(spherical_targets),
+            'spherical_min_radius': args.spherical_min_radius,
+            'spherical_patch_size': int(args.imgsz),
+            'spherical_groups': spherical_groups,
             'azimuthal_diameters': [int(v) for v in azimuthal_diameters],
             'azimuth_angles_deg': [float(v) for v in resolved_azimuth_angles],
             'enable_azimuthal_groups': [
@@ -1597,7 +1657,7 @@ def _main_impl() -> None:
         raise ValueError(
             'No inference views are active. Enable at least one view with --enable_cartesian, '
             '--enable_tilted VIEW[:TILT_ANGLE[:TILT_DIRECTION]], or '
-            '--enable_azimuthal VIEWS[:AZIMUTH_ANGLE], or --enable_radial VIEWS. A tilted_* target is skipped '
+            '--enable_azimuthal VIEWS[:AZIMUTH_ANGLE], --enable_radial VIEWS, or --enable_spherical VIEWS. A tilted_* target is skipped '
             'when its matching Tilted base is not enabled.'
         )
 
@@ -1624,6 +1684,7 @@ def _main_impl() -> None:
     upright_azimuthal_concrete_views = [v for v in azimuthal_concrete_views if not is_tilted_azimuthal_view(v)]
     upright_tilted_views = [v for v in physical_views if is_tilted_view(v)]
     radial_concrete_views = [v for v in physical_views if v.family == 'radial']
+    spherical_concrete_views = [v for v in physical_views if v.family == 'spherical']
     source_frames_per_angle = int(sum(int(v.num_slices) for v in physical_views))
     azimuthal_frames_per_angle = int(sum(int(v.num_slices) for v in azimuthal_concrete_views))
     tilted_azimuthal_frames_per_angle = int(sum(int(v.num_slices) for v in tilted_azimuthal_concrete_views))
@@ -1640,7 +1701,8 @@ def _main_impl() -> None:
         f'{len(physical_views)} physical view(s) = {len(cartesian_views)} Cartesian + '
         f'{len(upright_tilted_views)} Tilted + {len(upright_azimuthal_concrete_views)} upright Azimuthal + '
         f'{len(tilted_azimuthal_concrete_views)} tilted-Azimuthal + '
-        f'{len(radial_concrete_views)} Radial intrinsic patch trajectories; '
+        f'{len(radial_concrete_views)} Radial intrinsic patch trajectories + '
+        f'{len(spherical_concrete_views)} Spherical QSC face-patch trajectories; '
         f'{source_frames_per_angle} source frame(s)/--angle, '
         f'{len(inference_views)} independent view-angle variant(s), and '
         f'{source_frames_per_angle * max(1, len(angles))} total model frame(s) across '
@@ -1659,6 +1721,16 @@ def _main_impl() -> None:
             f'{int(args.imgsz)}x{int(args.imgsz)} patches preserve unit arc/height spacing, '
             'periodic angular samples, and a clamped radius trajectory. '
             'Optional Tiles operate inside these patches.'
+        )
+    if spherical_concrete_views:
+        print(
+            'Spherical QSC workload: '
+            f'{len(spherical_groups)} canonical cube rotation group(s), '
+            f'{sum(len(group["faces"]) for group in spherical_groups)} cube faces, '
+            f'{len(spherical_concrete_views)} fixed face-patch trajectories, and '
+            f'{sum(v.num_slices for v in spherical_concrete_views)} native patch frames/angle. '
+            'Request aliases share each cube; contextual channels clamp along radius. '
+            'The central core is excluded; optional Tiles operate inside each square patch.'
         )
     if tilted_azimuthal_concrete_views:
         print(
@@ -2622,7 +2694,7 @@ def _main_impl() -> None:
         view = kwargs['view']
         source_shape = (int(input_T), int(input_H), int(input_W))
         source_volume_bytes = math.prod(source_shape)
-        if int(kwargs.get('added_voxels', 0)) <= 0 and view.family != 'radial':
+        if int(kwargs.get('added_voxels', 0)) <= 0 and view.family not in ('radial', 'spherical'):
             working_bytes = 64 * 1024 * 1024
         elif (str(view.family) == 'azimuthal' and str(kwargs.get('source')) == 'fullframe'
               and _numba is not None):
@@ -2896,7 +2968,7 @@ def _main_impl() -> None:
 
     def _parent_destination_ready(model_name: str, view_name: str) -> bool:
         view = view_infos_by_name[str(view_name)]
-        if view.family in ('azimuthal', 'radial'):
+        if view.family in ('azimuthal', 'radial', 'spherical'):
             return str(view_name) in azimuthal_native_output_by_model.get(str(model_name), {})
         if is_tilted_view(view):
             return str(view_name) in tilted_native_output_by_model.get(str(model_name), {})
@@ -2904,7 +2976,7 @@ def _main_impl() -> None:
 
     def _parent_destination_volume(model_name: str, view_name: str) -> np.ndarray:
         view = view_infos_by_name[str(view_name)]
-        if view.family in ('azimuthal', 'radial'):
+        if view.family in ('azimuthal', 'radial', 'spherical'):
             return azimuthal_native_output_by_model[str(model_name)][str(view_name)]
         if is_tilted_view(view):
             return tilted_native_output_by_model[str(model_name)][str(view_name)]
@@ -2995,7 +3067,7 @@ def _main_impl() -> None:
                 and str(getattr(ref, 'layer_role', 'additive_component')) == 'additive_component'
                 and str(getattr(ref, 'recomposition_op', 'union')) == 'union'
             )
-            if view.family in ('azimuthal', 'radial'):
+            if view.family in ('azimuthal', 'radial', 'spherical'):
                 primary = azimuthal_native_output_by_model[str(model_name)].get(runtime_name)
             elif is_tilted_view(view):
                 primary = tilted_native_output_by_model[str(model_name)].get(runtime_name)
@@ -3009,7 +3081,7 @@ def _main_impl() -> None:
             # orthogonal-additions continuation.
             refs_are_authoritative = bool(
                 view_refs and (
-                    view.family in ('azimuthal', 'radial')
+                    view.family in ('azimuthal', 'radial', 'spherical')
                     or is_tilted_view(view)
                     or primary is None
                 )
@@ -3021,7 +3093,7 @@ def _main_impl() -> None:
                     selected_refs.setdefault(str(ref.key), ref)
             else:
                 dense_owner = primary
-                if dense_owner is None and (view.family in ('azimuthal', 'radial') or is_tilted_view(view)):
+                if dense_owner is None and (view.family in ('azimuthal', 'radial', 'spherical') or is_tilted_view(view)):
                     dense_owner = fallback
                 d1_ref = d1_layer_ref_by_parent.get((str(model_name), runtime_name))
                 if dense_owner is not None and d1_ref is not None:
@@ -3083,7 +3155,7 @@ def _main_impl() -> None:
         physical_view = physical_view_infos_by_name[str(physical_name)]
         projection_bytes = (
             int(array_nbytes((int(input_T), int(input_H), int(input_W)), np.uint8))
-            if physical_view.family in ('azimuthal', 'radial') or is_tilted_view(physical_view)
+            if physical_view.family in ('azimuthal', 'radial', 'spherical') or is_tilted_view(physical_view)
             else 1
         )
 
@@ -4000,7 +4072,7 @@ def _main_impl() -> None:
 
             view_info = view_infos_by_name[result.view_name]
             if result.final_view_volume_mm is not None and not retire_completed_non_tiled_view:
-                if view_info.family in ('azimuthal', 'radial'):
+                if view_info.family in ('azimuthal', 'radial', 'spherical'):
                     azimuthal_native_output_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
                 elif is_tilted_view(view_info):
                     tilted_native_output_by_model[result.model_name][result.view_name] = result.final_view_volume_mm
@@ -4829,7 +4901,8 @@ def _main_impl() -> None:
                 )
                 hybrid_deferred = bool(
                     str(kind) == 'fullframe'
-                    and view.family != 'radial'
+                    and view.family not in ('radial', 'spherical')
+                    and legacy_d1_model_eligible
                     and v1613_d1_owner_active
                     and worker_direct_union_active
                     and cpu_eligible
@@ -4856,7 +4929,8 @@ def _main_impl() -> None:
                     result_mode = HYBRID_DEFERRED_RESULT_MODE
                 elif (
                     str(kind) == 'fullframe'
-                    and view.family != 'radial'
+                    and view.family not in ('radial', 'spherical')
+                    and legacy_d1_model_eligible
                     and v1613_d1_owner_active
                     and not cpu_eligible
                     and not azimuthal_parent_requires_seam_union
@@ -6500,9 +6574,9 @@ def _main_impl() -> None:
                 fused_projected_layer_refs.extend(view_projected_layer_refs)
                 continue
 
-            if (view.family not in ('azimuthal', 'radial') and not is_tilted_view(view)):
+            if (view.family not in ('azimuthal', 'radial', 'spherical') and not is_tilted_view(view)):
                 continue
-            if view.family in ('azimuthal', 'radial'):
+            if view.family in ('azimuthal', 'radial', 'spherical'):
                 native_source = azimuthal_native_output_by_model[model_name].get(view.name)
             else:
                 native_source = tilted_native_output_by_model[model_name].get(view.name)
@@ -6934,6 +7008,7 @@ def _main_impl() -> None:
             azimuthal_diameters=azimuthal_diameters,
             azimuthal_azimuth_angles=resolved_azimuth_angles,
             radial_requests=radial_requests,
+            spherical_requests=spherical_requests,
             backend={
                 'inference_devices': list(inference_devices),
                 'gpu_worker_process_active': bool(gpu_worker_process_active),

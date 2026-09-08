@@ -91,6 +91,17 @@ class ComponentReplayTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'three local'):
             component_replay.load_component_replay(captured)
 
+    def test_legacy_non_spherical_capture_defaults_new_geometry_fields(self):
+        self.configure()
+        captured = self.capture(self.source())
+        path = captured / 'manifest.json'
+        descriptor = json.loads(path.read_text())
+        descriptor['view'] = {key: value for key, value in descriptor['view'].items()
+                              if not key.startswith('spherical_')}
+        descriptor['descriptor_sha256'] = component_replay._descriptor_digest(descriptor)
+        path.write_text(json.dumps(descriptor))
+        self.assertEqual(component_replay.load_component_replay(captured).view, self.view)
+
     def test_disabled_filter_empty_and_quotas_do_not_copy_unselected_inputs(self):
         component_replay.configure_component_replay_capture(None)
         self.assertIsNone(self.capture(self.root/'missing'))

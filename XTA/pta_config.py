@@ -16,12 +16,15 @@ from .config import (
     ChannelFormat,
     AzimuthalViewRequest,
     RadialViewRequest,
+    SphericalViewRequest,
     TiltedViewGroup,
     resolve_cartesian_views,
     resolve_channel_format,
     resolve_azimuthal_view_requests,
     resolve_radial_view_requests,
     parse_radial_min_radius,
+    resolve_spherical_view_requests,
+    parse_spherical_min_radius,
     resolve_tilted_view_groups,
 )
 from .unification.tiles import ResolvedTileGroup, resolve_tile_groups
@@ -75,6 +78,7 @@ class PtaConfig:
     requested_output_format: str
     effective_output_format: str
     radial_requests: Tuple[RadialViewRequest, ...] = ()
+    spherical_requests: Tuple[SphericalViewRequest, ...] = ()
 
     @property
     def has_physical_views(self) -> bool:
@@ -88,7 +92,7 @@ class PtaConfig:
         return any(
             not str(request.view).startswith("tilted_")
             or str(request.view)[len("tilted_") :] in tilted_bases
-            for request in (*self.azimuthal_requests, *self.radial_requests)
+            for request in (*self.azimuthal_requests, *self.radial_requests, *self.spherical_requests)
         )
 
 
@@ -347,6 +351,22 @@ def build_pta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         help="Minimum shell radius; auto selects imgsz/(4*pi), two wraps per patch",
     )
     parser.add_argument(
+        "--enable_spherical", nargs="+", default=None, metavar="VIEW",
+        help=(
+            "Dense QSC spherical-shell views; accepts the six Radial view tokens. "
+            "Upright aliases share one cube; tilted aliases share each direction/angle "
+            "rotation. Requires --imgsz > 0"
+        ),
+    )
+    parser.add_argument(
+        "--spherical_min_radius", default=None, type=parse_spherical_min_radius,
+        metavar="RADIUS|auto",
+        help=(
+            "Minimum spherical radius; auto independently selects imgsz/(4*pi). "
+            "Dense shells end at (min(T,H,W)-1)/2 and exclude the central core"
+        ),
+    )
+    parser.add_argument(
         "--enable_tilted",
         nargs="+",
         default=None,
@@ -419,6 +439,9 @@ def resolve_pta_config(args: argparse.Namespace) -> PtaConfig:
     radial_requests = tuple(resolve_radial_view_requests(args.enable_radial))
     if radial_requests and int(args.imgsz) <= 0:
         raise ValueError("--enable_radial requires --imgsz > 0 to define its periodic patches")
+    spherical_requests = tuple(resolve_spherical_view_requests(args.enable_spherical))
+    if spherical_requests and int(args.imgsz) <= 0:
+        raise ValueError("--enable_spherical requires --imgsz > 0 to define its QSC face patches")
     if not (0.0 <= float(args.background_percent) <= 1.0):
         raise ValueError("--background_percent must be in [0,1]")
     if args.train_split is not None and not (0.0 <= float(args.train_split) <= 1.0):
@@ -458,6 +481,7 @@ def resolve_pta_config(args: argparse.Namespace) -> PtaConfig:
         cartesian_views=tuple(resolve_cartesian_views(args.enable_cartesian)),
         azimuthal_requests=tuple(resolve_azimuthal_view_requests(args.enable_azimuthal)),
         radial_requests=radial_requests,
+        spherical_requests=spherical_requests,
         tilted_groups=tuple(resolve_tilted_view_groups(args.enable_tilted)),
         tiles=resolve_tile_requests(args.enable_tile),
         device_ids=resolve_pta_device_ids(args.device),

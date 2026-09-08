@@ -33,6 +33,7 @@ from .geometry import (
     ViewInfo,
     is_azimuthal_view,
     is_radial_view,
+    is_spherical_view,
     is_tilted_azimuthal_view,
     is_tilted_view,
     physical_view_name,
@@ -619,6 +620,8 @@ def _shutdown_d1_worker_pipeline() -> None:
 
 def _d1_view_family_ids(view: ViewInfo) -> Tuple[int, int, int, float, int, float, float]:
     """Return family/base/direction/shear/stack/center metadata for the CUDA kernel."""
+    if is_spherical_view(view):
+        raise ValueError('D1 source-space kernels do not support Spherical QSC shells; use native union projection')
     if is_radial_view(view):
         raise ValueError('D1 source-space kernels do not support Radial shells; use native union projection')
     if is_azimuthal_view(view):
@@ -664,6 +667,8 @@ def _d1_get_or_create_state(task: Dict[str, object], accumulator: '_DeviceUnionA
     view = task.get('view')
     if not isinstance(view, ViewInfo):
         raise TypeError('D1 task is missing ViewInfo metadata')
+    if is_spherical_view(view):
+        raise ValueError('D1 source-space kernels do not support Spherical QSC shells; use native union projection')
     if is_radial_view(view):
         raise ValueError('D1 source-space kernels do not support Radial shells; use native union projection')
     key = (str(task.get('model_name', '')), str(view.name))

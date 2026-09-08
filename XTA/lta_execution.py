@@ -391,6 +391,15 @@ def _require_supported_runtime(plan: LtaRunPlan) -> tuple[object, object, LtaRun
     source = plan.discovery.target_volumes[0]
     volume_plan = plan.volumes[0]
     runtime_views = tuple(volume_plan.runtime_views)
+    if any(
+        str(getattr(getattr(view, "runtime_view", None), "family", "")) == "spherical"
+        for view in runtime_views
+    ):
+        raise ValueError(
+            "Spherical QSC views are available for LTA planning and rendering, but production "
+            "mask injection requires qualification for spherical geometry; use "
+            "--enable_cartesian transverse --angle 0 for production execution"
+        )
     if len(runtime_views) != 1:
         raise ValueError(
             "the qualified production mask-injection path currently requires exactly "

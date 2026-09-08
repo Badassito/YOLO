@@ -74,6 +74,7 @@ from .geometry import (
     build_fullframe_raster_plan,
     is_azimuthal_view,
     is_radial_view,
+    is_spherical_view,
     is_tilted_azimuthal_view,
     is_tilted_view,
     mirrored_azimuthal_parent_crop,
@@ -1020,15 +1021,17 @@ def run_prediction_volume_in_openvino_worker(
     cfg: PredictConfig,
     task: Dict[str, object],
 ) -> Dict[str, object]:
-    """Run one CPU-eligible Cartesian/Tilted task into the shared result contract."""
+    """Run one CPU-eligible view task into the shared native result contract."""
     view: ViewInfo = task['view']  # type: ignore[assignment]
     job = task['job']
     kind = str(task['kind'])
+    if is_spherical_view(view) and str(task.get('result_mode', 'file')) == 'd1_owner':
+        raise ValueError('Spherical QSC tasks require native union results for parent projection; D1 is unsupported')
     if is_radial_view(view) and str(task.get('result_mode', 'file')) == 'd1_owner':
         raise ValueError('Radial shell tasks require native union results for parent projection; D1 is unsupported')
     if not cpu_inference_supports_view(view):
         raise ValueError(
-            f'OpenVINO CPU workers support Cartesian and Tilted Cartesian only; got {view.name}'
+            f'OpenVINO CPU workers support Cartesian, Tilted Cartesian, Radial, and Spherical views; got {view.name}'
         )
     if kind not in {'fullframe', 'tile'}:
         raise ValueError(f'Unsupported OpenVINO task kind {kind!r}')
@@ -1313,6 +1316,8 @@ def run_prediction_volume_in_worker(
     kind = str(task['kind'])
     if str(task.get('result_mode', 'file')) == HYBRID_DEFERRED_RESULT_MODE:
         raise ValueError('CUDA worker received an unresolved hybrid full-frame task')
+    if is_spherical_view(view) and str(task.get('result_mode', 'file')) == 'd1_owner':
+        raise ValueError('Spherical QSC tasks require native union results for parent projection; D1 is unsupported')
     if (is_radial_view(view) and str(task.get('result_mode', 'file')) == 'd1_owner'
             and not is_radial_owner_task(task)):
         raise ValueError('Radial shell tasks require native union results for parent projection; D1 is unsupported')

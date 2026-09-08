@@ -102,6 +102,7 @@ from .backprojection import (
     SinkOnlyProjectionResult,
     backproject_azimuthal_volume_to_volume,
     backproject_radial_volume_to_volume,
+    backproject_spherical_volume_to_volume,
     backproject_tilted_volume_to_volume,
 )
 from .outputs import (
@@ -155,7 +156,7 @@ def project_view_volume_to_orthogonal_volume(
     # reduced Cartesian stacks are axis-permuted without expansion. Their resulting
     # orthogonal grid is smaller on exactly the two axes represented by the YOLO plane;
     # the NRRD streamer/final union performs the sole restore to output geometry.
-    if reduced_processing and view.family not in ('azimuthal', 'radial') and not is_tilted_view(view):
+    if reduced_processing and view.family not in ('azimuthal', 'radial', 'spherical') and not is_tilted_view(view):
         if physical_view_name(view) == 'transverse':
             t_dim, h_dim, w_dim = int(source_shape[0]), int(plane_h), int(plane_w)
         elif physical_view_name(view) == 'sagittal':
@@ -194,8 +195,17 @@ def project_view_volume_to_orthogonal_volume(
             projection_block_callback=projection_block_callback, sink_only=sink_only,
         )
 
+    if view.family == 'spherical':
+        return backproject_spherical_volume_to_volume(
+            spherical_mask_mm=view_mask_mm, spherical_view=view, out_path=out_path,
+            desc=desc, prefer_memory=prefer_memory, reserve_bytes=reserve_bytes,
+            workers=workers, out_shape_tyx=out_shape_tyx,
+            known_slice_bboxes=known_slice_bboxes,
+            projection_block_callback=projection_block_callback, sink_only=sink_only,
+        )
+
     if bool(sink_only):
-        raise ValueError(f'{desc}: sink-only projection requires an Azimuthal or Radial view')
+        raise ValueError(f'{desc}: sink-only projection requires an Azimuthal, Radial or Spherical view')
 
     if is_tilted_view(view):
         return backproject_tilted_volume_to_volume(
@@ -372,9 +382,9 @@ def materialize_nrrd_view_layer(
         and tuple(int(v) for v in np.asarray(view_volume_mm).shape[-2:])
         != (int(view.src_h), int(view.src_w))
     )
-    if view.family in ('azimuthal', 'radial') or (is_tilted_view(view) and not reduced_view_layer):
+    if view.family in ('azimuthal', 'radial', 'spherical') or (is_tilted_view(view) and not reduced_view_layer):
         projection_out_shape = final_source_output_shape()
-    if view.family == 'radial' and projection_out_shape is None:
+    if view.family in ('radial', 'spherical') and projection_out_shape is None:
         projection_out_shape = (int(view.full_t), int(view.full_h), int(view.full_w))
     incremental_writer: Optional[IncrementalRawBBoxMaskStoreWriter] = None
     projection_block_callback: Optional[Callable[[int, np.ndarray], None]] = None
@@ -382,7 +392,7 @@ def materialize_nrrd_view_layer(
         'nrrd_layer_key': key,
         'source_raw_path': str(raw_path),
         'source_raw_workspace': 'in_memory_when_available' if bool(transient_projection_in_memory) else 'disk_backed',
-        'projection_payload_fusion': ('cylindrical_shell_sink' if view.family == 'radial' else (
+        'projection_payload_fusion': ('spherical_qsc_shell_sink' if view.family == 'spherical' else 'cylindrical_shell_sink' if view.family == 'radial' else (
             (
                 f'{azimuthal_base_view_name(view)}_tilted_azimuthal_composed_sink'
                 if is_tilted_azimuthal_view(view)
@@ -391,7 +401,7 @@ def materialize_nrrd_view_layer(
             if azimuthal_sink_only_projection_supported(view) else 'dense_projection'
         )),
     }
-    if bool(bbox_store_enabled) and (view.family == 'radial' or azimuthal_sink_only_projection_supported(view)):
+    if bool(bbox_store_enabled) and (view.family in ('radial', 'spherical') or azimuthal_sink_only_projection_supported(view)):
         expected_shape = (
             tuple(int(v) for v in projection_out_shape)
             if projection_out_shape is not None
@@ -1061,7 +1071,7 @@ def materialize_interpolation_component_nrrd_view_layer(
         f'{str(stage)}_walkback{int(interpolation_walk_back_index):02d}_'
         f'candidate{int(interpolation_candidate_index):02d}'
     )
-    if int(added_voxels) <= 0 and view.family != 'radial':
+    if int(added_voxels) <= 0 and view.family not in ('radial', 'spherical'):
         try:
             shape = tuple(int(v) for v in store.shape)
             key = _nrrd_layer_key(

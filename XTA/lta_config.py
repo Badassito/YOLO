@@ -12,12 +12,15 @@ from .config import (
     PostprocessingRequest,
     AzimuthalViewRequest,
     RadialViewRequest,
+    SphericalViewRequest,
     TiltedViewGroup,
     resolve_cartesian_views,
     resolve_postprocessing_options,
     resolve_azimuthal_view_requests,
     resolve_radial_view_requests,
     parse_radial_min_radius,
+    resolve_spherical_view_requests,
+    parse_spherical_min_radius,
     resolve_tilted_view_groups,
     resolve_tta_angles,
 )
@@ -59,6 +62,7 @@ class LtaConfig:
     save: LtaSaveRequest
     postprocessing: PostprocessingRequest
     radial_requests: Tuple[RadialViewRequest, ...] = ()
+    spherical_requests: Tuple[SphericalViewRequest, ...] = ()
 
     @property
     def has_physical_views(self) -> bool:
@@ -72,7 +76,7 @@ class LtaConfig:
         return any(
             not str(request.view).startswith("tilted_")
             or str(request.view)[len("tilted_") :] in tilted_bases
-            for request in (*self.azimuthal_requests, *self.radial_requests)
+            for request in (*self.azimuthal_requests, *self.radial_requests, *self.spherical_requests)
         )
 
 
@@ -198,6 +202,22 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         help="Minimum shell radius; auto selects 1008/(4*pi), two wraps per patch",
     )
     parser.add_argument(
+        "--enable_spherical", nargs="+", default=None, metavar="VIEW",
+        help=(
+            "Planned dense QSC spherical-shell views with 1008-pixel patches; accepts "
+            "the six Radial view tokens. Upright aliases share one cube and tilted "
+            "aliases share each direction/angle rotation. Production execution is not yet connected"
+        ),
+    )
+    parser.add_argument(
+        "--spherical_min_radius", default=None, type=parse_spherical_min_radius,
+        metavar="RADIUS|auto",
+        help=(
+            "Minimum spherical radius; auto independently selects 1008/(4*pi). "
+            "Dense shells end at (min(T,H,W)-1)/2 and exclude the central core"
+        ),
+    )
+    parser.add_argument(
         "--enable_tilted",
         nargs="+",
         default=None,
@@ -279,6 +299,7 @@ def resolve_lta_config(args: argparse.Namespace) -> LtaConfig:
         cartesian_views=tuple(resolve_cartesian_views(args.enable_cartesian)),
         azimuthal_requests=tuple(resolve_azimuthal_view_requests(args.enable_azimuthal)),
         radial_requests=tuple(resolve_radial_view_requests(args.enable_radial)),
+        spherical_requests=tuple(resolve_spherical_view_requests(args.enable_spherical)),
         tilted_groups=tuple(resolve_tilted_view_groups(args.enable_tilted)),
         tiles=tuple(resolve_tile_groups(args.enable_tile)),
         angles=tuple(float(value) for value in resolve_tta_angles(args.angle)),
@@ -288,7 +309,7 @@ def resolve_lta_config(args: argparse.Namespace) -> LtaConfig:
     if not config.has_physical_views:
         raise ValueError(
             "No LTA inference views are active. Enable at least one view with "
-            "--enable_cartesian, --enable_tilted, --enable_azimuthal, or --enable_radial; "
+            "--enable_cartesian, --enable_tilted, --enable_azimuthal, --enable_radial, or --enable_spherical; "
             "--enable_tile does not create a parent view"
         )
     return config

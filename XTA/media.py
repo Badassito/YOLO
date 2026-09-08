@@ -429,6 +429,8 @@ def decode_video_to_memmap_gray8(
     finally:
         if proc.stdout:
             proc.stdout.close()
+            # Windows communicate() otherwise starts a reader for this closed pipe.
+            proc.stdout = None
         _, err = proc.communicate()
         if proc.returncode not in (0, None):
             msg = err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
@@ -530,6 +532,8 @@ def decode_video_to_memmap_gray8_streaming(
                 try:
                     if proc.stdout:
                         proc.stdout.close()
+                        # Keep stderr attached, but do not reread the consumed stdout.
+                        proc.stdout = None
                     _out, err = proc.communicate()
                     if proc.returncode not in (0, None):
                         msg = err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)

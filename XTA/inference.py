@@ -3934,6 +3934,14 @@ def predict_source_and_accumulate(
                 prediction_count = int(specialized_stats['prediction_count'])
                 frames_with_predictions = int(specialized_stats['frames_with_predictions'])
 
+        if bool(require_proto_hole_treatment) and specialized_stats is None:
+            # A legacy D1 task owns no host union. Reject a declined TensorRT
+            # ring before generic results address its shape-only placeholder.
+            raise RuntimeError(
+                f'{source_label}: D1 requires the resident TensorRT ring so D3 proto '
+                'topology treatment occurs before backprojection'
+            )
+
         source_padding_count = max(0, int(getattr(source, 'azimuthal_padding_count', 0) or 0))
         effective_slice_locks = slice_locks
         if effective_slice_locks is None and source_padding_count > 0:

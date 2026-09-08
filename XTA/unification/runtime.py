@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence, Tuple
 
-from XTA.config import AzimuthalViewRequest, RadialViewRequest, TiltedViewGroup
+from XTA.config import AzimuthalViewRequest, RadialViewRequest, SphericalViewRequest, TiltedViewGroup
 from XTA.geometry import ViewInfo, get_view_infos, azimuthal_target_diameter
 from XTA.media import resolve_azimuthal_azimuth_angles
 
@@ -24,6 +24,7 @@ class CompiledPhysicalViews:
     azimuthal_diameters: Tuple[int, ...]
     azimuthal_azimuth_angles: Tuple[float, ...]
     radial_targets: Tuple[str, ...] = ()
+    spherical_targets: Tuple[str, ...] = ()
 
 
 def compile_physical_views(
@@ -38,6 +39,9 @@ def compile_physical_views(
     radial_requests: Sequence[RadialViewRequest] = (),
     radial_min_radius: float | None = None,
     radial_patch_size: int = 3072,
+    spherical_requests: Sequence[SphericalViewRequest] = (),
+    spherical_min_radius: float | None = None,
+    spherical_patch_size: int = 0,
 ) -> CompiledPhysicalViews:
     """Compile grouped view requests through the authoritative TTA geometry.
 
@@ -48,6 +52,7 @@ def compile_physical_views(
 
     azimuthal_targets = tuple(str(request.view) for request in azimuthal_requests)
     radial_targets = tuple(str(request.view) for request in radial_requests)
+    spherical_targets = tuple(str(request.view) for request in spherical_requests)
     azimuthal_diameters = tuple(
         int(azimuthal_target_diameter(target, int(t_dim), int(height), int(width)))
         for target in azimuthal_targets
@@ -72,6 +77,9 @@ def compile_physical_views(
             radial_views=radial_targets,
             radial_min_radius=radial_min_radius,
             radial_patch_size=int(radial_patch_size),
+            spherical_views=spherical_targets,
+            spherical_min_radius=spherical_min_radius,
+            spherical_patch_size=int(spherical_patch_size),
         )
     )
     return CompiledPhysicalViews(
@@ -80,6 +88,7 @@ def compile_physical_views(
         azimuthal_diameters=azimuthal_diameters,
         azimuthal_azimuth_angles=azimuthal_angles,
         radial_targets=radial_targets,
+        spherical_targets=spherical_targets,
     )
 
 

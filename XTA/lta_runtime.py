@@ -92,7 +92,7 @@ class LtaRuntimeViewPlan:
     runtime_view: object | None = field(default=None, repr=False, compare=False)
 
     def manifest_record(self) -> dict[str, object]:
-        from .unification.tta_manifest import radial_view_manifest_record
+        from .unification.tta_manifest import radial_view_manifest_record, spherical_view_manifest_record
 
         return {
             "volume_id": self.volume_id,
@@ -118,6 +118,7 @@ class LtaRuntimeViewPlan:
             ],
             "raster_plan_digest": self.raster_plan_digest,
             "radial_geometry": radial_view_manifest_record(self.runtime_view),
+            "spherical_geometry": spherical_view_manifest_record(self.runtime_view),
         }
 
 
@@ -374,7 +375,7 @@ def build_lta_run_plan(
         raise ValueError("run_id must not be empty")
     volume_plans = []
     from .unification.sampling import build_forward_raster_plan
-    from .unification.tta_manifest import radial_view_plan_metadata
+    from .unification.tta_manifest import radial_view_plan_metadata, spherical_view_plan_metadata
     for volume in discovery.target_volumes:
         if volume.width is None or volume.height is None:
             raise RuntimeError(
@@ -392,6 +393,9 @@ def build_lta_run_plan(
             radial_requests=config.radial_requests,
             radial_min_radius=config.args.radial_min_radius,
             radial_patch_size=1008,
+            spherical_requests=config.spherical_requests,
+            spherical_min_radius=config.args.spherical_min_radius,
+            spherical_patch_size=1008,
         )
         physical_views = tuple(getattr(compiled, "views"))
         variants = tuple(variant_expander(physical_views, config.angles))
@@ -434,6 +438,7 @@ def build_lta_run_plan(
                     "channel_policy": LTA_CHANNEL_POLICY,
                     "runtime_kind": "fullframe_sam",
                     **radial_view_plan_metadata(physical),
+                    **spherical_view_plan_metadata(physical),
                 },
             )
             runtime_plans.append(

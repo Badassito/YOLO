@@ -19,9 +19,9 @@ GIB = 1024 ** 3
 
 NRRD_SPACE = "left-posterior-superior"
 
-SCRIPT_VERSION = '20.0.3'
+SCRIPT_VERSION = '21.0.0'
 
-SCRIPT_VERSION_COMPACT = '2003'
+SCRIPT_VERSION_COMPACT = '2100'
 
 SCRIPT_BASENAME = f'GPT-6-Astra-Ultra_v{SCRIPT_VERSION}_SLURM.py'
 
@@ -275,6 +275,8 @@ AZIMUTHAL_VIEW_TOKENS: Tuple[str, ...] = (
 
 RADIAL_VIEW_TOKENS: Tuple[str, ...] = AZIMUTHAL_VIEW_TOKENS
 
+SPHERICAL_VIEW_TOKENS: Tuple[str, ...] = RADIAL_VIEW_TOKENS
+
 TILT_DIRECTION_TOKENS: Tuple[str, ...] = ('vertical', 'horizontal', 'both')
 
 @dataclass(frozen=True)
@@ -287,6 +289,12 @@ class AzimuthalViewRequest:
 @dataclass(frozen=True)
 class RadialViewRequest:
     """One cylindrical-shell target, sampled densely from its minimum radius."""
+
+    view: str
+
+@dataclass(frozen=True)
+class SphericalViewRequest:
+    """One QSC cube target; equivalent base aliases share its shell trajectories."""
 
     view: str
 
@@ -362,6 +370,31 @@ def parse_radial_min_radius(value: str | float | None) -> Optional[float]:
         raise argparse.ArgumentTypeError('--radial_min_radius must be positive or auto') from exc
     if not math.isfinite(radius) or radius <= 0.0:
         raise argparse.ArgumentTypeError('--radial_min_radius must be finite and > 0 or auto')
+    return radius
+
+
+def resolve_spherical_view_requests(
+    values: Sequence[str] | str | None,
+) -> List[SphericalViewRequest]:
+    """Resolve shell targets while retaining aliases for canonical cube planning."""
+    return [
+        SphericalViewRequest(view=view)
+        for view in _resolve_unique_view_tokens(
+            values, valid=SPHERICAL_VIEW_TOKENS, flag_name='--enable_spherical'
+        )
+    ]
+
+
+def parse_spherical_min_radius(value: str | float | None) -> Optional[float]:
+    """Accept an independent finite positive spherical radius or auto."""
+    if value is None or str(value).strip().lower() == 'auto':
+        return None
+    try:
+        radius = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError('--spherical_min_radius must be positive or auto') from exc
+    if not math.isfinite(radius) or radius <= 0.0:
+        raise argparse.ArgumentTypeError('--spherical_min_radius must be finite and > 0 or auto')
     return radius
 
 def _structured_group_values(
@@ -896,8 +929,8 @@ def build_argparser() -> argparse.ArgumentParser:
             "uses neighboring view slices in ascending offset order. Azimuthal and Tilted "
             "Azimuthal indices wrap; after an odd number of 0/180-degree seam crossings, "
             "the contextual plane's radius (u) axis is reversed. Cartesian and Tilted "
-            "Cartesian indices edge-clamp. Radial indices clamp to the radius range "
-            "of the same periodic patch. "
+            "Cartesian indices edge-clamp. Radial and Spherical indices clamp to the radius range "
+            "of the same native patch trajectory. "
             "Only one value is accepted and every prediction remains assigned to N"
         ),
     )
@@ -1001,6 +1034,26 @@ def build_argparser() -> argparse.ArgumentParser:
             "Smallest Radial shell radius in source voxels. Default auto is "
             "imgsz/(4*pi), giving two complete circumference wraps per patch. "
             "Sampling is dense from this radius outward; the central core is excluded"
+        ),
+    )
+    p.add_argument(
+        "--enable_spherical", nargs="+", default=None, type=str, metavar="VIEW",
+        help=(
+            "Enable dense spherical shells using six Quadrilateralized Spherical Cube (QSC) "
+            "faces. Accepts transverse, sagittal, coronal, tilted_transverse, "
+            "tilted_sagittal, tilted_coronal. Upright base aliases share one cube; "
+            "tilted aliases share a rotated cube for each enabled tilt direction and "
+            "signed angle. Radius is the slice direction; --imgsz defines square face "
+            "patches, with optional tiles sampled inside those patches"
+        ),
+    )
+    p.add_argument(
+        "--spherical_min_radius", default=None, type=parse_spherical_min_radius,
+        metavar="RADIUS|auto",
+        help=(
+            "Smallest Spherical shell radius in source voxels. Auto independently selects "
+            "imgsz/(4*pi), even when --radial_min_radius is explicit. Dense shells extend "
+            "through (min(T,H,W)-1)/2; the central core is excluded"
         ),
     )
     p.add_argument(

@@ -1,6 +1,6 @@
 # XTA architecture
 
-`GPT-6-Astra-Ultra_v20.0.3_SLURM.py` is the sole versioned launcher. It, the
+`GPT-6-Astra-Ultra_v21.0.0_SLURM.py` is the sole versioned launcher. It, the
 installed `xta` console script, and `python -m XTA` all dispatch
 through `XTA.cli.run()`.
 The implementation lives in the importable `XTA` package so spawned processes
@@ -21,6 +21,74 @@ Main v20.0.1 promotes the completed v20.0.4 source from
 release. The development v20.0.1 through v20.0.3 changes are included in main
 v20.0.1 without separate main releases. Version references in the correction
 history below retain their development branch numbering.
+
+## Spherical view family (v21)
+
+`--enable_spherical VIEWS` adds concentric spherical shells to TTA and fully
+labeled PTA. It accepts the same six base/tilted tokens as Radial. Upright
+Transverse, Sagittal and Coronal requests compile to one canonical QSC cube;
+each requested alias remains recorded in the manifest. Tilted base aliases
+likewise share one cube for each direction and signed angle. Different tilt
+groups remain distinct, even when cube symmetry could otherwise identify them.
+
+Spherical tilts are rigid rotations of the cube charts, not Cartesian shears.
+Coordinates use X=source columns, Y=source rows, Z=source stack. A positive
+vertical tilt rotates about +X; a positive horizontal tilt rotates about -Y.
+This convention is independent of the requested base alias. The source sphere
+stays centered at `((W-1)/2,(H-1)/2,(T-1)/2)` in the working volume, with maximum
+radius `(min(T,H,W)-1)/2`. The existing final native-shape restoration remains
+authoritative, including deferred T-axis reconstruction.
+
+`--spherical_min_radius auto` independently resolves to `imgsz/(4*pi)` working
+voxels. Setting `--radial_min_radius` does not affect it. Positive finite minima
+are required; radii include both annular endpoints with gaps no larger than one
+voxel. The excluded central core is not reconstructed by spherical masks.
+
+The chart is the true equal-area O'Neill-Laubscher QSC used by
+[PROJ](https://proj.org/en/stable/operations/projections/qsc.html), rather than
+the approximate COBE cube or a gnomonic cube. `XTA/qsc.py` keeps this unit-sphere
+map independent of the source-volume pose, providing an extension point for
+future ellipsoid adapters without claiming generalized ellipsoid support now.
+
+Every face uses a fixed endpoint-inclusive grid sized for the outer radius R:
+choose the smallest even interval count `n >= 3*sqrt(R*(R+1/2))`, then sample
+`n+1` nodes across each face axis. Fixed `imgsz` square patches cover that grid,
+overlapping the final patch where necessary; small faces are centered with zero
+padding. These intrinsic patches are not Tiles. Optional Tiles remain samples
+inside a patch, and channels/interpolation clamp radius within the same fixed
+face/patch trajectory. Faces, edges and corners use consistent QSC frames;
+incident closed faces and overlapping patches contribute by ordinary mask OR.
+
+The density guarantee is analytical: the QSC inverse has conservative Euclidean
+Lipschitz bound 5/3. The chosen grid and radial spacing put every working-voxel
+center in the annulus within squared distance at most `281/324 < 1` of a native
+sample, so it has positive trilinear input weight. Tests enumerate those actual
+taps on odd/even/thin volumes and rotated cubes. This is a native intensity
+sampling guarantee; categorical labels remain nearest-neighbor and later TTA
+affines follow the existing forward sampling policy. Inner shells deliberately
+oversample relative to the outer sphere. A future maximum-spacing control in
+working voxels could jointly set radial and face spacing; v21 exposes no sparse
+density setting.
+
+CUDA native rendering caches bounded float64 QSC directions and preserves
+logical-T gray8 rounding before affine transforms. Source backprojection uses
+direct float64 QSC geometry on CUDA, followed by the established compact
+raw/packbits publication contract. The bounded CPU reference remains available
+with `YOLO_TTA_GPU_SPHERICAL_BACKPROJECT=0`, or when device admission is unavailable.
+The native renderer has a resident Torch fallback and can be opted out with
+`YOLO_TTA_GPU_SPHERICAL_NATIVE_KERNEL=0`. Inference priority and source ownership
+rules are unchanged. Spherical views do not enter legacy D1/Radial owner kernels.
+
+The shared LTA planner and low-level renderers record spherical geometry, while
+LTA production execution retains its existing single-Transverse restriction and
+rejects spherical requests explicitly. PTA partial-label and encoded-gap paths
+retain their Cartesian-only labeling policy.
+
+Functional CUDA checks cover native rendering, native-T restoration, direct
+backprojection over hundreds of geometry cases, compact CVOL publication, and
+uncropped source addresses beyond 4 GiB. `tools/qualify_spherical_large_address.py`
+records the latter without benchmarking. Generated v21 evidence and release
+artifacts live under `Scratch/Experiments/Spherical`, outside the repository.
 
 ## Cylindrical view family (v20)
 
@@ -960,7 +1028,7 @@ one-versus-four-device scheduling and final bytes are covered by deterministic s
 representative H100 execution remains a hardware qualification step:
 
 ```bash
-python -u GPT-6-Astra-Ultra_v20.0.3_SLURM.py \
+python -u GPT-6-Astra-Ultra_v21.0.0_SLURM.py \
   --mode lta \
   --input <target-video> \
   --exemplar <aligned-image-yolo-directory> \

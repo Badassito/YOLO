@@ -209,11 +209,23 @@ def load_component_replay(path: Path) -> ComponentProjectionReplay:
         if not file.is_relative_to(root) or file.stat().st_size != int(record['bytes']) or _digest(file) != record['sha256']:
             raise ValueError(f'Component replay payload checksum mismatch: {relative}')
     view_fields = {field.name for field in fields(ViewInfo)}
-    if set(value['view']) != view_fields:
+    supplied_fields = set(value['view'])
+    missing_fields = view_fields - supplied_fields
+    spherical_defaults = {field.name: field.default for field in fields(ViewInfo)
+                          if field.name.startswith('spherical_')}
+    if (supplied_fields - view_fields or missing_fields - spherical_defaults.keys()
+            or (missing_fields and value['view'].get('family') == 'spherical')):
         raise ValueError('Component replay ViewInfo fields differ from this runtime')
     view_data = dict(value['view'])
+    # Existing v1 captures predate the additive spherical ViewInfo fields.
+    # Their geometry remains fully specified; a spherical capture must include
+    # all its own fields rather than silently inventing a missing chart.
+    view_data.update({name: spherical_defaults[name] for name in missing_fields})
     view_data['azimuths_deg'] = tuple(float(angle) for angle in view_data['azimuths_deg'])
     view_data['radial_radii'] = tuple(float(radius) for radius in view_data['radial_radii'])
+    view_data['spherical_radii'] = tuple(float(radius) for radius in view_data['spherical_radii'])
+    view_data['spherical_request_tokens'] = tuple(str(token) for token in view_data['spherical_request_tokens'])
+    view_data['spherical_rotation_xyz'] = tuple(float(value) for value in view_data['spherical_rotation_xyz'])
     view = ViewInfo(**view_data)
     output_shape = tuple(int(dimension) for dimension in value['out_shape_tyx'])
     if len(output_shape) != 3 or min(output_shape) <= 0:

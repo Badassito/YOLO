@@ -8547,5 +8547,1400 @@
         "current_name": "azimuthal_source_mode"
       }
     ]
+  },
+  "v21_review": {
+    "release": "21.0.0",
+    "definitions": [
+      {
+        "module": "assembly",
+        "name": "materialize_interpolation_component_nrrd_view_layer",
+        "sha256": "52e948b77193f4f294b60dc7bc8de8bcda8621aed882e41cd2e9ad3add364692",
+        "previous_sha256": "980b20c0d4d9f76d2de8e990e6afb336ab5a68cd8c09cfac74423afbaed79194",
+        "reason": "Route native spherical masks into bounded source projection and incremental NRRD sinks with existing fatal cleanup."
+      },
+      {
+        "module": "assembly",
+        "name": "materialize_nrrd_view_layer",
+        "sha256": "b44e3117809c42726447a774946174e413effb5e6346c8d5407021f10c819188",
+        "previous_sha256": "487f1f3d7a8af4456500621fb6e18ccf2b791967b93851267b12b23d0eeb4f81",
+        "reason": "Route native spherical masks into bounded source projection and incremental NRRD sinks with existing fatal cleanup."
+      },
+      {
+        "module": "assembly",
+        "name": "project_view_volume_to_orthogonal_volume",
+        "sha256": "37b0fdad061707d9547f7eccfda63699596bd43392abc0b50f933109d5e6ac5b",
+        "previous_sha256": "75a39a1f829c04ed66d55c9da77ebcfc41df8a5bd12c1690874f16c100e5975e",
+        "reason": "Route native spherical masks into bounded source projection and incremental NRRD sinks with existing fatal cleanup."
+      },
+      {
+        "module": "backprojection",
+        "name": "HybridBackprojectionQueue",
+        "sha256": "e34eb782393f59f1d3f352b10c1b2c8756eb1297f52362e24dbda37580e4b446",
+        "previous_sha256": "da6d074288b5d53ceca2253d08acfc6415cac69dc0848adfe37dc4727ac83c72",
+        "reason": "Add bounded spherical source-projection dispatch to the shared queue."
+      },
+      {
+        "module": "backprojection",
+        "name": "backproject_spherical_volume_to_volume",
+        "sha256": "78e928b106c4edf9289240a4995ac0b0f86bcc8950f4fcb893f3de407609b34d",
+        "previous_sha256": null,
+        "reason": "Add bounded spherical source-projection dispatch to the shared queue."
+      },
+      {
+        "module": "component_replay",
+        "name": "load_component_replay",
+        "sha256": "fa181bdbe4254ab7dc45b45fb463ff344dbe7da05b9fc3e1484660a5da3932ea",
+        "previous_sha256": "1d1e6b59bd319436f2caea13a4dcef175152afac8dffafbcd73e24ad7c091e59",
+        "reason": "Restore spherical tuple fields, supply only additive defaults to historical non-spherical captures and reject incomplete spherical captures."
+      },
+      {
+        "module": "config",
+        "name": "SphericalViewRequest",
+        "sha256": "1abe50c04c0814b173cd9bd53eb804683253ac070719aab5e7978cc0dcfd0d59",
+        "previous_sha256": null,
+        "reason": "Add strict independent Spherical request/radius grammar, channel help and v21 constants."
+      },
+      {
+        "module": "config",
+        "name": "build_argparser",
+        "sha256": "3275a114f2bea438bac7200c39da7fa04fa84b238d6ba5bec9b99b91dddc607e",
+        "previous_sha256": "3a1b6bcf8d32df21e022444e3fb1132ee04e94c26135ff042b95756ce20fca45",
+        "reason": "Add strict independent Spherical request/radius grammar, channel help and v21 constants."
+      },
+      {
+        "module": "config",
+        "name": "parse_spherical_min_radius",
+        "sha256": "ec677f664016c76065edb65451933b2ec36d3bddcf5ce090ccb1b58b931b7abe",
+        "previous_sha256": null,
+        "reason": "Add strict independent Spherical request/radius grammar, channel help and v21 constants."
+      },
+      {
+        "module": "config",
+        "name": "resolve_spherical_view_requests",
+        "sha256": "b7d4d205da8045f0bd2e7e3613140ee247c4603a9912a212aa7f06b39afb874d",
+        "previous_sha256": null,
+        "reason": "Add strict independent Spherical request/radius grammar, channel help and v21 constants."
+      },
+      {
+        "module": "cuda_backend",
+        "name": "GpuRenderedYoloSource",
+        "sha256": "50604c99c95c518c493acd48285ce0b289d58802274e473eaaeec022fa9ce990",
+        "previous_sha256": "06800a1cb5090900686fe27591222e83224c194ec5f5433c04d3a364fa6c45dc",
+        "reason": "Use a dedicated bounded spherical renderer/cache and reject incompatible fused/ring paths; preserve Radial mathematics."
+      },
+      {
+        "module": "cuda_backend",
+        "name": "GpuTileRenderedYoloSource",
+        "sha256": "579248dc8f0e396372e97162265d435710946105260f610d265ccb6db0909ae9",
+        "previous_sha256": "228b986e032bc1b6fb0433d93aaba7e0a5a3588c8dc652a5bca8007794f9b705",
+        "reason": "Use a dedicated bounded spherical renderer/cache and reject incompatible fused/ring paths; preserve Radial mathematics."
+      },
+      {
+        "module": "cuda_backend",
+        "name": "_GpuWorkerRenderEngine",
+        "sha256": "a442c02aebdd4a2f40d310d838f89d7e522cd828ff1af4166d5275f26703aa39",
+        "previous_sha256": "369e578af8e515cc079c738f58d91518a06a6e834e1f55d74533dffad1ea4d35",
+        "reason": "Use a dedicated bounded spherical renderer/cache and reject incompatible fused/ring paths; preserve Radial mathematics."
+      },
+      {
+        "module": "cuda_backend",
+        "name": "_fused_preflight_family",
+        "sha256": "d0f15fc7081b74065b02c6349f0852444bf54abfe352b9b538b8e4f8aea66ba5",
+        "previous_sha256": "7543d6727bbe5978c32a0e2f978f9560c83beb092fa334e6b9b98aacd687f6b4",
+        "reason": "Use a dedicated bounded spherical renderer/cache and reject incompatible fused/ring paths; preserve Radial mathematics."
+      },
+      {
+        "module": "cuda_d1",
+        "name": "_d1_get_or_create_state",
+        "sha256": "adaf5719a04491044093ad6a1e3b383c8943e093c72d2b20f984b44efafa91d9",
+        "previous_sha256": "37cff0c7bc9c3e636a5fe68f5bc75fd180835667ab091371dce8a132db5ce6cf",
+        "reason": "Reject Spherical before unsupported D1 kernel and state ownership."
+      },
+      {
+        "module": "cuda_d1",
+        "name": "_d1_view_family_ids",
+        "sha256": "d0d326ab0dedb55b77f3a386c63f14692a5c33aae019a3959ee2ec4160ee0a58",
+        "previous_sha256": "e9c75f246b0b9b6102d6758f0c917ef9ea0de1a1a997bfd7716b047e74ff43df",
+        "reason": "Reject Spherical before unsupported D1 kernel and state ownership."
+      },
+      {
+        "module": "geometry",
+        "name": "ViewInfo",
+        "sha256": "53d5733948a33303647027f8009987bf5aacda115a237c25cac7c831bcbb083e",
+        "previous_sha256": "698023677c765317066783bf66b23a0d618d2cc37b315ffe8148255c0124306a",
+        "reason": "Add QSC metadata, canonical compilation, output identity, source extraction and raster plans while preserving old-family mathematics."
+      },
+      {
+        "module": "geometry",
+        "name": "build_dense_tile_raster_plan",
+        "sha256": "ab93d0470091be111c6ec1d61f2b6bfba66cef119b253d2ab39e60811d5dcd45",
+        "previous_sha256": "7f76a3043fc5613c6792d11099755a1677356af7430cbb9d4cbd09a2ad1afafe",
+        "reason": "Add QSC metadata, canonical compilation, output identity, source extraction and raster plans while preserving old-family mathematics."
+      },
+      {
+        "module": "geometry",
+        "name": "build_fullframe_raster_plan",
+        "sha256": "3bac6e08eee710ff73f4706b15133eac236539a278a28a3b24ecad1abdd33021",
+        "previous_sha256": "915d2c2bcb1e6fb248baf92476f75a85b25e2e97c0ac9ba793075baeeee0fc6a",
+        "reason": "Add QSC metadata, canonical compilation, output identity, source extraction and raster plans while preserving old-family mathematics."
+      },
+      {
+        "module": "geometry",
+        "name": "get_categorical_view_frame_by_index",
+        "sha256": "55a2f66df6c9ec7eda7dda03f5dfa791d1021d149883476ad8a6909ba4420870",
+        "previous_sha256": "90eb7add085681cac25dce9bb36f642f76eec8a14025515bf8e4fb0bcccc8c92",
+        "reason": "Add QSC metadata, canonical compilation, output identity, source extraction and raster plans while preserving old-family mathematics."
+      },
+      {
+        "module": "geometry",
+        "name": "get_view_frame_by_index",
+        "sha256": "627022f925234423a27865d4dcecfa211194e367f2f2edf076fc6a3a8ee48f51",
+        "previous_sha256": "9459aacb1f573c141b78224b6ca3be8596dabe93050f9e74574e04143cfca6d0",
+        "reason": "Add QSC metadata, canonical compilation, output identity, source extraction and raster plans while preserving old-family mathematics."
+      },
+      {
+        "module": "geometry",
+        "name": "get_view_infos",
+        "sha256": "a2eb488112197d3617632bd5beefced728e943aa08dc5c28141a1a491065578c",
+        "previous_sha256": "f77b27e9a095317082509cb8bd88f5a98dd561d3818ae74a351340ed9511c116",
+        "reason": "Add QSC metadata, canonical compilation, output identity, source extraction and raster plans while preserving old-family mathematics."
+      },
+      {
+        "module": "geometry",
+        "name": "is_spherical_view",
+        "sha256": "f9d45cd0647944d6a65827cca5b63c28c248d1a787bbb2ab12329497840f18e2",
+        "previous_sha256": null,
+        "reason": "Add QSC metadata, canonical compilation, output identity, source extraction and raster plans while preserving old-family mathematics."
+      },
+      {
+        "module": "geometry",
+        "name": "view_output_token",
+        "sha256": "d4a3448907b48851663f6dcbab61f2b42b494d22305e68c0970b9dd57195c427",
+        "previous_sha256": "d4b65eef0239cccad875fc7906131975aea307b033653b6d982c4a864a00002c",
+        "reason": "Add QSC metadata, canonical compilation, output identity, source extraction and raster plans while preserving old-family mathematics."
+      },
+      {
+        "module": "geometry",
+        "name": "write_aug_job_meta",
+        "sha256": "775e61a5fd0f3bc962fdb0e50a3e757764b66965c9bc4ecd6aca33398dcaa76b",
+        "previous_sha256": "dfa4404ab46fb07a704ccc547cb01b77e08942fedae3103761b9c28b6aa3dd0a",
+        "reason": "Add QSC metadata, canonical compilation, output identity, source extraction and raster plans while preserving old-family mathematics."
+      },
+      {
+        "module": "inference",
+        "name": "predict_source_and_accumulate",
+        "sha256": "99ca4d32238e6c6915ee2e2815b9b65d83a664eb3416a2652ff883d7d3be2601",
+        "previous_sha256": "28eec86038df26fe016c533232272e809cf340c62a8acc83a262fac84d190308",
+        "reason": "Reject a declined resident TensorRT ring when D1 requires proto-hole treatment, before generic predictions can address its shape-only host placeholder."
+      },
+      {
+        "module": "inference_backends/descriptors",
+        "name": "cuda_local_capabilities",
+        "sha256": "4ff3d87528acb9cbd0e046828fcd174bdf5027082970afdab0c0d29f2e60848a",
+        "previous_sha256": "7083323a7df56f0bca07bc6e73953bb3847bb74d7e401c9ca2844ad3556f596a",
+        "reason": "Declare native Spherical support in the existing inference backend contracts."
+      },
+      {
+        "module": "inference_backends/descriptors",
+        "name": "openvino_local_capabilities",
+        "sha256": "7b914a3e7a63ba4d1971f46e8e169d3eae0f6e7eed6fedbd741cdc54af8a12f6",
+        "previous_sha256": "34b55cde49038385f01d05ac5bc84df85ebf17c212fc2dd68650c1429769bcbe",
+        "reason": "Declare native Spherical support in the existing inference backend contracts."
+      },
+      {
+        "module": "interpolation",
+        "name": "_view_uses_interpolation",
+        "sha256": "02d942c4943a2eaf73e0dce1cb4c9c3a55b71fb5ea9e9bcf9d29a03183107b2d",
+        "previous_sha256": "bef22390c1d652d4e07a88261acd5ea5d16685f4c11517e7aad08e87e46e2ff5",
+        "reason": "Allow existing interpolation inside each fixed spherical radius trajectory."
+      },
+      {
+        "module": "lta_config",
+        "name": "LtaConfig",
+        "sha256": "bce46b366622a61dd55ed62b32cb4678dd88062384fa0f58efc61ace7575cb13",
+        "previous_sha256": "6b775424eadcae3fd69c470fc35cd7f60ae1731135baf54a339201a1229b1869",
+        "reason": "Expose spherical planning grammar and independent fixed-1008 minimum without claiming production inference support."
+      },
+      {
+        "module": "lta_config",
+        "name": "build_lta_argparser",
+        "sha256": "02b48d5eaef8be07beebf7811de90390c69df4b0239b7df6a4c551d5b35ee758",
+        "previous_sha256": "fffcdaa7c477ea59f6d444b0f24127bf1e13b5c5ea8e797fdd088d9dce58ddd6",
+        "reason": "Expose spherical planning grammar and independent fixed-1008 minimum without claiming production inference support."
+      },
+      {
+        "module": "lta_config",
+        "name": "resolve_lta_config",
+        "sha256": "3aee2bd37416d62277a1f84999a8a6fd9aa6a633c2c50e95c99339fa524146ee",
+        "previous_sha256": "1cd15746f818022a1aa9ae009e8673630d6f1c5dad46265baf80d66bb2251a14",
+        "reason": "Expose spherical planning grammar and independent fixed-1008 minimum without claiming production inference support."
+      },
+      {
+        "module": "lta_execution",
+        "name": "_require_supported_runtime",
+        "sha256": "ac45eaa6545bb8c928f567303c79652c39ce281be24c23e9611ac635d1c50f4d",
+        "previous_sha256": "71d5ca93f90004294447486645dca8484ee6ed8af35880c1951c9d400e55ca80",
+        "reason": "Explicitly reject unqualified spherical production mask injection."
+      },
+      {
+        "module": "lta_rendering",
+        "name": "build_lta_rendered_view",
+        "sha256": "e8f9fa69eefcd988ea728815d9d0c8ccfcb89512b7b496bc84a964edb4fd9069",
+        "previous_sha256": "d6afa1f9ac8ef0620f837b18b63ca43417f2b93a63ce0b6ba1093643ca972b02",
+        "reason": "Retain QSC geometry in canonical low-level LTA RGB raster plans."
+      },
+      {
+        "module": "lta_runtime",
+        "name": "LtaRuntimeViewPlan",
+        "sha256": "e72f1446fa37d1ec1f0467efd0b480f0d477b86d794a1bd1934f422645c401c6",
+        "previous_sha256": "2b751f2466f36cd4c3f70355d901082779fa97c89a922ad2b08336e394913635",
+        "reason": "Compile canonical QSC LTA plans and retain exact geometry in manifests, sessions and plan identities."
+      },
+      {
+        "module": "lta_runtime",
+        "name": "build_lta_run_plan",
+        "sha256": "1bc47f542fad172e91a19a21405a0827ffa8cf1dd30004b4aa9f4756646bbb88",
+        "previous_sha256": "ba407cf9eb137465cf84d0f99938a54a67da337060a48275829b95b1051ce144",
+        "reason": "Compile canonical QSC LTA plans and retain exact geometry in manifests, sessions and plan identities."
+      },
+      {
+        "module": "media",
+        "name": "decode_video_to_memmap_gray8",
+        "sha256": "db9759b60298cd9f89ae3ccb11e6279f4b714ce63a0e542a195c19623d5c34d6",
+        "previous_sha256": "04ead2c666b759e4437a442b6a89399698363fc9faf2c1a62e64e909e41ffdbb",
+        "reason": "Detach consumed closed FFmpeg stdout before Windows communicate while retaining stderr and return-code checks."
+      },
+      {
+        "module": "media",
+        "name": "decode_video_to_memmap_gray8_streaming",
+        "sha256": "2051879c56150771e1b52cc5cbe0089e78f411c890d5fdad3dacabde2a548ae6",
+        "previous_sha256": "1cf2f960ce768482e08468f3358e5498fe50ebe83693589ed6c774915058a40e",
+        "reason": "Detach consumed closed FFmpeg stdout before Windows communicate while retaining stderr and return-code checks."
+      },
+      {
+        "module": "pipeline",
+        "name": "_legacy_d1_model_supported",
+        "sha256": "b4ff5863e0688d7048809d8ac81439ff758ab4e1cef2a15d3c3c6ca80ba4f62c",
+        "previous_sha256": null,
+        "reason": "Require a TensorRT .engine artifact for the legacy D1 proto-topology ring; other formats retain native task unions and Radial owner eligibility remains independent."
+      },
+      {
+        "module": "pipeline",
+        "name": "_main_impl",
+        "sha256": "9ed788bfe6feb89d505b8a6a64346b8d7c6206f222e91172fe437a4337e98918",
+        "previous_sha256": "60496d3e8cc73cceb8d0608c33dfb7c6510671379bfd07fab7cf70ddba47e6a4",
+        "reason": "Compile canonical QSC groups, route native spherical results and restrict legacy D1/hybrid paths to TensorRT engine artifacts independently of Radial inference-owner eligibility."
+      },
+      {
+        "module": "pipeline",
+        "name": "_spherical_workload_groups",
+        "sha256": "e1acf47b1ad272ca5c9db366be55c604b70bb21a35ad8908f5cfc3cc22b4b6b4",
+        "previous_sha256": null,
+        "reason": "Compile and count canonical cubes, retain native spherical results, exclude D1/hybrid paths and project terminal groups with full provenance."
+      },
+      {
+        "module": "pta",
+        "name": "_v18_view_manifest_record",
+        "sha256": "e2500ff437334ebc9334de3adb638a8020ec07c0b8ad3016fcd67e8cfa5eee86",
+        "previous_sha256": "b99ef35b27ccc4381ff28c1ea87a675f27df8f3ef9f843c819be1a0b0ceeb6de",
+        "reason": "Compile QSC parent patches, retain raster/manifest provenance and exclude partial-label or encoded-gap spherical transforms."
+      },
+      {
+        "module": "pta",
+        "name": "adapt_shared_view",
+        "sha256": "c0885509add4be7ef3f5c5a7dca4b51af971453c78b52f265d2abf91cda8a757",
+        "previous_sha256": "c647f1a5a011a610a3a91b342a9b8a304620fb1c9b22479dc8a653507f9496e8",
+        "reason": "Compile QSC parent patches, retain raster/manifest provenance and exclude partial-label or encoded-gap spherical transforms."
+      },
+      {
+        "module": "pta",
+        "name": "build_render_plan",
+        "sha256": "44e0612b05d552a03e67bb11244462cc55d26b1d7212589f9647c58a24657d9e",
+        "previous_sha256": "986cc78ee5f2300b38136527e6be5c655040602ed3301e8e606f3a73f431b799",
+        "reason": "Compile QSC parent patches, retain raster/manifest provenance and exclude partial-label or encoded-gap spherical transforms."
+      },
+      {
+        "module": "pta",
+        "name": "compile_v18_pta_views",
+        "sha256": "8f131baf63829cb2b9549315484e5740b5b8dc778733eda351c66d78633ea464",
+        "previous_sha256": "c11a61c3ab30b9eb757bc971fc37011810632102fe69266a39b73fd95562c6c7",
+        "reason": "Compile QSC parent patches, retain raster/manifest provenance and exclude partial-label or encoded-gap spherical transforms."
+      },
+      {
+        "module": "pta",
+        "name": "main",
+        "sha256": "400b5f1160721af48334ce06fa0cbb230aa6469b270e0ddeba2a882f0900bb49",
+        "previous_sha256": "c4dac8cbcfad14ca5de0a50325d5b1f8089e59780fe91781c97893b4104b1d78",
+        "reason": "Compile QSC parent patches, retain raster/manifest provenance and exclude partial-label or encoded-gap spherical transforms."
+      },
+      {
+        "module": "pta",
+        "name": "prepare_loaded_source",
+        "sha256": "3c08cbcf67094f7df37054c058176e9f64dc29232b550ab6be0e816afd9ebf80",
+        "previous_sha256": "86423fedf12cae2152527d0926a6bb8e1dde8b241db1d7418d331f8ff226d6cc",
+        "reason": "Compile QSC parent patches, retain raster/manifest provenance and exclude partial-label or encoded-gap spherical transforms."
+      },
+      {
+        "module": "pta",
+        "name": "write_pta_summary",
+        "sha256": "a6e60f9541aa97d45cb3403805601879107fc8cd0d7f1deb69ef49d7491e9cdc",
+        "previous_sha256": "1b963a68b4e893cfccf24a3e8947121053dc809cc07b6ca6180bb2e39f55d609",
+        "reason": "Compile QSC parent patches, retain raster/manifest provenance and exclude partial-label or encoded-gap spherical transforms."
+      },
+      {
+        "module": "pta",
+        "name": "write_v18_pta_manifest",
+        "sha256": "5f275706a07b58d72e8cb21fee558ecbfd537033eed5fa223a12f5fe7f9b2146",
+        "previous_sha256": "abfc051236561f8d3abba0037cde21dfb209157e7ae841d7d5328fe9188b84c2",
+        "reason": "Compile QSC parent patches, retain raster/manifest provenance and exclude partial-label or encoded-gap spherical transforms."
+      },
+      {
+        "module": "pta_config",
+        "name": "PtaConfig",
+        "sha256": "94bb751aedeb81fb99f51d2d3ddde1f997d5f547d29b3cf5e294dd6db4139bb0",
+        "previous_sha256": "bf155601c5e95e26943b1153b922762c282283d52daedc3e4a7bbe3b8a3e9946",
+        "reason": "Add independent spherical configuration and require positive PTA patch size."
+      },
+      {
+        "module": "pta_config",
+        "name": "build_pta_argparser",
+        "sha256": "7905b59b2c448efa9a582228f7e6c8307013d76b174061196bacc80ab8147a6c",
+        "previous_sha256": "2e5f404388347bb3477b97742b84469095b27da83f605fc8ea47b31a1c8998aa",
+        "reason": "Add independent spherical configuration and require positive PTA patch size."
+      },
+      {
+        "module": "pta_config",
+        "name": "resolve_pta_config",
+        "sha256": "71a5162b1dd22d49ae3ba1a7df161e6260dc39d5e87d75413de77053bb748925",
+        "previous_sha256": "de933dd75754a4f15750971194ac4f9b08c5bd8a17aa41f9d010d134686701cb",
+        "reason": "Add independent spherical configuration and require positive PTA patch size."
+      },
+      {
+        "module": "pta_workers",
+        "name": "_gpu_projected_item_image",
+        "sha256": "9448ba88a6f47a820359207e36adc9aea23fd93485355ea7119c78b4ecd006fc",
+        "previous_sha256": "0f7aa1889d108e023d933e7193fdc0179b907f2a702864a03dad7d14d9e8ed33",
+        "reason": "Use dedicated spherical CUDA rendering with bounded CPU fallback, canonical tiles and center-slice categorical labels."
+      },
+      {
+        "module": "pta_workers",
+        "name": "execute_gpu_frame_batch_task",
+        "sha256": "a932ab1af3196d9506aa0e236584a6e07fafc664aa4a5f4ec0b341775402ff2c",
+        "previous_sha256": "745a59e4e9037a5a4d234cdfd4de737c7e85876149c0c43f21624aa917cb1fa4",
+        "reason": "Use dedicated spherical CUDA rendering with bounded CPU fallback, canonical tiles and center-slice categorical labels."
+      },
+      {
+        "module": "pta_workers",
+        "name": "projection_phase_summary",
+        "sha256": "0fee4cddaa20e050a7eff4c3e6357a4104524244bde6fdc356b880d1ae33e5b0",
+        "previous_sha256": "619fc9ebd5348be22a7e46b0ab2d5d79403e1ba550a4af40f38a7ec4655f55d0",
+        "reason": "Use dedicated spherical CUDA rendering with bounded CPU fallback, canonical tiles and center-slice categorical labels."
+      },
+      {
+        "module": "qsc",
+        "name": "_face_ids",
+        "sha256": "779279cd4785d71cd57d6608b95838f2213e50201c25398a9236032419e4be84",
+        "previous_sha256": null,
+        "reason": "Pin true equal-area QSC equations, canonical closed-face frames, exact ties and the analytic dense-sampling bound."
+      },
+      {
+        "module": "qsc",
+        "name": "_fold",
+        "sha256": "353e456234ddacda5b2b33e9518a28512d20fe6ea5eb0fb15f34c6c364a92843",
+        "previous_sha256": null,
+        "reason": "Pin true equal-area QSC equations, canonical closed-face frames, exact ties and the analytic dense-sampling bound."
+      },
+      {
+        "module": "qsc",
+        "name": "_project_local",
+        "sha256": "dda57624c3e403bc96aab20c396ee4088de50377dfae0a039288334aa71634ad",
+        "previous_sha256": null,
+        "reason": "Pin true equal-area QSC equations, canonical closed-face frames, exact ties and the analytic dense-sampling bound."
+      },
+      {
+        "module": "qsc",
+        "name": "_unfold",
+        "sha256": "608b5c4a9d34c16c57ed924ebd4d8dd66f8ff4d11f793a8ad2097e1da6154381",
+        "previous_sha256": null,
+        "reason": "Pin true equal-area QSC equations, canonical closed-face frames, exact ties and the analytic dense-sampling bound."
+      },
+      {
+        "module": "qsc",
+        "name": "qsc_face_intervals",
+        "sha256": "3cdfaeb95ef453a2e542996f4ae31853a5a780f56a6df8d3fc0a194c758c55dc",
+        "previous_sha256": null,
+        "reason": "Pin true equal-area QSC equations, canonical closed-face frames, exact ties and the analytic dense-sampling bound."
+      },
+      {
+        "module": "qsc",
+        "name": "qsc_forward",
+        "sha256": "c3824ccc684dbbc47727a64286d03d959df36cfbed28708bd98a3c720eecd289",
+        "previous_sha256": null,
+        "reason": "Pin true equal-area QSC equations, canonical closed-face frames, exact ties and the analytic dense-sampling bound."
+      },
+      {
+        "module": "qsc",
+        "name": "qsc_forward_face",
+        "sha256": "0db8d5701f2dbf722d72fb1b470677991b61815b57e130172d1b825dc1f3755e",
+        "previous_sha256": null,
+        "reason": "Pin true equal-area QSC equations, canonical closed-face frames, exact ties and the analytic dense-sampling bound."
+      },
+      {
+        "module": "qsc",
+        "name": "qsc_inverse",
+        "sha256": "6eedf6c7fbf964be977f4d9ca031671cbb4aa9549fe6a5a551dff5e1fbfbf68b",
+        "previous_sha256": null,
+        "reason": "Pin true equal-area QSC equations, canonical closed-face frames, exact ties and the analytic dense-sampling bound."
+      },
+      {
+        "module": "runtime",
+        "name": "cpu_inference_supports_view",
+        "sha256": "b38f95f4415e0ac3bebe7c8cd13b8d5acd343cacacc776daaa637c00e60505c7",
+        "previous_sha256": "ef761cc4da5ee4ba113200b9985d925659139b97d4d8c67201f0c8ffb989aa2a",
+        "reason": "Admit native spherical patches through the explicit CPU inference family predicate."
+      },
+      {
+        "module": "spherical_cuda",
+        "name": "_build_direction_block",
+        "sha256": "b49370cbf362da2bec67b9cdc27491c0c75cbae722ee6eee89db629023fab73d",
+        "previous_sha256": null,
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_cuda",
+        "name": "_direction_blocks",
+        "sha256": "24248ae9793ce73a7af82f6b91c7078e5e29aa8af05d39c1d9554b876268a1a1",
+        "previous_sha256": null,
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_cuda",
+        "name": "_render_contract",
+        "sha256": "6fc4bab4921dc764e9ff6f6e2a315176434cad6d49564da926e675872c029f12",
+        "previous_sha256": null,
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_cuda",
+        "name": "_render_spherical_native_cuda",
+        "sha256": "bc2398f4d0ddd1f01a9d7949730c198e49fce10854a8f1c26fb09994191c7c2f",
+        "previous_sha256": null,
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_cuda",
+        "name": "_render_spherical_native_torch",
+        "sha256": "40915b7121faae9d01d430152fc805059d83d57364b8084ee6ca5cc6ebed0f3a",
+        "previous_sha256": null,
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_cuda",
+        "name": "_spherical_kernels",
+        "sha256": "eb02ff49b86e9656036ee1dbf3b45e592ced309ac5c942234ccef4625edd88df",
+        "previous_sha256": null,
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_cuda",
+        "name": "clear_spherical_render_cache",
+        "sha256": "f59973b7824d69c1bf4e7b8cf4c0ddc5ff98103d66faf9e219fdc8a307879599",
+        "previous_sha256": null,
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_cuda",
+        "name": "render_spherical_native_resident",
+        "sha256": "b75823dd78d39b51eadd18a651393db71413f9295d3146a769cff9b921372872",
+        "previous_sha256": null,
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_geometry",
+        "name": "SphericalSurface",
+        "sha256": "c9bcd33efe124dcf87de35768feb55c904eb1abc246aeeb5d8b50d520ad025e5",
+        "previous_sha256": null,
+        "reason": "Pin spherical annuli, rigid cube rotation, canonical aliases, fixed face patches and bounded CPU intensity/categorical sampling."
+      },
+      {
+        "module": "spherical_geometry",
+        "name": "_patch_origins",
+        "sha256": "e085fb8b715be4a562bb54dcbbb0d9d5c384fa0df498a9dfc186c4a2716e7994",
+        "previous_sha256": null,
+        "reason": "Pin spherical annuli, rigid cube rotation, canonical aliases, fixed face patches and bounded CPU intensity/categorical sampling."
+      },
+      {
+        "module": "spherical_geometry",
+        "name": "build_spherical_view_infos",
+        "sha256": "651129975e5461027f7e0ead91651a2beacae34c45ed3ba486a86ebf766c6307",
+        "previous_sha256": null,
+        "reason": "Pin spherical annuli, rigid cube rotation, canonical aliases, fixed face patches and bounded CPU intensity/categorical sampling."
+      },
+      {
+        "module": "spherical_geometry",
+        "name": "cube_rotation",
+        "sha256": "ecd7d3ae6464ee7bd175460e4f3b16453f779e9fd124d9e7ff20d6dddc40778c",
+        "previous_sha256": null,
+        "reason": "Pin spherical annuli, rigid cube rotation, canonical aliases, fixed face patches and bounded CPU intensity/categorical sampling."
+      },
+      {
+        "module": "spherical_geometry",
+        "name": "face_directions",
+        "sha256": "e2d1ba45b919b6a68d9c81bbf8d7122d99e3da96294f731d773adca22966ea00",
+        "previous_sha256": null,
+        "reason": "Pin spherical annuli, rigid cube rotation, canonical aliases, fixed face patches and bounded CPU intensity/categorical sampling."
+      },
+      {
+        "module": "spherical_geometry",
+        "name": "radius_grid",
+        "sha256": "893d96f6106fd6e0d154a936c193291f4495c2ec55474b47ff648ad5e3779c38",
+        "previous_sha256": null,
+        "reason": "Pin spherical annuli, rigid cube rotation, canonical aliases, fixed face patches and bounded CPU intensity/categorical sampling."
+      },
+      {
+        "module": "spherical_geometry",
+        "name": "render_shell_frame",
+        "sha256": "3eca937397e1f54174b18f95e98ce45c6f24a757a4d38388a300228cf2c2909a",
+        "previous_sha256": null,
+        "reason": "Pin spherical annuli, rigid cube rotation, canonical aliases, fixed face patches and bounded CPU intensity/categorical sampling."
+      },
+      {
+        "module": "spherical_geometry",
+        "name": "shell_coordinates",
+        "sha256": "3619c60a8eedbbfcd4dcdcbd91a5b2b20a9eadec730ca6ee94c41b42ce6d5850",
+        "previous_sha256": null,
+        "reason": "Pin spherical annuli, rigid cube rotation, canonical aliases, fixed face patches and bounded CPU intensity/categorical sampling."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "_SphericalCudaStage",
+        "sha256": "292d836bd002cc31fad42af5f1f0983afea7ea47d1bb8402eb7ca52394d75c68",
+        "previous_sha256": null,
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "_close_spherical_cuda_resources",
+        "sha256": "27be8acf52e6685154c65bb2495c7e6977a493116858221ee8545ae760a84cb8",
+        "previous_sha256": null,
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "_nearest_global_shell",
+        "sha256": "1991691dadd4deed0d14403caa2f784348b0fa6a0376c8a564d803e864be9461",
+        "previous_sha256": null,
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "_ordered_spherical_blocks",
+        "sha256": "08756a4588c8b9eac1406c45c8adfc26e24280a9d01db1a8d1b73f3da8007d4d",
+        "previous_sha256": null,
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "_ordered_spherical_cuda_blocks",
+        "sha256": "75f6bbfb2fb57bffab55006927247360537c011d651eba84eb993ae9cfdd446a",
+        "previous_sha256": null,
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "_processing_index",
+        "sha256": "81a698cea7313e8069b2e4238c485379dcaf365490a402b12f3f22a169a70191",
+        "previous_sha256": null,
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "_project_spherical_block",
+        "sha256": "719d1e5d89645b1fa68a46f39586214b9d3a9ff3956e359bdbb60389c28f1bf2",
+        "previous_sha256": null,
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "_pull_spherical_chunk",
+        "sha256": "c8a4bc075078b5d46e612f732a3b6dfb661ffde6c4195cb37c4dfa7cb6ebd554",
+        "previous_sha256": null,
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "_spherical_block_schedule",
+        "sha256": "2f9497321d2b476ff0c239a4ec78567bd3caa46aa14177cc0155a3b88a773a88",
+        "previous_sha256": null,
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "_try_spherical_cuda_stage",
+        "sha256": "725ce30c7f5ffe2551ca70b4a28442fda4d6451abe60e23b5b5031c5caf4441f",
+        "previous_sha256": null,
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "_validate_spherical_projection",
+        "sha256": "07a62d3276eda37079595051306a9512181e066877999248fffcf59301ede36e",
+        "previous_sha256": null,
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "backproject_spherical_volume_to_volume",
+        "sha256": "52e1fdedd62b26517ad7e5363bbcd5d857fb4e9306e678b256916aa60c06f68b",
+        "previous_sha256": null,
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "spherical_cuda_backproject_enabled",
+        "sha256": "caecf9f03b2273e69733dc33800295d20791e05ff1573998053c631aa5d3960d",
+        "previous_sha256": null,
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "name": "SphericalCudaProjectionUnavailable",
+        "sha256": "acaf597ca13fde6a9b9bafb49bb01c3767433d5967712f80fe57a9f8ee2594df",
+        "previous_sha256": null,
+        "reason": "Pin float64 QSC CUDA projection, 64-bit byte addresses, bounded private buffers, compact encoding, preflight and stream-failure quarantine."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "name": "SphericalCudaProjectionUnsafeFailure",
+        "sha256": "495ae3c316c25802998c5257626a6c1444dd00fda89c1a8211808d5ee82bacfe",
+        "previous_sha256": null,
+        "reason": "Pin float64 QSC CUDA projection, 64-bit byte addresses, bounded private buffers, compact encoding, preflight and stream-failure quarantine."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "name": "SphericalCudaProjector",
+        "sha256": "227883e5e6d500a5ec234f5c8e94a6624d33a094f819615cffadc7292b245186",
+        "previous_sha256": null,
+        "reason": "Pin float64 QSC CUDA projection, 64-bit byte addresses, bounded private buffers, compact encoding, preflight and stream-failure quarantine."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "name": "_SphericalContract",
+        "sha256": "d5f63e64916f0365f97216cfd8e190cc4a4c0b6836d8ca60011e6e66af850051",
+        "previous_sha256": null,
+        "reason": "Pin float64 QSC CUDA projection, 64-bit byte addresses, bounded private buffers, compact encoding, preflight and stream-failure quarantine."
+      },
+      {
+        "module": "tta_terminal",
+        "name": "finalize_physical_view_volume_group",
+        "sha256": "ffad64880cebf1c9e9c45853105e37849666b2d862e5621d7a5769303ea90559",
+        "previous_sha256": "a408024ea1a5d3ef5714ba434d03efe5eb03d2b5ff6742b108fb877460feb81d",
+        "reason": "Project spherical terminal groups into source space before final union."
+      },
+      {
+        "module": "unification/runtime",
+        "name": "CompiledPhysicalViews",
+        "sha256": "965ff7dcddefd12b28575738ee46642c0e1ca430ac2d9c6fae35968538145dfa",
+        "previous_sha256": "f80bcb98af5f3f186470f3617e35af34087e611ba5ea1f529dbbeff5fc0d0e98",
+        "reason": "Forward independent spherical request, radius and patch arguments through the shared physical compiler."
+      },
+      {
+        "module": "unification/runtime",
+        "name": "compile_physical_views",
+        "sha256": "0a0f5d4d30ea74b402e109922d8d9e42ce034357a7ea763584be335f154f5dcd",
+        "previous_sha256": "57ea6a91d425fb9141dbd379546f515c2949130e47e89dff8f98dfec37ede495",
+        "reason": "Forward independent spherical request, radius and patch arguments through the shared physical compiler."
+      },
+      {
+        "module": "unification/sampling",
+        "name": "forward_sampling_policy",
+        "sha256": "5b4e96c3a55fb38f585ed840088f2b33dafa13b61b9a987a7cc26d2cc61fc6b7",
+        "previous_sha256": "1236e15e39fbc901cf05ad10a2bb679631f08e36314f75bddcfee82df9a058d9",
+        "reason": "Version 21 declares QSC extraction, radius clamp, face boundaries and source taps."
+      },
+      {
+        "module": "unification/tta_manifest",
+        "name": "_channel_record",
+        "sha256": "e12c45f6c07ea04426f41ab1ddb71e9766e09dc88218298c2d6861fb7f7060b7",
+        "previous_sha256": "d367d80ffec9272770a50e9f30bb8dc1129c8efec4116fee7ddb1db2040dcaa7",
+        "reason": "Record complete v21 QSC geometry, canonical cube alias provenance and raster-plan identity."
+      },
+      {
+        "module": "unification/tta_manifest",
+        "name": "_view_record",
+        "sha256": "09febf1798e302c96723fbca86c47382e002a6bd0665a7ea00f7228a553b181f",
+        "previous_sha256": "48d60cf05d27e6646f3052b7b78b9774a7c8fa9eddea2523680725833be2d518",
+        "reason": "Record complete v21 QSC geometry, canonical cube alias provenance and raster-plan identity."
+      },
+      {
+        "module": "unification/tta_manifest",
+        "name": "build_tta_run_manifest",
+        "sha256": "d17a136ce8a4d094c446b5a1b93e8bb9be6c8ae051c8515a47dfae9fe1ce2581",
+        "previous_sha256": "f998ca04809288c0b34c864f29a690def3c4599ae3d56dad7a77125b064d4be6",
+        "reason": "Record complete v21 QSC geometry, canonical cube alias provenance and raster-plan identity."
+      },
+      {
+        "module": "unification/tta_manifest",
+        "name": "spherical_view_manifest_record",
+        "sha256": "07874ea7dc581f0f31e6664e0e21608fce5b81dc7f01232988aa9e2f3657b71f",
+        "previous_sha256": null,
+        "reason": "Record complete v21 QSC geometry, canonical cube alias provenance and raster-plan identity."
+      },
+      {
+        "module": "unification/tta_manifest",
+        "name": "spherical_view_plan_metadata",
+        "sha256": "056b6bbc3d53f094d2948d7698558704a18eae535311342d14788721d1d12ab7",
+        "previous_sha256": null,
+        "reason": "Record complete v21 QSC geometry, canonical cube alias provenance and raster-plan identity."
+      },
+      {
+        "module": "workers",
+        "name": "run_prediction_volume_in_openvino_worker",
+        "sha256": "b59b3677196a6371f422cd31a426c0446eacc774a7431bea6856d5538053c5f8",
+        "previous_sha256": "e80ea7b42e19a436ca9ccc105da890273e385838ec315c03aa65c8dcd5adedba",
+        "reason": "Require native spherical task results and reject D1 before device access; preserve Radial owner handling."
+      },
+      {
+        "module": "workers",
+        "name": "run_prediction_volume_in_worker",
+        "sha256": "ba1fd167a1290a2aff4cfca0ed4031737017ed617ecc90e7f9f123a4b1a1aa90",
+        "previous_sha256": "6dd4ac73111d24f25196e3442378ab5a434eb44dee84c6fb4fc88cdfff6fad2b",
+        "reason": "Require native spherical task results and reject D1 before device access; preserve Radial owner handling."
+      }
+    ],
+    "statements": [
+      {
+        "module": "__init__",
+        "label": "Assign:7",
+        "kind": "Assign",
+        "sha256": "6967ec169622a2d64957630f0daf9fbc0c0f19cabdf097701158fa36ab993d06",
+        "reason": "Promote the inert package identity to v21."
+      },
+      {
+        "module": "assembly",
+        "label": "ImportFrom:101",
+        "kind": "ImportFrom",
+        "sha256": "3bfcce17afb64bd0045922ca854a8fb95ac83d1e684e94611acf0eaea4e22814",
+        "reason": "Route native spherical masks into bounded source projection and incremental NRRD sinks with existing fatal cleanup."
+      },
+      {
+        "module": "cli",
+        "label": "Assign:13",
+        "kind": "Assign",
+        "sha256": "35a03198ee25c2fd53194c47165c1285c47d7fbef1c1aa62b03948f45f860222",
+        "reason": "Promote the dependency-light launcher identity to v21."
+      },
+      {
+        "module": "cli",
+        "label": "Assign:14",
+        "kind": "Assign",
+        "sha256": "d7fe778154e60cdd2e64317983b823f1cf631c3b7a4a44ceba1d9b29da9729a4",
+        "reason": "Promote the dependency-light launcher identity to v21."
+      },
+      {
+        "module": "config",
+        "label": "Assign:22",
+        "kind": "Assign",
+        "sha256": "35a03198ee25c2fd53194c47165c1285c47d7fbef1c1aa62b03948f45f860222",
+        "reason": "Add strict independent Spherical request/radius grammar, channel help and v21 constants."
+      },
+      {
+        "module": "config",
+        "label": "Assign:24",
+        "kind": "Assign",
+        "sha256": "473def822a1c4770205ac74330539ff65652bb5b798f1b03d596c8fdef6ff3ed",
+        "reason": "Add strict independent Spherical request/radius grammar, channel help and v21 constants."
+      },
+      {
+        "module": "config",
+        "label": "AnnAssign:278",
+        "kind": "AnnAssign",
+        "sha256": "a62ce5f0d3f8323f67eb1ed93a071139d72d183fbe1c0e5329dda013075c3b15",
+        "reason": "Add strict independent Spherical request/radius grammar, channel help and v21 constants."
+      },
+      {
+        "module": "cuda_backend",
+        "label": "ImportFrom:46",
+        "kind": "ImportFrom",
+        "sha256": "caf0111b9016dc9ec09eb9d6057ed53ea52ade17a74dd683241417199f7c3fc3",
+        "reason": "Use a dedicated bounded spherical renderer/cache and reject incompatible fused/ring paths; preserve Radial mathematics."
+      },
+      {
+        "module": "cuda_backend",
+        "label": "ImportFrom:95",
+        "kind": "ImportFrom",
+        "sha256": "9f358ac06880fb2bffe455001aeef26565c648e9f19092aad489e1443904c21c",
+        "reason": "Use a dedicated bounded spherical renderer/cache and reject incompatible fused/ring paths; preserve Radial mathematics."
+      },
+      {
+        "module": "cuda_d1",
+        "label": "ImportFrom:32",
+        "kind": "ImportFrom",
+        "sha256": "2712434201dc6fca5615cb47f4de8bc4c353425cf006eb71b96bfeef2885f5fd",
+        "reason": "Reject Spherical before unsupported D1 kernel and state ownership."
+      },
+      {
+        "module": "geometry",
+        "label": "Assign:399",
+        "kind": "Assign",
+        "sha256": "8953b5acb3e666e0eab992d560fae59458bd2ff9843cc377d3dfa1997157da72",
+        "reason": "Add QSC metadata, canonical compilation, output identity, source extraction and raster plans while preserving old-family mathematics."
+      },
+      {
+        "module": "lta_config",
+        "label": "ImportFrom:11",
+        "kind": "ImportFrom",
+        "sha256": "17a8a59ff8c05d48288b872bb125789f32057b0348872c3859ef5f24a7e5cf7b",
+        "reason": "Expose spherical planning grammar and independent fixed-1008 minimum without claiming production inference support."
+      },
+      {
+        "module": "pipeline",
+        "label": "ImportFrom:44",
+        "kind": "ImportFrom",
+        "sha256": "3de06232aff7e1e483a720d86444467687931fc9bdece6899742249d289cede6",
+        "reason": "Compile and count canonical cubes, retain native spherical results, exclude D1/hybrid paths and project terminal groups with full provenance."
+      },
+      {
+        "module": "pta",
+        "label": "ImportFrom:287",
+        "kind": "ImportFrom",
+        "sha256": "6942a07adb3db26323b3958f874e01d69dbd947ffb079c21ba5a97304d5a3fe5",
+        "reason": "Compile QSC parent patches, retain raster/manifest provenance and exclude partial-label or encoded-gap spherical transforms."
+      },
+      {
+        "module": "pta_config",
+        "label": "ImportFrom:15",
+        "kind": "ImportFrom",
+        "sha256": "0bc4e5958d2d2ee9472d2975eb870943b2f960dad48cfd73965730373a6d7454",
+        "reason": "Add independent spherical configuration and require positive PTA patch size."
+      },
+      {
+        "module": "qsc",
+        "label": "Expr:1",
+        "kind": "Expr",
+        "sha256": "b98ef1de3c44532bc4219b62a577568eb56bef5796d50a8f36fbd94e64171b19",
+        "reason": "Pin true equal-area QSC equations, canonical closed-face frames, exact ties and the analytic dense-sampling bound."
+      },
+      {
+        "module": "qsc",
+        "label": "ImportFrom:52",
+        "kind": "ImportFrom",
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Pin true equal-area QSC equations, canonical closed-face frames, exact ties and the analytic dense-sampling bound."
+      },
+      {
+        "module": "qsc",
+        "label": "Import:54",
+        "kind": "Import",
+        "sha256": "f329650e2c61a07a1bab85b32296a6d93760e313e108904819fa27d09cf3954d",
+        "reason": "Pin true equal-area QSC equations, canonical closed-face frames, exact ties and the analytic dense-sampling bound."
+      },
+      {
+        "module": "qsc",
+        "label": "Import:56",
+        "kind": "Import",
+        "sha256": "271fc31378e1108a9784c29c3c4768de571ce080301b4ad9721ba767fcf5842b",
+        "reason": "Pin true equal-area QSC equations, canonical closed-face frames, exact ties and the analytic dense-sampling bound."
+      },
+      {
+        "module": "qsc",
+        "label": "Assign:59",
+        "kind": "Assign",
+        "sha256": "6f6dc6a2826c2e1bab01af445ff1f16aaa78ff5e006152cc28b01dcc859d0ab7",
+        "reason": "Pin true equal-area QSC equations, canonical closed-face frames, exact ties and the analytic dense-sampling bound."
+      },
+      {
+        "module": "qsc",
+        "label": "Assign:62",
+        "kind": "Assign",
+        "sha256": "48ac25dfe7d061ac85b639745f9b64db01b36cbfa74063fcc647298fee2cbb6b",
+        "reason": "Pin true equal-area QSC equations, canonical closed-face frames, exact ties and the analytic dense-sampling bound."
+      },
+      {
+        "module": "qsc",
+        "label": "Assign:70",
+        "kind": "Assign",
+        "sha256": "0d5b76e787c53b1cace0c660f28edc4c1eb4ece12566fb97c1d6369e4877f12d",
+        "reason": "Pin true equal-area QSC equations, canonical closed-face frames, exact ties and the analytic dense-sampling bound."
+      },
+      {
+        "module": "qsc",
+        "label": "Assign:71",
+        "kind": "Assign",
+        "sha256": "fc7adbe2cc62cb07de66c937d6370e1a103a27f1d0117664a33b2cbe71221788",
+        "reason": "Pin true equal-area QSC equations, canonical closed-face frames, exact ties and the analytic dense-sampling bound."
+      },
+      {
+        "module": "qsc",
+        "label": "Assign:72",
+        "kind": "Assign",
+        "sha256": "d254df35aac965fe99b7cfc3dd6657eb2ff1450a7e162be4997c5632130d97b6",
+        "reason": "Pin true equal-area QSC equations, canonical closed-face frames, exact ties and the analytic dense-sampling bound."
+      },
+      {
+        "module": "qsc",
+        "label": "Assign:73",
+        "kind": "Assign",
+        "sha256": "82ee305f6eb98505cd735d3e6f270eec7e0395e88b93972a906174014b6aaee3",
+        "reason": "Pin true equal-area QSC equations, canonical closed-face frames, exact ties and the analytic dense-sampling bound."
+      },
+      {
+        "module": "spherical_cuda",
+        "label": "Expr:1",
+        "kind": "Expr",
+        "sha256": "c5f0cc05bbcaed3ea3bf72bc18c470b8668c1324ca02d3c0f18e883ed0cdf408",
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_cuda",
+        "label": "ImportFrom:7",
+        "kind": "ImportFrom",
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_cuda",
+        "label": "ImportFrom:9",
+        "kind": "ImportFrom",
+        "sha256": "c94574074fdb9b78d16dc80d7f17b8e203628f02242595f56590a1b1c4a8a3cc",
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_cuda",
+        "label": "ImportFrom:10",
+        "kind": "ImportFrom",
+        "sha256": "271cd8a5819453f6952690fd43e9ce152386df249c8de9a1999907454b0006b7",
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_cuda",
+        "label": "Import:11",
+        "kind": "Import",
+        "sha256": "f329650e2c61a07a1bab85b32296a6d93760e313e108904819fa27d09cf3954d",
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_cuda",
+        "label": "Import:12",
+        "kind": "Import",
+        "sha256": "ac3a74d6dd975a8e8fe4b7f85fce794793a9355595b850e3926964913948d386",
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_cuda",
+        "label": "Import:14",
+        "kind": "Import",
+        "sha256": "271fc31378e1108a9784c29c3c4768de571ce080301b4ad9721ba767fcf5842b",
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_cuda",
+        "label": "ImportFrom:16",
+        "kind": "ImportFrom",
+        "sha256": "00e34b062f0b9c8410d2f0ef9f6dcb170bfd492168deb8e3b86989d1dac789b0",
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_cuda",
+        "label": "Assign:19",
+        "kind": "Assign",
+        "sha256": "d36b6decc4d0aaeca37d28b08fc7128ab5f61038c2a0443c4013bd2395bc22e3",
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_cuda",
+        "label": "Assign:20",
+        "kind": "Assign",
+        "sha256": "4d315f9458b75003740b6fff209d0f3cc2db5f78ac2655b5fc5ea79ea68a394b",
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_cuda",
+        "label": "Assign:21",
+        "kind": "Assign",
+        "sha256": "31705360833f10567832af4a45743e0ae26c9046ac1fa7d730c3ccae73699409",
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_cuda",
+        "label": "Assign:22",
+        "kind": "Assign",
+        "sha256": "5105e99e67e3fd2aa1d5a63becaa10e76fb92197e7f262c4e3e9ef1af2ae840f",
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_cuda",
+        "label": "Assign:171",
+        "kind": "Assign",
+        "sha256": "68c275301795d7e3efec6b112aaf04356b8a8153517fca3b9703682e0467de05",
+        "reason": "Pin bounded cached QSC directions, logical gray8 reconstruction, 64-bit native CUDA addresses and fenced engine ownership."
+      },
+      {
+        "module": "spherical_geometry",
+        "label": "Expr:1",
+        "kind": "Expr",
+        "sha256": "c4a828b4c2e8bf891d3aa2c1e5e6701dcd0727c756107aa50d9abbf0667332e3",
+        "reason": "Pin spherical annuli, rigid cube rotation, canonical aliases, fixed face patches and bounded CPU intensity/categorical sampling."
+      },
+      {
+        "module": "spherical_geometry",
+        "label": "ImportFrom:7",
+        "kind": "ImportFrom",
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Pin spherical annuli, rigid cube rotation, canonical aliases, fixed face patches and bounded CPU intensity/categorical sampling."
+      },
+      {
+        "module": "spherical_geometry",
+        "label": "ImportFrom:9",
+        "kind": "ImportFrom",
+        "sha256": "321ed2ed3afceb74be547c9905ed4c676e453b1a68fe7cb2d3e214caeac2624d",
+        "reason": "Pin spherical annuli, rigid cube rotation, canonical aliases, fixed face patches and bounded CPU intensity/categorical sampling."
+      },
+      {
+        "module": "spherical_geometry",
+        "label": "Import:10",
+        "kind": "Import",
+        "sha256": "f329650e2c61a07a1bab85b32296a6d93760e313e108904819fa27d09cf3954d",
+        "reason": "Pin spherical annuli, rigid cube rotation, canonical aliases, fixed face patches and bounded CPU intensity/categorical sampling."
+      },
+      {
+        "module": "spherical_geometry",
+        "label": "ImportFrom:11",
+        "kind": "ImportFrom",
+        "sha256": "834c8ba08672e9caba16fdc6c97d97606ada4e4e63b1e6a3c49ce60b8a90a6b8",
+        "reason": "Pin spherical annuli, rigid cube rotation, canonical aliases, fixed face patches and bounded CPU intensity/categorical sampling."
+      },
+      {
+        "module": "spherical_geometry",
+        "label": "Import:13",
+        "kind": "Import",
+        "sha256": "271fc31378e1108a9784c29c3c4768de571ce080301b4ad9721ba767fcf5842b",
+        "reason": "Pin spherical annuli, rigid cube rotation, canonical aliases, fixed face patches and bounded CPU intensity/categorical sampling."
+      },
+      {
+        "module": "spherical_geometry",
+        "label": "ImportFrom:15",
+        "kind": "ImportFrom",
+        "sha256": "b8e8a7972d5204f0901eab61e0a1f62b9ade169007d4d1c480bff5e63cdb8db7",
+        "reason": "Pin spherical annuli, rigid cube rotation, canonical aliases, fixed face patches and bounded CPU intensity/categorical sampling."
+      },
+      {
+        "module": "spherical_geometry",
+        "label": "If:17",
+        "kind": "If",
+        "sha256": "827545ce4f0042909a8e697c1953c54a6c3b932eaa7b701c95880900b31ead95",
+        "reason": "Pin spherical annuli, rigid cube rotation, canonical aliases, fixed face patches and bounded CPU intensity/categorical sampling."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "Expr:1",
+        "kind": "Expr",
+        "sha256": "fb474cd07070aea8479078dee9cb1e8c77e9858d7e0280c029d5bc064cbb66a1",
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "ImportFrom:8",
+        "kind": "ImportFrom",
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "ImportFrom:10",
+        "kind": "ImportFrom",
+        "sha256": "44606a75ef80c599dae4001b8647bf9120e9ae20e99e2647215ae67968dbeb17",
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "ImportFrom:11",
+        "kind": "ImportFrom",
+        "sha256": "f58f2ea673fa2a5627654ed695deb2cb35329421a039e6485db604bafb90b572",
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "Import:12",
+        "kind": "Import",
+        "sha256": "f329650e2c61a07a1bab85b32296a6d93760e313e108904819fa27d09cf3954d",
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "Import:13",
+        "kind": "Import",
+        "sha256": "ac3a74d6dd975a8e8fe4b7f85fce794793a9355595b850e3926964913948d386",
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "Import:14",
+        "kind": "Import",
+        "sha256": "ff05bad0fd9a7212d3cd85fd2726055168be21bc8f6e0d93b29965794b0675d4",
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "ImportFrom:15",
+        "kind": "ImportFrom",
+        "sha256": "59051b17634cdcb5a576ceb58fdc0a4e5652ed3b60d66667e92ddefd931abeca",
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "ImportFrom:16",
+        "kind": "ImportFrom",
+        "sha256": "82762e2b287594f827a3b52f091b007647620ad69131caa2d0e15a3360ae37c4",
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "Import:18",
+        "kind": "Import",
+        "sha256": "271fc31378e1108a9784c29c3c4768de571ce080301b4ad9721ba767fcf5842b",
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "ImportFrom:20",
+        "kind": "ImportFrom",
+        "sha256": "c886e8eacee2cc9f88f09bc14036d0a53628632deda64d9a24c334cdcbb355e5",
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "ImportFrom:21",
+        "kind": "ImportFrom",
+        "sha256": "fc282796be4a1362954a99d00feed9ea3df2f39569de61311e6f9b18aea34241",
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "ImportFrom:22",
+        "kind": "ImportFrom",
+        "sha256": "35b6f282248161e21b0f68171cf71c5783c6df1b4de5414bb3b72e28503e515e",
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "ImportFrom:23",
+        "kind": "ImportFrom",
+        "sha256": "91efdac630274734c90ed1ede4a1d8c47b050a9076c725f8d48143db9128bf4e",
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "If:25",
+        "kind": "If",
+        "sha256": "827545ce4f0042909a8e697c1953c54a6c3b932eaa7b701c95880900b31ead95",
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "Assign:29",
+        "kind": "Assign",
+        "sha256": "92570f47d7a6bc732f8519a8171b4a369d8b4565c378b819e7f6e4d37f913191",
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "Assign:30",
+        "kind": "Assign",
+        "sha256": "bf8f6f6165a78206c9c57c5d280b4154c1a81a74f2ef70db2c1bb8318887c002",
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "Assign:31",
+        "kind": "Assign",
+        "sha256": "b6ce8d5e3e6ea8650c24db1651b1ecac0fe98f08b68361ae5df9f775604e0f76",
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "Assign:32",
+        "kind": "Assign",
+        "sha256": "b688fe9ea4f0e535f3ebe95d5b3bc67a9a257802661b29d237dbb1d7463d9772",
+        "reason": "Pin bounded ordered source pull, global nearest ties, closed faces, annular clipping, transactional sinks and fatal CUDA retention."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "label": "Expr:1",
+        "kind": "Expr",
+        "sha256": "e8ceda57092725048aeac378f2003811adac3075bd3045a53edd4a3a2e7dfc50",
+        "reason": "Pin float64 QSC CUDA projection, 64-bit byte addresses, bounded private buffers, compact encoding, preflight and stream-failure quarantine."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "label": "ImportFrom:7",
+        "kind": "ImportFrom",
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Pin float64 QSC CUDA projection, 64-bit byte addresses, bounded private buffers, compact encoding, preflight and stream-failure quarantine."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "label": "ImportFrom:9",
+        "kind": "ImportFrom",
+        "sha256": "321ed2ed3afceb74be547c9905ed4c676e453b1a68fe7cb2d3e214caeac2624d",
+        "reason": "Pin float64 QSC CUDA projection, 64-bit byte addresses, bounded private buffers, compact encoding, preflight and stream-failure quarantine."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "label": "Import:10",
+        "kind": "Import",
+        "sha256": "60e489325a19bee8be6a450945dd253634f01297b803d2869e489219288b5372",
+        "reason": "Pin float64 QSC CUDA projection, 64-bit byte addresses, bounded private buffers, compact encoding, preflight and stream-failure quarantine."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "label": "Import:11",
+        "kind": "Import",
+        "sha256": "80f21c52b46d18d972ae93db225486a900db10799e9bdba98d07dbcc819ff502",
+        "reason": "Pin float64 QSC CUDA projection, 64-bit byte addresses, bounded private buffers, compact encoding, preflight and stream-failure quarantine."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "label": "Import:12",
+        "kind": "Import",
+        "sha256": "ff05bad0fd9a7212d3cd85fd2726055168be21bc8f6e0d93b29965794b0675d4",
+        "reason": "Pin float64 QSC CUDA projection, 64-bit byte addresses, bounded private buffers, compact encoding, preflight and stream-failure quarantine."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "label": "Import:14",
+        "kind": "Import",
+        "sha256": "271fc31378e1108a9784c29c3c4768de571ce080301b4ad9721ba767fcf5842b",
+        "reason": "Pin float64 QSC CUDA projection, 64-bit byte addresses, bounded private buffers, compact encoding, preflight and stream-failure quarantine."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "label": "ImportFrom:16",
+        "kind": "ImportFrom",
+        "sha256": "12feb3c055408ee18ae0ed23995b91cfdad0df504c2b23f5b3c4c20e6b417812",
+        "reason": "Pin float64 QSC CUDA projection, 64-bit byte addresses, bounded private buffers, compact encoding, preflight and stream-failure quarantine."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "label": "ImportFrom:18",
+        "kind": "ImportFrom",
+        "sha256": "06d19ce80d11c361ba5abce6a586318fec07e47603b7091d1fc63bf50b5fecb9",
+        "reason": "Pin float64 QSC CUDA projection, 64-bit byte addresses, bounded private buffers, compact encoding, preflight and stream-failure quarantine."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "label": "Assign:41",
+        "kind": "Assign",
+        "sha256": "baedceadb82f8bd0b9ccdc6f30080e46e31eaffa21442e844bb0ac396c5c5b27",
+        "reason": "Pin float64 QSC CUDA projection, 64-bit byte addresses, bounded private buffers, compact encoding, preflight and stream-failure quarantine."
+      },
+      {
+        "module": "unification/runtime",
+        "label": "ImportFrom:13",
+        "kind": "ImportFrom",
+        "sha256": "a05f2e781cc4775356a47f9264e41db2c4a4b622e368d7ffc3c09f956e04d542",
+        "reason": "Forward independent spherical request, radius and patch arguments through the shared physical compiler."
+      },
+      {
+        "module": "unification/tta_manifest",
+        "label": "Assign:12",
+        "kind": "Assign",
+        "sha256": "389a08154d5304cce85691e8434343670b4c86c6367c4dbc604021d5e67d10dd",
+        "reason": "Record complete v21 QSC geometry, canonical cube alias provenance and raster-plan identity."
+      },
+      {
+        "module": "unification/tta_manifest",
+        "label": "Assign:93",
+        "kind": "Assign",
+        "sha256": "bdb4e610a48d32a6fd969b17e3402896013114b85d685851cb8a06cc7092ac5a",
+        "reason": "Record complete v21 QSC geometry, canonical cube alias provenance and raster-plan identity."
+      },
+      {
+        "module": "unification/tta_manifest",
+        "label": "Assign:518",
+        "kind": "Assign",
+        "sha256": "4cf11206e6c38ad0a24102deaba101f43f225a33514a5b5f4a0ae82f19a9c94d",
+        "reason": "Record complete v21 QSC geometry, canonical cube alias provenance and raster-plan identity."
+      },
+      {
+        "module": "workers",
+        "label": "ImportFrom:66",
+        "kind": "ImportFrom",
+        "sha256": "1f044906a704d10eb959dc10d14a53a984484a4d0570be78fc5776cb1d31e406",
+        "reason": "Require native spherical task results and reject D1 before device access; preserve Radial owner handling."
+      }
+    ],
+    "local_import_seams": [
+      {
+        "module": "cuda_backend",
+        "name": "_GpuWorkerRenderEngine",
+        "definition_sha256": "a442c02aebdd4a2f40d310d838f89d7e522cd828ff1af4166d5275f26703aa39",
+        "seam_sha256": "61456a7e052e01fdd6a7d69b765fc39465506c03094833384038bede77b79d72",
+        "reason": "Use a dedicated bounded spherical renderer/cache and reject incompatible fused/ring paths; preserve Radial mathematics."
+      },
+      {
+        "module": "runtime",
+        "name": "cpu_inference_supports_view",
+        "definition_sha256": "b38f95f4415e0ac3bebe7c8cd13b8d5acd343cacacc776daaa637c00e60505c7",
+        "seam_sha256": "0b1941f6b49484feb4c3811f9148230e4121998b195a8ebad4f05432f3d57bd4",
+        "reason": "Admit native spherical patches through the explicit CPU inference family predicate."
+      },
+      {
+        "module": "inference",
+        "name": "predict_source_and_accumulate",
+        "definition_sha256": "99ca4d32238e6c6915ee2e2815b9b65d83a664eb3416a2652ff883d7d3be2601",
+        "seam_sha256": "ccf37e9656817910658d67d9c07dd114ce6eb29a820fda1bfa904ac246d955d8",
+        "reason": "Preserve explicitly reviewed local-import ownership while adding D1 fail-fast validation before generic prediction; the inserted guard shifts the existing seam offsets."
+      }
+    ],
+    "complete_modules": [
+      "qsc",
+      "spherical_geometry",
+      "spherical_cuda",
+      "spherical_projection",
+      "spherical_projection_cuda"
+    ],
+    "preserved_radial_modules": [
+      {
+        "module": "cylindrical_cuda_projection",
+        "sha256": "a15a139342d17fbc65e3e004f210a842aebc272ec0bd892baccf1bb59fe9d29e",
+        "reason": "Unchanged v20 Radial mathematics, native projection, crop encoding and inference-owner lifecycle; source newlines normalized."
+      },
+      {
+        "module": "cylindrical_geometry",
+        "sha256": "f04abbcf98189450c0bb6de3e5652eb47a16af1160ea606da1fb9419b9276e54",
+        "reason": "Unchanged v20 Radial mathematics, native projection, crop encoding and inference-owner lifecycle; source newlines normalized."
+      },
+      {
+        "module": "cylindrical_owner",
+        "sha256": "48b9ac7441e220d280f3367b53cd930865d8b99f5e63867439eeddd8b182f20e",
+        "reason": "Unchanged v20 Radial mathematics, native projection, crop encoding and inference-owner lifecycle; source newlines normalized."
+      },
+      {
+        "module": "cylindrical_projection",
+        "sha256": "dd386efe482f586356b955868682cb717e4bfdfc9ea9583de1b3b09b9467c82a",
+        "reason": "Unchanged v20 Radial mathematics, native projection, crop encoding and inference-owner lifecycle; source newlines normalized."
+      }
+    ],
+    "preserved_radial_definitions": [
+      {
+        "module": "cuda_backend",
+        "qualified_name": "_GpuWorkerRenderEngine._render_radial_native_resident",
+        "sha256": "e4368aa883deadf0932d8764cb55b7123d17b3d428dc07619e283855fb39ba9d",
+        "reason": "Keep Radial source reconstruction and scalar CUDA/Torch native arithmetic unchanged."
+      },
+      {
+        "module": "cuda_backend",
+        "qualified_name": "_GpuWorkerRenderEngine._render_radial_native_resident_cuda",
+        "sha256": "b8d9f6fdd49e97d990415143f0a752e5f8dfa83c372b4e10a76509e2e39ec335",
+        "reason": "Keep Radial source reconstruction and scalar CUDA/Torch native arithmetic unchanged."
+      },
+      {
+        "module": "cuda_backend",
+        "qualified_name": "_GpuWorkerRenderEngine._render_radial_native_resident_torch",
+        "sha256": "3eb9eb98414db312ce3aa2dfd26d204b4a0ac51932c501fc8e2b9f93ab86ae49",
+        "reason": "Keep Radial source reconstruction and scalar CUDA/Torch native arithmetic unchanged."
+      }
+    ]
   }
 }

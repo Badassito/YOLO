@@ -4458,6 +4458,12 @@ def backproject_radial_volume_to_volume(*args, **kwargs):
     return project(*args, **kwargs)
 
 
+def backproject_spherical_volume_to_volume(*args, **kwargs):
+    """Dispatch QSC radius stacks to their bounded source-space projector."""
+    from .spherical_projection import backproject_spherical_volume_to_volume as project
+    return project(*args, **kwargs)
+
+
 @dataclass(frozen=True)
 class ViewBackprojectionQueueJob:
     model_name: str
@@ -4500,6 +4506,12 @@ class HybridBackprojectionQueue:
                 out_path=job.out_path, desc=job.desc, workers=int(job.workers),
                 out_shape_tyx=job.out_shape_tyx,
             )
+        elif view_local.family == 'spherical':
+            projected = backproject_spherical_volume_to_volume(
+                spherical_mask_mm=job.native_source, spherical_view=view_local,
+                out_path=job.out_path, desc=job.desc, workers=int(job.workers),
+                out_shape_tyx=job.out_shape_tyx,
+            )
         elif is_tilted_view(view_local):
             projected = backproject_tilted_volume_to_volume(
                 tilted_mask_mm=job.native_source,
@@ -4532,6 +4544,8 @@ class HybridBackprojectionQueue:
                     )
             elif job.view.family == 'radial':
                 backend_note = 'bounded CPU cylindrical shell projection'
+            elif job.view.family == 'spherical':
+                backend_note = 'bounded spherical QSC shell projection'
             else:
                 backend_note = 'CPU tilted path'
             print(f'Backprojection queue: running {job.model_name}/{job.view.name} via {backend_note}')

@@ -9,7 +9,7 @@ from typing import Any, Mapping, Sequence
 from .context import UnifiedLaunchContext
 
 
-TTA_RUN_MANIFEST_SCHEMA = "xta.v20.run_manifest/1"
+TTA_RUN_MANIFEST_SCHEMA = "xta.v21.run_manifest/1"
 TTA_VOXEL_COUNT_SCHEMA = "xta.v18.voxel_count/1"
 
 
@@ -88,6 +88,55 @@ def radial_view_plan_metadata(view: Any) -> dict[str, Any]:
     """Bind shell geometry into plan identity while retaining other-family metadata."""
     record = radial_view_manifest_record(view)
     return {} if record is None else {"radial_shell": record}
+
+
+_SPHERICAL_VIEW_FIELDS = (
+    "spherical_face", "spherical_group", "spherical_request_tokens",
+    "spherical_tilted_source", "spherical_min_radius", "spherical_max_radius",
+    "spherical_step", "spherical_radii", "spherical_face_intervals",
+    "spherical_patch_size", "spherical_u_origin", "spherical_v_origin",
+    "spherical_patch_u", "spherical_patch_v", "spherical_rotation_xyz",
+)
+
+
+def spherical_view_manifest_record(view: Any) -> dict[str, Any] | None:
+    """Record one QSC face-patch radius trajectory and its canonical cube."""
+    if str(getattr(view, "family", "")) != "spherical":
+        return None
+    record: dict[str, Any] = {}
+    for field in _SPHERICAL_VIEW_FIELDS:
+        value = getattr(view, field)
+        record[field] = list(value) if isinstance(value, tuple) else value
+    return {
+        **record,
+        "source_shape_t_y_x": [int(view.full_t), int(view.full_h), int(view.full_w)],
+        "center_x_y_t": [
+            (int(view.full_w) - 1) / 2.0,
+            (int(view.full_h) - 1) / 2.0,
+            (int(view.full_t) - 1) / 2.0,
+        ],
+        "native_patch_shape_h_w": [int(view.src_h), int(view.src_w)],
+        "tilt_angle_deg": float(view.tilt_angle_deg),
+        "tilt_direction": str(view.tilt_direction),
+        "projection": "quadrilateralized_spherical_cube_equal_area",
+        "slice_direction": "radius",
+        "input_axes": ["qsc_face_u", "qsc_face_v"],
+        "face_grid": "fixed_outer_radius_endpoint_inclusive_n_plus_one_samples",
+        "face_boundary": "inclusive_shared_face_edges; outside_face_patch_padding_zero",
+        "source_boundary": "zero_extended_trilinear_intensity; nearest_categorical_outside_zero",
+        "channel_boundary": "clamp_radius_within_face_patch_trajectory",
+        "patch_frame_mapping": "spherical_radii[frame_index] at fixed QSC face and patch origins",
+        "rotation_convention": "row_major_xyz_matrix_rotates_cube_directions_about_source_center",
+        "patch_is_tile": False,
+        "tile_parent": "native_qsc_face_patch",
+        "coverage_domain": "minimum_radius_to_largest_inscribed_sphere; central_core_excluded",
+    }
+
+
+def spherical_view_plan_metadata(view: Any) -> dict[str, Any]:
+    """Bind complete QSC geometry and cube rotation into raster-plan identity."""
+    record = spherical_view_manifest_record(view)
+    return {} if record is None else {"spherical_shell": record}
 
 
 def _sha256_file(path: Path) -> str:
@@ -258,6 +307,9 @@ def _view_record(view: Any) -> dict[str, Any]:
     radial = radial_view_manifest_record(view)
     if radial is not None:
         record.update(radial)
+    spherical = spherical_view_manifest_record(view)
+    if spherical is not None:
+        record.update(spherical)
     return record
 
 
@@ -268,7 +320,7 @@ def _channel_record(channel_format: Any) -> dict[str, Any]:
         "channel_count": int(channel_format.channel_count),
         "stride": int(channel_format.stride),
         "offsets": [int(value) for value in channel_format.offsets],
-        "boundary_policy": "azimuthal_wrap_mirror_u_radial_radius_clamp_cartesian_edge_clamp",
+        "boundary_policy": "azimuthal_wrap_mirror_u_radial_radius_clamp_spherical_radius_clamp_cartesian_edge_clamp",
         "prediction_assignment": "center_slice_only",
         "direction": "forward",
     }
@@ -298,6 +350,7 @@ def build_tta_run_manifest(
     output_paths: Mapping[str, str | Path],
     output_metadata: Mapping[str, Any] | None = None,
     radial_requests: Sequence[Any] = (),
+    spherical_requests: Sequence[Any] = (),
 ) -> dict[str, Any]:
     """Build the complete success manifest without importing numerical runtimes."""
 
@@ -356,6 +409,42 @@ def build_tta_run_manifest(
         for token in radial_tokens
     ]
 
+    spherical_records = [
+        record for record in physical_records if str(record["family"]) == "spherical"
+    ]
+    spherical_group_ids = list(dict.fromkeys(
+        str(record["spherical_group"]) for record in spherical_records
+    ))
+    spherical_groups = []
+    for group_id in spherical_group_ids:
+        trajectories = [
+            record for record in spherical_records
+            if str(record["spherical_group"]) == group_id
+        ]
+        spherical_groups.append({
+            "group": group_id,
+            "requested_views": list(dict.fromkeys(
+                str(token) for record in trajectories
+                for token in record["spherical_request_tokens"]
+            )),
+            "concrete_patch_trajectories": trajectories,
+        })
+    spherical_tokens = list(dict.fromkeys(
+        [str(request.view) for request in spherical_requests]
+        + [str(token) for record in spherical_records
+           for token in record["spherical_request_tokens"]]
+    ))
+    spherical_request_records = [
+        {
+            "view": token,
+            "canonical_groups": [
+                group["group"] for group in spherical_groups
+                if token in group["requested_views"]
+            ],
+        }
+        for token in spherical_tokens
+    ]
+
     paths = {str(key): str(Path(value)) for key, value in output_paths.items()}
 
     return {
@@ -397,6 +486,8 @@ def build_tta_run_manifest(
             "inference_view_variants": inference_records,
             "azimuthal_groups": azimuthal_groups,
             "radial_groups": radial_groups,
+            "spherical_groups": spherical_groups,
+            "spherical_requests": spherical_request_records,
             "tiles": [
                 {
                     "config_id": str(config.config_id),
@@ -432,4 +523,6 @@ __all__ = (
     "capture_tta_artifact_identities",
     "radial_view_manifest_record",
     "radial_view_plan_metadata",
+    "spherical_view_manifest_record",
+    "spherical_view_plan_metadata",
 )

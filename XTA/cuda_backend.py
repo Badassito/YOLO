@@ -65,6 +65,7 @@ from .geometry import (
     get_tilted_render_plan,
     is_azimuthal_view,
     is_radial_view,
+    is_spherical_view,
     is_tilted_azimuthal_view,
     is_tilted_view,
     make_dense_tile_channel_renderer,
@@ -91,6 +92,7 @@ from .inference import (
 )
 from .unification.contracts import DataRole
 from .unification.sampling import require_forward_sampling
+from .spherical_cuda import clear_spherical_render_cache, render_spherical_native_resident
 
 
 if TYPE_CHECKING:
@@ -1054,7 +1056,7 @@ def fused_renderer_preflight_tolerances() -> Tuple[float, float, float, float, f
     )
 
 def _fused_preflight_family(view: ViewInfo) -> str:
-    if is_radial_view(view):
+    if is_radial_view(view) or is_spherical_view(view):
         return ''
     if is_tilted_azimuthal_view(view):
         return 'tilted_azimuthal'
@@ -1281,6 +1283,7 @@ class _GpuWorkerRenderEngine:
         self._native_t_map_cache.clear()
         self._native_plane_cache.clear()
         self._native_u8_plane_cache.clear()
+        clear_spherical_render_cache(self)
         self._fold_cache.clear()
         self._tilted_plans.clear()
         self._fused_azimuthal_taps.clear()
@@ -1410,6 +1413,7 @@ class _GpuWorkerRenderEngine:
         self._native_t_map_cache.clear()
         self._native_plane_cache.clear()
         self._native_u8_plane_cache.clear()
+        clear_spherical_render_cache(self)
         self._fold_cache.clear()
         self._tilted_plans.clear()
         self._fused_azimuthal_taps.clear()
@@ -1508,6 +1512,7 @@ class _GpuWorkerRenderEngine:
                 '_fold_cache', '_tilted_plans', '_fused_azimuthal_taps',
             )
             cache_entries = sum(len(getattr(self, name)) for name in cache_names)
+            cache_entries += len(getattr(self, '_spherical_direction_cache', ()))
             # A texture namespace retains both its CUDAarray and the original
             # linear source via source_ref. Clear every owning reference, including
             # ones a now-retired source object may still hold to this namespace.
@@ -1520,6 +1525,7 @@ class _GpuWorkerRenderEngine:
             self._volume_gpu = None
             for name in cache_names:
                 getattr(self, name).clear()
+            clear_spherical_render_cache(self)
             self._standalone_render_meta = None
             self._standalone_render_meta_ref = None
             self._fused_preflight_volume_key = None
@@ -1553,6 +1559,7 @@ class _GpuWorkerRenderEngine:
         self._native_t_map_cache.clear()
         self._native_plane_cache.clear()
         self._native_u8_plane_cache.clear()
+        clear_spherical_render_cache(self)
         self._fold_cache.clear()
         self._tilted_plans.clear()
         self._fused_azimuthal_taps.clear()
@@ -1929,7 +1936,7 @@ class _GpuWorkerRenderEngine:
         stage_metadata: bool = True,
         disable_on_failure: bool = True,
     ) -> bool:
-        if is_radial_view(view):
+        if is_radial_view(view) or is_spherical_view(view):
             return False
         if not fused_tilted_render_enabled() or 'tilted' in self._fused_disabled_families:
             return False
@@ -2163,7 +2170,7 @@ class _GpuWorkerRenderEngine:
         # Local import keeps the package dependency graph acyclic.
         from .backprojection import _ResidentTensorRTRingFatalError
 
-        if is_radial_view(view):
+        if is_radial_view(view) or is_spherical_view(view):
             return False
         family = 'azimuthal' if str(view.family) == 'azimuthal' else ('tilted' if is_tilted_view(view) else '')
         if not family:
@@ -3344,8 +3351,8 @@ class _GpuWorkerRenderEngine:
     ) -> object:
         """Return one resident ordinary-Cartesian plane without a float round trip."""
 
-        if is_azimuthal_view(view) or is_radial_view(view) or is_tilted_view(view):
-            raise ValueError("ordinary Cartesian u8 rendering excludes cylindrical and Tilted views")
+        if is_azimuthal_view(view) or is_radial_view(view) or is_spherical_view(view) or is_tilted_view(view):
+            raise ValueError("ordinary Cartesian u8 rendering excludes cylindrical, spherical, and Tilted views")
         physical = str(physical_view_name(view))
         if physical not in {"transverse", "sagittal", "coronal"}:
             raise ValueError(f"unsupported ordinary Cartesian view {physical!r}")
@@ -3405,6 +3412,8 @@ class _GpuWorkerRenderEngine:
         self._native_u8_plane_cache.clear()
 
     def _render_native_plane(self, view: ViewInfo, frame_idx: int) -> object:
+        if is_spherical_view(view):
+            return self._render_spherical_native_resident(view, int(frame_idx))
         if is_radial_view(view):
             return self._render_radial_native_resident(view, int(frame_idx))
         vol = self._volume_gpu
@@ -3425,6 +3434,10 @@ class _GpuWorkerRenderEngine:
         if str(view.family) == 'azimuthal':
             return self._render_azimuthal_native_resident(view, int(frame_idx))
         raise ValueError(f'Unsupported view for GPU native plane: {name}')
+
+    def _render_spherical_native_resident(self, view: ViewInfo, frame_idx: int) -> object:
+        """Render fixed QSC face directions at one clamped-channel shell radius."""
+        return render_spherical_native_resident(self, view, int(frame_idx))
 
     def _render_radial_native_resident(self, view: ViewInfo, frame_idx: int) -> object:
         """Prefer one scalar-geometry CUDA launch; retain the explicit Torch reference."""
@@ -3899,7 +3912,7 @@ class GpuRenderedYoloSource:
         require_forward_sampling('cuda', DataRole.INTENSITY)
         self.engine = engine
         self.view = view
-        self.resident_ring_supported = not is_radial_view(view)
+        self.resident_ring_supported = not (is_radial_view(view) or is_spherical_view(view))
         self.job = job
         self.slice_offset = int(slice_offset)
         self.name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(name)).strip('_') or 'gpu_rendered_volume'
@@ -3967,7 +3980,7 @@ class GpuRenderedYoloSource:
  engines may expose an input binding whose dtype differs from that policy. The capability
  probe resolves the actual binding first; ``self.fp16`` is only the generic fallback."""
         if not bool(getattr(self, 'resident_ring_supported', True)):
-            raise RuntimeError('Radial shell views use generic CUDA inference; the resident ring is unsupported')
+            raise RuntimeError('Radial shell and Spherical QSC views use generic CUDA inference; the resident ring is unsupported')
         if (
             self.bs != 1
             or self.nf <= 0
@@ -4143,7 +4156,7 @@ class GpuTileRenderedYoloSource:
         require_forward_sampling('cuda', DataRole.INTENSITY)
         self.engine = engine
         self.view = view
-        self.resident_ring_supported = not is_radial_view(view)
+        self.resident_ring_supported = not (is_radial_view(view) or is_spherical_view(view))
         self.tile_job = tile_job
         self.tile_affine = np.asarray(tile_job.M_out_to_src, dtype=np.float32)
         self.slice_offset = int(slice_offset)
@@ -4205,7 +4218,7 @@ class GpuTileRenderedYoloSource:
     def prepare_direct_ring(self, input_dtype: Optional[object] = None) -> List[_ResidentGpuPipelineSlot]:
         """Allocate and validate two static TensorRT input slots for this tile."""
         if not bool(getattr(self, 'resident_ring_supported', True)):
-            raise RuntimeError('Radial shell views use generic CUDA inference; the resident tile ring is unsupported')
+            raise RuntimeError('Radial shell and Spherical QSC views use generic CUDA inference; the resident tile ring is unsupported')
         if self.bs != 1 or self.nf <= 0 or str(getattr(self.engine, '_mode', '')) != 'resident':
             raise RuntimeError('direct tile ring requires a nonempty batch-1 resident tile source')
         torch = self.engine.torch

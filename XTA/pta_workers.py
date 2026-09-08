@@ -580,7 +580,9 @@ def projection_phase_summary(
         if count <= 0:
             continue
         shared_view = plan.view.shared_view
-        if shared_view is not None and shared_geometry.is_radial_view(shared_view):
+        if shared_view is not None and shared_geometry.is_spherical_view(shared_view):
+            family = 'spherical'
+        elif shared_view is not None and shared_geometry.is_radial_view(shared_view):
             family = 'radial'
         elif shared_view is not None and shared_geometry.is_azimuthal_view(shared_view):
             family = (
@@ -1165,11 +1167,14 @@ def _gpu_projected_item_image(
     frame_idx: int,
     item_key: str,
 ) -> Optional[Tuple[object, object]]:
-    """Render one canonical Cartesian/cylindrical/Tilted intensity item on CUDA."""
+    """Render one canonical physical-view intensity item on CUDA."""
 
     shared_view = plan.view.shared_view
     radial_view = bool(
         shared_view is not None and shared_geometry.is_radial_view(shared_view)
+    )
+    spherical_view = bool(
+        shared_view is not None and shared_geometry.is_spherical_view(shared_view)
     )
     azimuthal_view = bool(
         shared_view is not None and shared_geometry.is_azimuthal_view(shared_view)
@@ -1179,23 +1184,26 @@ def _gpu_projected_item_image(
         and shared_geometry.is_tilted_view(shared_view)
         and not azimuthal_view
         and not radial_view
+        and not spherical_view
     )
     cartesian_view = bool(
         shared_view is not None
         and not azimuthal_view
         and not radial_view
+        and not spherical_view
         and not tilted_view
         and shared_geometry.physical_view_name(shared_view)
         in {"transverse", "sagittal", "coronal"}
     )
     if (
         shared_view is None
-        or not (cartesian_view or azimuthal_view or radial_view or tilted_view)
+        or not (cartesian_view or azimuthal_view or radial_view or spherical_view or tilted_view)
         or str(plan.channel_variant.kind) not in {"gray", "rgb", "custom"}
     ):
         return None
     gate_name = (
-        "YOLO_TTA_PTA_GPU_RADIAL_RENDER"
+        "YOLO_TTA_PTA_GPU_SPHERICAL_RENDER"
+        if spherical_view else "YOLO_TTA_PTA_GPU_RADIAL_RENDER"
         if radial_view else "YOLO_TTA_PTA_GPU_AZIMUTHAL_RENDER"
         if azimuthal_view
         else (
@@ -1211,7 +1219,7 @@ def _gpu_projected_item_image(
     if azimuthal_view and _azimuthal_source_mode() != "texture_linear":
         return None
     family_key = (
-        "radial" if radial_view else (
+        "spherical" if spherical_view else "radial" if radial_view else (
             "azimuthal" if azimuthal_view else ("tilted" if tilted_view else "cartesian")
         )
     )
@@ -1295,10 +1303,14 @@ def _gpu_projected_item_image(
             native_by_address: Dict[Tuple[int, bool], object] = {}
             with torch.cuda.stream(renderer._stream):  # type: ignore[union-attr]
                 for source_index, mirror_u in dict.fromkeys(addresses):
-                    if radial_view:
+                    if radial_view or spherical_view:
                         if bool(mirror_u):
-                            raise RuntimeError('Radial shell channels clamp along radius and cannot mirror azimuthal-u')
-                        native = renderer._render_radial_native_resident(  # type: ignore[union-attr]
+                            raise RuntimeError('Shell channels clamp along radius and cannot mirror azimuthal-u')
+                        render_native = (
+                            renderer._render_spherical_native_resident  # type: ignore[union-attr]
+                            if spherical_view else renderer._render_radial_native_resident  # type: ignore[union-attr]
+                        )
+                        native = render_native(
                             shared_view, int(source_index),
                         )
                         native_u8 = native.round().clamp_(0.0, 255.0).to(torch.uint8)
@@ -1364,7 +1376,8 @@ def _gpu_projected_item_image(
                 ready_event = torch.cuda.Event()
                 ready_event.record(renderer._stream)  # type: ignore[union-attr]
             announced_key = (
-                "radial_renderer_announced"
+                "spherical_renderer_announced"
+                if spherical_view else "radial_renderer_announced"
                 if radial_view else "azimuthal_renderer_announced"
                 if azimuthal_view
                 else (
@@ -1376,7 +1389,8 @@ def _gpu_projected_item_image(
             if isinstance(runtime, dict) and not bool(runtime.get(announced_key)):
                 runtime[announced_key] = True
                 family_label = (
-                    "Radial"
+                    "Spherical"
+                    if spherical_view else "Radial"
                     if radial_view else "Azimuthal"
                     if azimuthal_view
                     else ("Tilted Cartesian" if tilted_view else "Cartesian")
@@ -2054,6 +2068,16 @@ def execute_gpu_frame_batch_task(
         )
         if isinstance(runtime, dict):
             runtime["cartesian_renderer_manifest_announced"] = True
+    if (
+        bool(runtime.get("spherical_renderer_announced"))
+        and not bool(runtime.get("spherical_renderer_manifest_announced"))
+    ):
+        local_warnings.add(
+            'pta_cuda_spherical_projection_active',
+            'TTA resident Spherical QSC intensity projector; categorical masks retain CPU nearest sampling',
+        )
+        if isinstance(runtime, dict):
+            runtime['spherical_renderer_manifest_announced'] = True
     if (
         bool(runtime.get("radial_renderer_announced"))
         and not bool(runtime.get("radial_renderer_manifest_announced"))

@@ -18,6 +18,11 @@ MANIFEST = PACKAGE / "_package_inventory.json"
 # Formatting or review metadata may change; statement names/hashes may not.
 IMMUTABLE_INVENTORY_STATEMENTS_SHA256 = '0c32fe9dcf8531e246e996cd276a010659f5564edb87f445b44dc7065147dfc5'
 
+# The v21 appendix records exact reviewed additions and supersessions. Keep the
+# immutable statement inventory and all v20 pins intact; only this explicit
+# release review may replace their effective current-definition digests.
+REVIEWED_V21_SHA256 = '47204e5024f23a6e8db72c215fd0dadf9e46a5bfa49aef50056add8ffbfc15e9'
+
 # These definitions have reviewed, intentional implementation changes.
 INTENTIONALLY_CHANGED = {
     ("assembly", "materialize_interpolation_component_nrrd_view_layer"),
@@ -1133,6 +1138,25 @@ def reviewed_local_import_seams(
     return reviewed
 
 
+def reviewed_v21_contract(manifest: dict[str, object]) -> dict[str, object]:
+    """Authenticate the additive QSC review without rebaselining history."""
+    review = manifest.get('v21_review', {})
+    encoded = json.dumps(review, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    if hashlib.sha256(encoded).hexdigest() != REVIEWED_V21_SHA256:
+        raise RuntimeError('v21 review digest mismatch; require explicit review of changed contracts')
+    if review.get('release') != '21.0.0':
+        raise RuntimeError('v21 review has an unexpected release identity')
+    for category, identity in (
+        ('definitions', 'name'), ('statements', 'label'),
+        ('local_import_seams', 'name'), ('preserved_radial_modules', 'module'),
+        ('preserved_radial_definitions', 'qualified_name'),
+    ):
+        keys = [(item['module'], item[identity]) for item in review[category]]
+        if len(keys) != len(set(keys)) or any(not item.get('reason') for item in review[category]):
+            raise RuntimeError(f'v21 review has duplicate or unexplained {category}')
+    return review
+
+
 def main() -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     baseline_digest = hashlib.sha256(json.dumps(
@@ -1141,6 +1165,20 @@ def main() -> None:
     if baseline_digest != IMMUTABLE_INVENTORY_STATEMENTS_SHA256:
         raise RuntimeError('immutable inventory digest mismatch; retain historical statement records and add explicit reviews')
     rename_replacements = azimuthal_rename_replacements(manifest)
+    v21 = reviewed_v21_contract(manifest)
+    v21_definitions = {(item['module'], item['name']): item for item in v21['definitions']}
+    v21_seams = {
+        (item['module'], item['name']): (item['definition_sha256'], item['seam_sha256'])
+        for item in v21['local_import_seams']
+    }
+
+    def reviewed_definition_hash(module: str, name: str, previous_hash: str) -> str:
+        record = v21_definitions.get((module, name))
+        if record is None:
+            return previous_hash
+        if record['previous_sha256'] != previous_hash:
+            raise RuntimeError(f'v21 supersession does not match its historical pin: {module}.{name}')
+        return str(record['sha256'])
 
     available: dict[str, Counter[str]] = {}
     trees: dict[str, ast.Module] = {}
@@ -1150,6 +1188,9 @@ def main() -> None:
         {str(item["module"]) for item in manifest["statements"]}
         | {module for module, _name in REVIEWED_V20_ADDED_DEFINITIONS}
         | {module for module, _label in REVIEWED_V20_ADDED_STATEMENTS}
+        | {item['module'] for item in v21['definitions']}
+        | {item['module'] for item in v21['statements']}
+        | {item['module'] for item in v21['preserved_radial_modules']}
     )
     for module in audited_modules:
         module_path = PACKAGE / f"{module}.py"
@@ -1161,6 +1202,7 @@ def main() -> None:
         local_import_seams.update(reviewed_local_import_seams(module, module_source, tree))
 
     for (module, name), (expected_hash, reason) in REVIEWED_V20_ADDED_DEFINITIONS.items():
+        expected_hash = reviewed_definition_hash(module, name, expected_hash)
         matches = [node for node in top_level.get(module, ()) if getattr(node, 'name', None) == name]
         if not reason or len(matches) != 1 or digest(matches[0]) != expected_hash:
             raise RuntimeError(f'v20 reviewed added definition changed or is missing: {module}.{name}')
@@ -1168,16 +1210,46 @@ def main() -> None:
         if not reason or available.get(module, Counter())[expected_hash] != 1:
             raise RuntimeError(f'v20 reviewed added statement changed or is missing: {module}.{label}')
 
+    for (module, name), record in v21_definitions.items():
+        matches = [node for node in top_level[module] if getattr(node, 'name', None) == name]
+        if len(matches) != 1 or digest(matches[0]) != record['sha256']:
+            raise RuntimeError(f'v21 reviewed definition changed or is missing: {module}.{name}')
+    for item in v21['statements']:
+        if available[item['module']][item['sha256']] != 1:
+            raise RuntimeError(f'v21 reviewed statement changed or is missing: {item["module"]}.{item["label"]}')
+    for module in v21['complete_modules']:
+        expected = Counter(item['sha256'] for item in v21['definitions'] + v21['statements'] if item['module'] == module)
+        if available[module] != expected:
+            raise RuntimeError(f'v21 complete-module statement coverage differs: {module}')
+    for item in v21['preserved_radial_modules']:
+        source = (PACKAGE / f'{item["module"]}.py').read_text(encoding='utf-8')
+        if hashlib.sha256(source.encode('utf-8')).hexdigest() != item['sha256']:
+            raise RuntimeError(f'v21 changed a preserved Radial module: {item["module"]}')
+    for item in v21['preserved_radial_definitions']:
+        scope = trees[item['module']]
+        for name in item['qualified_name'].split('.'):
+            matches = [node for node in scope.body if getattr(node, 'name', None) == name]
+            if len(matches) != 1:
+                raise RuntimeError(f'v21 preserved Radial definition is missing: {item["qualified_name"]}')
+            scope = matches[0]
+        if digest(scope) != item['sha256']:
+            raise RuntimeError(f'v21 changed preserved Radial arithmetic: {item["qualified_name"]}')
+
+    expected_local_import_seams = {**REVIEWED_LOCAL_IMPORT_SEAMS, **v21_seams}
+    for key, (previous_hash, _previous_seam) in REVIEWED_LOCAL_IMPORT_SEAMS.items():
+        if key in v21_seams:
+            reviewed_definition_hash(*key, previous_hash)
+
     unexpected_local_import_seams = sorted(
-        set(local_import_seams) - set(REVIEWED_LOCAL_IMPORT_SEAMS)
+        set(local_import_seams) - set(expected_local_import_seams)
     )
     missing_local_import_seams = sorted(
-        set(REVIEWED_LOCAL_IMPORT_SEAMS) - set(local_import_seams)
+        set(expected_local_import_seams) - set(local_import_seams)
     )
     changed_local_import_seams = sorted(
         key
-        for key in set(local_import_seams) & set(REVIEWED_LOCAL_IMPORT_SEAMS)
-        if local_import_seams[key] != REVIEWED_LOCAL_IMPORT_SEAMS[key]
+        for key in set(local_import_seams) & set(expected_local_import_seams)
+        if local_import_seams[key] != expected_local_import_seams[key]
     )
     if unexpected_local_import_seams or missing_local_import_seams or changed_local_import_seams:
         raise RuntimeError(
@@ -1205,6 +1277,7 @@ def main() -> None:
     if untracked_v20:
         raise RuntimeError(f'v20 replacement reviews are absent from the immutable inventory: {untracked_v20!r}')
     for (module, _baseline_hash), (name, replacement_hash, reason) in REVIEWED_V20_STATEMENT_REPLACEMENTS.items():
+        replacement_hash = reviewed_definition_hash(module, name, replacement_hash)
         matches = [node for node in top_level[module] if getattr(node, 'name', None) == name]
         if not reason or len(matches) != 1 or digest(matches[0]) != replacement_hash:
             raise RuntimeError(f'v20 reviewed definition changed or is missing: {module}.{name}')
@@ -1330,6 +1403,7 @@ def main() -> None:
             continue
         if inventory_key in REVIEWED_V20_STATEMENT_REPLACEMENTS:
             _name, replacement_hash, _reason = REVIEWED_V20_STATEMENT_REPLACEMENTS[inventory_key]
+            replacement_hash = reviewed_definition_hash(module, _name, replacement_hash)
             available[module][replacement_hash] -= 1
             changed += 1
             continue

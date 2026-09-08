@@ -284,7 +284,10 @@ from .pta_scheduler import (
 from .unification.channels import resolve_channel_variants as resolve_v18_channel_variants
 from .workspace import azimuthal_source_mode as _azimuthal_source_mode
 from .unification.runtime import compile_physical_views
-from .unification.tta_manifest import radial_view_manifest_record, radial_view_plan_metadata
+from .unification.tta_manifest import (
+    radial_view_manifest_record, radial_view_plan_metadata,
+    spherical_view_manifest_record, spherical_view_plan_metadata,
+)
 from .unification.sampling import (
     build_forward_raster_plan,
     forward_sampling_execution_record,
@@ -1658,6 +1661,8 @@ def adapt_shared_view(view: shared_geometry.ViewInfo) -> ViewInfo:
         runtime_family = "azimuthal"
     elif str(view.family) == "radial":
         runtime_family = "radial"
+    elif shared_geometry.is_spherical_view(view):
+        runtime_family = "spherical"
     elif shared_geometry.is_tilted_view(view):
         # The old token described only transverse tilts.  It is retained solely
         # for PTA summary/filter call sites; ``shared_view`` owns the base axes.
@@ -1707,6 +1712,9 @@ def compile_v18_pta_views(
         radial_requests=tuple(getattr(config, "radial_requests", ())),
         radial_min_radius=getattr(getattr(config, "args", None), "radial_min_radius", None),
         radial_patch_size=int(azimuthal_native_raster) if int(azimuthal_native_raster) > 0 else 3072,
+        spherical_requests=tuple(getattr(config, "spherical_requests", ())),
+        spherical_min_radius=getattr(getattr(config, "args", None), "spherical_min_radius", None),
+        spherical_patch_size=int(azimuthal_native_raster),
     )
     return [adapt_shared_view(view) for view in compiled.views], compiled
 
@@ -1897,6 +1905,7 @@ def build_render_plan(
                 "runtime_job_id": str(tag),
                 "runtime_kind": "fullframe",
                 **radial_view_plan_metadata(view.shared_view),
+                **spherical_view_plan_metadata(view.shared_view),
             },
         )
 
@@ -1964,6 +1973,7 @@ def build_render_plan(
                         "tile_x": int(x),
                         "tile_y": int(y),
                         **radial_view_plan_metadata(view.shared_view),
+                        **spherical_view_plan_metadata(view.shared_view),
                     },
                 )
             tile_items.append(RenderTileItem(
@@ -2338,6 +2348,7 @@ def _v18_view_manifest_record(view: ViewInfo) -> Dict[str, object]:
         "tilt_direction": str(shared.tilt_direction),
         "azimuthal_tilted_source": bool(shared.azimuthal_tilted_source),
         "radial_geometry": radial_view_manifest_record(shared),
+        "spherical_geometry": spherical_view_manifest_record(shared),
     }
 
 
@@ -2505,7 +2516,7 @@ def write_v18_pta_manifest(
         + (("cpu", "categorical_ground_truth"),)
     )
     manifest = {
-        "schema": "pta-tta.v20.manifest.1",
+        "schema": "pta-tta.v21.manifest.1",
         "status": "complete",
         "pipeline_version": SCRIPT_VERSION,
         "mode": "pta",
@@ -2533,6 +2544,8 @@ def write_v18_pta_manifest(
             ],
             "radial_requests": [str(request.view) for request in config.radial_requests],
             "radial_min_radius": config.args.radial_min_radius,
+            "spherical_requests": [str(request.view) for request in config.spherical_requests],
+            "spherical_min_radius": config.args.spherical_min_radius,
             "tilted_groups": [
                 {
                     "views": list(group.views),
@@ -2603,6 +2616,8 @@ def write_v18_pta_manifest(
             "azimuthal_channel_boundary": "index_wrap_with_odd_crossing_mirror_u",
             "radial_channel_boundary": "clamp_radius_within_patch_trajectory",
             "radial_patch_boundary": "periodic_azimuth_without_reflection; unsheared_height_padding_zero; zero_extended_source_taps",
+            "spherical_channel_boundary": "clamp_radius_within_face_patch_trajectory",
+            "spherical_patch_boundary": "inclusive_qsc_face_edges; outside_face_patch_padding_zero; zero_extended_source_taps",
             "prediction_interpolation": "not_applicable_to_pta",
         },
         "external_augmentation": {
@@ -3360,6 +3375,7 @@ def prepare_loaded_source(
             *(f"cartesian:{name}" for name in v18_config.cartesian_views if str(name) != "transverse"),
             *(f"azimuthal:{request.view}" for request in v18_config.azimuthal_requests),
             *(f"radial:{request.view}" for request in v18_config.radial_requests),
+            *(f"spherical:{request.view}" for request in v18_config.spherical_requests),
             *(f"tilted:{','.join(group.views)}" for group in v18_config.tilted_groups),
         ]
         if disabled:
@@ -3377,6 +3393,7 @@ def prepare_loaded_source(
             cartesian_views=allowed_cartesian,
             azimuthal_requests=(),
             radial_requests=(),
+            spherical_requests=(),
             tilted_groups=(),
         )
     views, compiled_views = compile_v18_pta_views(
@@ -4426,6 +4443,15 @@ def write_pta_summary(
                     f"height_origin={shared.radial_height_origin:g}, "
                     f"periodic_patch={shared.radial_patch_size}"
                 )
+            if v.family == "spherical" and v.shared_view is not None:
+                shared = v.shared_view
+                extra = (
+                    f", cube_group={shared.spherical_group}, face={shared.spherical_face}, "
+                    f"shell_radii={list(shared.spherical_radii)}, "
+                    f"qsc_grid_intervals={shared.spherical_face_intervals}, "
+                    f"patch_origin=({shared.spherical_u_origin},{shared.spherical_v_origin}), "
+                    f"request_aliases={list(shared.spherical_request_tokens)}"
+                )
             lines.append(f"      {v.display_name}: frames={int(v.num_slices)}, source_plane=({int(v.src_w)}x{int(v.src_h)}){extra}")
         lines.append("    rendered_output_sets:")
         for st in rec.render_stats:
@@ -5252,6 +5278,7 @@ def main(
             ):
                 cuda_family = family in {
                     "cartesian", "upright-azimuthal", "tilted-cartesian", "tilted-azimuthal",
+                    "radial", "spherical",
                 }
                 backend_note = (
                     "resident CUDA when admitted; CPU fallback"

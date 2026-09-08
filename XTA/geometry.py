@@ -396,6 +396,7 @@ TILTED_VIEW_FAMILY = 'tilted'
 AZIMUTHAL_VIEW_FAMILY = 'azimuthal'
 
 RADIAL_VIEW_FAMILY = 'radial'
+SPHERICAL_VIEW_FAMILY = 'spherical'
 
 @dataclass(frozen=True)
 class ViewInfo:
@@ -445,6 +446,22 @@ class ViewInfo:
     radial_patch_size: int = 0
     radial_patch_index: int = 0
     radial_height_index: int = 0
+    # A spherical trajectory keeps one QSC face patch fixed across radii.
+    spherical_face: int = -1
+    spherical_group: str = ''
+    spherical_request_tokens: Tuple[str, ...] = ()
+    spherical_tilted_source: bool = False
+    spherical_min_radius: float = 0.0
+    spherical_max_radius: float = 0.0
+    spherical_step: float = 0.0
+    spherical_radii: Tuple[float, ...] = ()
+    spherical_face_intervals: int = 0
+    spherical_patch_size: int = 0
+    spherical_u_origin: int = 0
+    spherical_v_origin: int = 0
+    spherical_patch_u: int = 0
+    spherical_patch_v: int = 0
+    spherical_rotation_xyz: Tuple[float, ...] = (1., 0., 0., 0., 1., 0., 0., 0., 1.)
     # v16.4.0 TTA identity. ``name`` is the unique runtime variant name;
     # ``physical_view_name`` retains the underlying projection geometry name.
     physical_view_name: str = ''
@@ -497,6 +514,10 @@ def is_azimuthal_view(view: ViewInfo) -> bool:
 
 def is_radial_view(view: ViewInfo) -> bool:
     return str(view.family) == RADIAL_VIEW_FAMILY
+
+
+def is_spherical_view(view: ViewInfo) -> bool:
+    return str(getattr(view, 'family', '')) == SPHERICAL_VIEW_FAMILY
 
 def radial_base_view_name(view: ViewInfo) -> str:
     if not is_radial_view(view):
@@ -686,6 +707,10 @@ def view_output_token(view: ViewInfo) -> str:
         else:
             token = f'Radial{base}'
         token += f'_PatchU{view.radial_patch_index}_H{view.radial_height_index}'
+    elif is_spherical_view(view):
+        from .qsc import QSC_FACE_NAMES
+        token = (f'Spherical_{view.spherical_group}_{QSC_FACE_NAMES[view.spherical_face]}_'
+                 f'PatchU{view.spherical_patch_u}_V{view.spherical_patch_v}')
     elif is_azimuthal_view(view):
         base = str(azimuthal_base_view_name(view)).capitalize()
         if is_tilted_azimuthal_view(view):
@@ -912,6 +937,9 @@ def get_view_infos(
     radial_views: Optional[Sequence[str]] = None,
     radial_min_radius: Optional[float] = None,
     radial_patch_size: int = 3072,
+    spherical_views: Optional[Sequence[str]] = None,
+    spherical_min_radius: Optional[float] = None,
+    spherical_patch_size: int = 0,
 ) -> List[ViewInfo]:
     """Build the complete view set without changing any view-family geometry."""
     enabled_cartesian = resolve_cartesian_views(cartesian_views)
@@ -981,7 +1009,13 @@ def get_view_infos(
         min_radius=radial_min_radius, patch_size=int(radial_patch_size),
         tilted_views=tilted,
     )
-    return orthogonal + azimuthal_cartesian + tilted + azimuthal_tilted + shells
+    from .spherical_geometry import build_spherical_view_infos
+    spheres = build_spherical_view_infos(
+        int(T), int(H), int(W), targets=tuple(spherical_views or ()),
+        min_radius=spherical_min_radius, patch_size=int(spherical_patch_size),
+        tilted_views=tilted,
+    )
+    return orthogonal + azimuthal_cartesian + tilted + azimuthal_tilted + shells + spheres
 
 def orthogonal_views_only(views: Sequence[ViewInfo]) -> List[ViewInfo]:
     return [v for v in views if v.family == 'orthogonal']
@@ -1436,7 +1470,7 @@ def write_aug_job_meta(
     view: ViewInfo,
     channel_format: ChannelFormat = DEFAULT_CHANNEL_FORMAT,
 ) -> None:
-    from .unification.tta_manifest import radial_view_manifest_record
+    from .unification.tta_manifest import radial_view_manifest_record, spherical_view_manifest_record
     fmt = resolve_channel_format(channel_format)
     job.meta_path.parent.mkdir(parents=True, exist_ok=True)
     job.meta_path.write_text(
@@ -1461,6 +1495,7 @@ def write_aug_job_meta(
                 'azimuthal_source_view_name': str(view.azimuthal_source_view_name),
                 'azimuthal_request_token': str(view.azimuthal_request_token),
                 'radial_shell': radial_view_manifest_record(view),
+                'spherical_shell': spherical_view_manifest_record(view),
                 'tilt_frame_start': int(view.tilt_frame_start),
                 'tilt_frame_stop': int(view.tilt_frame_stop),
                 'out_size': int(job.aff.out_size),
@@ -1476,7 +1511,8 @@ def write_aug_job_meta(
                 'model_input_channels': int(fmt.channel_count),
                 'channel_stride': int(fmt.stride),
                 'channel_offsets': [int(v) for v in fmt.offsets],
-                'channel_boundary_policy': ('radial_radius_edge_clamp_periodic_arc'
+                'channel_boundary_policy': ('spherical_radius_edge_clamp_qsc_face_patch'
+                    if is_spherical_view(view) else 'radial_radius_edge_clamp_periodic_arc'
                     if is_radial_view(view) else 'azimuthal_wrap_mirror_u_cartesian_edge_clamp'),
                 'prediction_slice_policy': 'center_N_only',
             },
@@ -4192,7 +4228,7 @@ def build_fullframe_raster_plan(
 ) -> RasterPlan:
     """Build the canonical v18 TTA plan consumed by one full-frame job."""
 
-    from .unification.tta_manifest import radial_view_plan_metadata
+    from .unification.tta_manifest import radial_view_plan_metadata, spherical_view_plan_metadata
     fmt = resolve_channel_format(channel_format)
     return build_forward_raster_plan(
         mode='tta',
@@ -4210,6 +4246,7 @@ def build_fullframe_raster_plan(
             'runtime_job_id': str(job.aug_id),
             'runtime_kind': 'fullframe',
             **radial_view_plan_metadata(view),
+            **spherical_view_plan_metadata(view),
         },
     )
 
@@ -4228,7 +4265,7 @@ def build_dense_tile_raster_plan(
 ) -> RasterPlan:
     """Build the canonical v18 TTA plan consumed by one collapsed tile job."""
 
-    from .unification.tta_manifest import radial_view_plan_metadata
+    from .unification.tta_manifest import radial_view_plan_metadata, spherical_view_plan_metadata
     fmt = resolve_channel_format(channel_format)
     return build_forward_raster_plan(
         mode='tta',
@@ -4251,6 +4288,7 @@ def build_dense_tile_raster_plan(
             'tile_x': int(tile_job.tile_x),
             'tile_y': int(tile_job.tile_y),
             **radial_view_plan_metadata(view),
+            **spherical_view_plan_metadata(view),
         },
     )
 
@@ -4574,6 +4612,11 @@ def get_view_frame_by_index(
 
     T, H, W = volume_rgb.shape
 
+    if is_spherical_view(view):
+        from .spherical_geometry import render_shell_frame
+        wait_for_volume_ready(volume_rgb)
+        return render_shell_frame(volume_rgb, view, int(index))
+
     if is_radial_view(view):
         from .cylindrical_geometry import render_shell_frame
         wait_for_volume_ready(volume_rgb)
@@ -4625,6 +4668,11 @@ def get_categorical_view_frame_by_index(
     mask = np.asarray(mask_u8)
     if mask.ndim != 3:
         raise ValueError(f'Categorical source volume must be 3D, got {mask.shape}')
+
+    if is_spherical_view(view):
+        from .spherical_geometry import render_shell_frame
+        wait_for_volume_ready(mask_u8)
+        return render_shell_frame(mask, view, int(index), categorical=True)
 
     if is_radial_view(view):
         from .cylindrical_geometry import render_shell_frame
