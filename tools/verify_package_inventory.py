@@ -271,7 +271,7 @@ REVIEWED_LOCAL_IMPORT_SEAMS = {
         'd0e25f9ae060e0c7d74bece86ae3befb49f781d4a703061bb311fcb2c8d4f410',
     ),
     ('inference', 'predict_source_and_accumulate'): (
-        '6b3048e20bd43692dc08ba6ba9dd1e8db8ac6a6199cd60aff241a11a301f4fb4',
+        '28eec86038df26fe016c533232272e809cf340c62a8acc83a262fac84d190308',
         'ccf37e9656817910658d67d9c07dd114ce6eb29a820fda1bfa904ac246d955d8',
     ),
     ('inference', 'predict_source_and_submit_accumulation'): (
@@ -421,6 +421,11 @@ INTENTIONALLY_PRUNED_REPLACEMENTS = {
 # are semantic changes, never accepted by the mechanical Azimuthal rename map.
 # Key: immutable (module, baseline AST digest). Value: current name/digest/reason.
 REVIEWED_V20_STATEMENT_REPLACEMENTS = {
+    ('cuda_d1', 'bb0b1ecf37d4c52647a15defe499c22667663ca95fb7de4ec6cfbf0021143061'): (
+        '_d1_submit_publication',
+        '9af2021486da0d0e0b3910b4bfc2f79fa0ab6fe00791e9a3ec99d06afc6e0ae2',
+        'Reuse bounded source-bitset publication with explicit native-shell provenance while preserving legacy output semantics.',
+    ),
     ('geometry', 'c8e5256bd662acf22cc3768a96593fce8084353e0c54c2bb00f80c64d771075a'): (
         'ViewInfo',
         '698023677c765317066783bf66b23a0d618d2cc37b315ffe8148255c0124306a',
@@ -493,7 +498,7 @@ REVIEWED_V20_STATEMENT_REPLACEMENTS = {
     ),
     ('workers', 'f6c091cc8da972d22cd13d9135cc862ecbcc92b2c9ccca540d48d8a7b6eeb794'): (
         'run_prediction_volume_in_worker',
-        '0bdc55513468799cba2ce21a433802935419fae01c888bef1e100fc8f9746524',
+        '6dd4ac73111d24f25196e3442378ab5a434eb44dee84c6fb4fc88cdfff6fad2b',
         'Avoid irrelevant eager fused preflight for generic paths and emit flushed per-family render/result provenance, including CPU fallback.',
     ),
     ('assembly', 'fbe3c9b679863c1c1e49085f5e3b98ca730c8bc2f6d96979ed390a7a2b190a05'): (
@@ -503,7 +508,7 @@ REVIEWED_V20_STATEMENT_REPLACEMENTS = {
     ),
     ('pipeline', 'a2c4a36ea39c43fb451b6667bdb8aa0507d56f849d4d7b3768dd46476af98fc2'): (
         '_main_impl',
-        '28327a4faf3ce0f844c09b808a38d240ba69705a44f82aa9f08d3062e5e00a5a',
+        '77c8fb4a692638ce0f7912308e95a3b902fdee05a3b6ea2c278c7d9f6f5985a2',
         'Authorize skipped non-interpolated drain copies only when component-ref retirement is active, tiling is absent and temporary artifacts are not retained; existing terminal ownership retires the original.',
     ),
     ('assembly', '43e838c80f5d1abeb35369a50161eb5363f95cfaa560d9b6f7cf437dc1c20567'): (
@@ -523,6 +528,98 @@ REVIEWED_V20_STATEMENT_REPLACEMENTS = {
 # Kernel source is a string constant inside its factory's AST, so its digest
 # covers the actual CUDA arithmetic as well as Python compilation/fallback logic.
 REVIEWED_V20_ADDED_DEFINITIONS = {
+    ('cylindrical_owner', '_bucket_shell_pixels_numpy'): (
+        'f247ed177d854a52dad612649a85d5ee3f19d81f427e8eb19b2acb9edb586f68',
+        'Stable vectorized shell buckets preserve exact pixel order when optional JIT compilation is unavailable.',
+    ),
+    ('cylindrical_owner', 'shutdown_radial_owners'): (
+        '934300c210658758a74c761fa460398ee226e7b4c684e774afddb57c4cec08db',
+        'Native-shell owner boundary: exact cleanup/projection, coverage, bounded resource ownership or runtime provenance.',
+    ),
+    ('cylindrical_owner', 'preflight_radial_owner'): (
+        'ddb926a9b0dbd536691f1bf5ac15f321a1225a03625cfbd8d11f2d368648b5db',
+        'Native-shell owner boundary: exact cleanup/projection, coverage, bounded resource ownership or runtime provenance.',
+    ),
+    ('cylindrical_owner', 'active_radial_owners'): (
+        '24f66e6f282c5e1990c14a45130c63e815ecb418062bc96b3dd698c5f7e436a3',
+        'Native-shell owner boundary: exact cleanup/projection, coverage, bounded resource ownership or runtime provenance.',
+    ),
+    ('cylindrical_owner', 'consume_radial_device_union'): (
+        '5b8435cbdb92feb449a6fbab2c347835bfc5e27bf32ebcdcac924685dc79a933',
+        'Native-shell owner boundary: exact cleanup/projection, coverage, bounded resource ownership or runtime provenance.',
+    ),
+    ('cylindrical_owner', 'RadialOwner'): (
+        '710eb39c851132e4d7865a03c5a6bebb4f0b2dd10b84d17dd39277620e1a4042',
+        'Native-shell owner boundary: exact cleanup/projection, coverage, bounded resource ownership or runtime provenance.',
+    ),
+    ('cylindrical_owner', '_bucket_shell_pixels'): (
+        '234cadc5b2e81fcaacd479e6c8054f9e82243bb4e69e6f0cec30bb83ee19e1e1',
+        'Native-shell owner boundary: exact cleanup/projection, coverage, bounded resource ownership or runtime provenance.',
+    ),
+    ('cylindrical_owner', 'is_radial_owner_task'): (
+        'ef6221af1b8063ddd35778f54a66801ed2fc1c5abd0617554c84d75d8fe34755',
+        'Native-shell owner boundary: exact cleanup/projection, coverage, bounded resource ownership or runtime provenance.',
+    ),
+    ('cylindrical_owner', 'radial_owner_eligible'): (
+        '4b3759b7a8f350f77087dec613f5d21b13cb5bb7d7a633d86cd743bb80b19478',
+        'Native-shell owner boundary: exact cleanup/projection, coverage, bounded resource ownership or runtime provenance.',
+    ),
+    ('cylindrical_owner', 'radial_runtime_provenance'): (
+        '6e68af07ea98d011bc9e7040d7d7d6a95909b065a0e588e23f374df0f75a9cf2',
+        'Native-shell owner boundary: exact cleanup/projection, coverage, bounded resource ownership or runtime provenance.',
+    ),
+    ('cylindrical_owner', 'radial_owner_enabled'): (
+        '37fe66f517ab6dff9ff2d6a1f60ac12b3ed1865bb406ce7eb58416a3bc5eabb3',
+        'Native-shell owner boundary: exact cleanup/projection, coverage, bounded resource ownership or runtime provenance.',
+    ),
+    ('cylindrical_owner', 'DeviceOnlyRadialTarget'): (
+        'cf86365ca84e4b8aad65f863ae1f87477a637df9cc142e45a657cad8ac799801',
+        'Native-shell owner boundary: exact cleanup/projection, coverage, bounded resource ownership or runtime provenance.',
+    ),
+    ('tta_scheduler', 'TtaScheduler'): (
+        '596f4ca180ab0586b60731ff0a6e04d7f3a905ddf6c6d5198d284d57a4f9110d',
+        'Keep native radial tasks on one owner even when the multi-owner experiment is requested.',
+    ),
+    ('cuda_d1', '_d1_submit_publication'): (
+        '9af2021486da0d0e0b3910b4bfc2f79fa0ab6fe00791e9a3ec99d06afc6e0ae2',
+        'Reuse bounded source-bitset publication with explicit native-shell provenance while preserving legacy output semantics.',
+    ),
+    ('cuda_d1', '_d1_finalize_bitset_layer'): (
+        'bf97418ee95e4d194de9b8d27cd010dabb644bd1204db64d33aef948d411a551',
+        'Reuse bounded source-bitset publication with explicit native-shell provenance while preserving legacy output semantics.',
+    ),
+    ('inference', '_prediction_accumulation_target'): (
+        '9adaefe94493deba1ad8a04d0d7a191f167507576ccb48a307aab18cf7cba858',
+        'Support shape-only native device results, reject duplicate/missing radius results and avoid host cleanup on device-only frames.',
+    ),
+    ('inference', 'predict_source_and_accumulate'): (
+        '28eec86038df26fe016c533232272e809cf340c62a8acc83a262fac84d190308',
+        'Support shape-only native device results, reject duplicate/missing radius results and avoid host cleanup on device-only frames.',
+    ),
+    ('workers', '_gpu_inference_worker_main'): (
+        'fe54c592cd78e1e67dedca3f736a934900a77bb95531421191c2d32731b0b0bb',
+        'Dispatch native shell consumers without old D1 geometry/proto cleanup; retain native-owner retirement barriers and fatal CUDA ownership.',
+    ),
+    ('workers', '_release_gpu_worker_inference_assets'): (
+        'cc82e02acb0e19f80792e32e4b516c0063ea28b706d3e2b1562cb01456816a7d',
+        'Dispatch native shell consumers without old D1 geometry/proto cleanup; retain native-owner retirement barriers and fatal CUDA ownership.',
+    ),
+    ('workers', 'run_prediction_volume_in_worker'): (
+        '6dd4ac73111d24f25196e3442378ab5a434eb44dee84c6fb4fc88cdfff6fad2b',
+        'Dispatch native shell consumers without old D1 geometry/proto cleanup; retain native-owner retirement barriers and fatal CUDA ownership.',
+    ),
+    ('pipeline', '_main_impl'): (
+        '77c8fb4a692638ce0f7912308e95a3b902fdee05a3b6ea2c278c7d9f6f5985a2',
+        'Route eligible shell views through the native owner contract, preserve compatibility and empty-layer policy, and log effective execution provenance.',
+    ),
+    ('cylindrical_cuda_projection', '_pack_radial_source_block'): (
+        '8af8b8387c7a92773486ef7eb7decdae0f8df0bb960f65c678490055e2129b4f',
+        'Copy exact cropped uint8 source intervals across shells and row boundaries using validated integer addresses and bounded output ownership.',
+    ),
+    ('cylindrical_projection', '_build_radial_plane_plan_reference'): (
+        'c6d7097429247bd42b40ebee82506a068f2cd934f2aeba7e930671f9fa31c557',
+        'Retain the original two-pass CSR assembly as an exact numerical reference for qualification.',
+    ),
     ('cuda_backend', 'radial_native_kernel_enabled'): (
         '5fb5888625044f859e03b198d29f1f06f1180ecf2c6b7fb3c617f3dc6fbda0ad',
         'Explicit opt-out for the scalar native radial CUDA renderer; default enablement retains a logged Torch fallback.',
@@ -556,20 +653,20 @@ REVIEWED_V20_ADDED_DEFINITIONS = {
         'Resolve source/processing base-plane axes independently of the varying stack axis.',
     ),
     ('cylindrical_projection', '_plane_occurrence_strips'): (
-        'b7ed386dbcc9cc30f9069d71ea238bbfb75c4b46ccd8c5055478667ddf624cdc',
-        'Evaluate the unchanged nearest-shell and periodic-occurrence equations once per bounded 2D strip, preserving repeated-addition rounding.',
+        '98efa5553f4e6440cdfbc50e4b95ff54b17b0e982b576dfd0bcab950942aeb63',
+        'Preserve exact NumPy nearest-shell and repeated-addition wrap equations while allowing bounded single-pass construction strips.',
     ),
     ('cylindrical_projection', '_build_radial_plane_plan'): (
-        '9fcf4e1f9438bf5dd5b48dcced61be59fada9d1ea040d82bfb812b57dde5c4fa',
-        'Build readonly bounded shell/CSR column maps with exact occurrence ownership and admission checks.',
+        'a54394857ccfe6a62e40206623e76317615a627814483152dd7a4a5f58abd63e',
+        'Assemble exact readonly CSR tables in one geometry pass; bound strip occurrence retention by the plan budget and preserve per-pixel wrap order.',
     ),
     ('cylindrical_projection', '_radial_plane_plan'): (
         '4733fa3e98aea57e1fef235f2da26754ef44228a60af9f5e3552dea7acc26144',
         'Share one Future per concurrent exact plane key, complete outside the cache lock, preserve original build errors and retry eligibility, keep unrelated keys parallel, and retain readonly bounded LRU ownership.',
     ),
     ('cylindrical_projection', '_radial_projection_metadata'): (
-        '8ae4d34643f65f66b5eeb321135e7e6b76d8558d9634297ad6c1b7cb5013e1c1',
-        'Prepare exact stack centers, ideal and discrete-sample tilt offsets, and processing-grid row/column mappings.',
+        'f961fe2aab01cd9ab17778436351c78cbec4176bf881afc8f963235b5d94f8af',
+        'Evaluate the original NumPy sampled-shear equations in bounded multi-shell batches; preserve exact processing maps, ideal shear, float64 rounding and tilt signs.',
     ),
     ('cylindrical_projection', '_gather_radial_pixel'): (
         '865c22ec8d83336bc596b6dae0dce1ea08d4f9277d3fee27e9707382cbe18e5a',
@@ -588,8 +685,8 @@ REVIEWED_V20_ADDED_DEFINITIONS = {
         'Deliver concurrent projection blocks in source order, cancelling/draining remaining work before borrowed-input retirement on failure.',
     ),
     ('cylindrical_projection', 'backproject_radial_volume_to_volume'): (
-        '4534d51dea0be2e361117c6aebf07392c54d3a098dc25a2a4cc270323106a8de',
-        'Select compact CUDA publication only for explicit compatible sink-only callbacks; validate encoded block identity, format and exact record count before delivery; preserve dense/private callback paths and fatal ownership cleanup.',
+        'ef799fa756fe233a89229c297b8a078fb57a37a83f3c42de9b7270cdd3a8b74b',
+        'Preserve direct-CUDA production dispatch and setup partitions; report opt-in graph and empty-packet experiments separately without enabling them at the pipeline boundary.',
     ),
     ('cylindrical_projection', '_nearest_global_shell'): (
         'cb42c5d91613549ba8ad3fd2d644ed2f4e7ff67ebfd526371b00c162266cd07f',
@@ -636,8 +733,8 @@ REVIEWED_V20_ADDED_DEFINITIONS = {
         'Fatal BaseException retains the unfenced projector and bypasses ordinary retry handlers.',
     ),
     ('cylindrical_cuda_projection', '_ProjectionContract'): (
-        '3d2099ea7f63e74a92a816452173fd0b1636a2cf270e638e36f2bb64658c572a',
-        'Explicit validated host-plan/source/output geometry and bounded device-buffer accounting.',
+        'b7dd54823355c0e35f7680495de00c4ab99f2d644b9b57a54964c65a13facf55',
+        'Validate dense or bbox-cropped source addressing under the existing output and geometry admission contract.',
     ),
     ('cylindrical_cuda_projection', '_positive_shape'): (
         'f2e346180fb107cbfb7ec1cba507825c83caac4571aa7ea38c0b9d49e587a341',
@@ -648,12 +745,12 @@ REVIEWED_V20_ADDED_DEFINITIONS = {
         'Require exact contiguous dtype/shape for every borrowed host lookup array.',
     ),
     ('cylindrical_cuda_projection', '_validate_projection_contract'): (
-        'f785ed939e83db39d0bcbbe149f4af576143d3189607579f48859d01d3369288',
-        'Validate exact host-plan addresses and dimensions before CUDA allocation; enforce int32/grid-height limits, 64 MiB maximum block budget and 4096-slice encoded metadata capacity.',
+        '2954b1598a06fbb4184bcc86f24b147aff63bc6dd592712b1d44854251c330d1',
+        'Prefix known source rectangles with uint64 offsets and select cropped addressing only when it reduces storage; preserve gather validation.',
     ),
     ('cylindrical_cuda_projection', 'RadialCudaProjector'): (
-        '79f3fcdd69b505cede685e8d9a5c04015a206a3d3bf638366470926cb8eeb6df',
-        'Own bounded private source/dense/compact/metadata buffers and host returns; preflight dense/raw/packed equivalence, reduce exact device crops/counts, encode without CPU rescans, preserve stream fences and expose phase/D2H metrics.',
+        '123acc79a54c42266679f2ac69c175ab22a4f4884b47f5b83c10129cc073ca29',
+        'Keep graph replay and empty-packet elision disabled by default after mixed throughput results; explicit experiments retain bounded capture, preflight, direct fallback and fatal ownership fencing.',
     ),
     ('cylindrical_cuda_projection', 'RadialEncodedSlice'): (
         'bc52167c2887163a857a68a9bb873901c53ba29312558d3d56100868717620e4',
@@ -672,6 +769,46 @@ REVIEWED_V20_ADDED_DEFINITIONS = {
 # Compile policy and bounded resource constants live outside function bodies.
 # Pin their complete AST statements so helper hashes cannot mask policy drift.
 REVIEWED_V20_ADDED_STATEMENTS = {
+    ('cylindrical_owner', '_OWNER_KERNEL_SOURCE'): (
+        '4d833c54ff172cfc150730b1ed57f574aac648051198623231368939af4b0877',
+        'Pin the native owner protocol, kernel, optional compile policy and resource limits.',
+    ),
+    ('cylindrical_owner', '_bucket_shell_pixels_compiled'): (
+        '8ba550259e851dc5379807dd87dc1867f613202d431e039a280d854829d7229e',
+        'Pin the native owner protocol, kernel, optional compile policy and resource limits.',
+    ),
+    ('cylindrical_owner', '_RADIAL_OWNER_LOCK'): (
+        '22f5cde9003cdd04ef1057fe0f92b1552cb53764c95cece589a11564fdc97f93',
+        'Pin the native owner protocol, kernel, optional compile policy and resource limits.',
+    ),
+    ('cylindrical_owner', '_RADIAL_OWNER_STATES'): (
+        '23eb5b965d00c50f4f6e2868d42a6a8b605baa7f148c68c43491ff5908393cd9',
+        'Pin the native owner protocol, kernel, optional compile policy and resource limits.',
+    ),
+    ('cylindrical_owner', '_RESERVE_BYTES'): (
+        'b1dcdc89cbca2b1e25e13f67a7844a474b129eb0d81ea3bc53806dd1a1745fb2',
+        'Pin the native owner protocol, kernel, optional compile policy and resource limits.',
+    ),
+    ('cylindrical_owner', '_WORK_ITEMS'): (
+        '1f26b2c99d35da871b02c17234d80d5bea31cf753604b75ff4cb45b2ea8cfcf9',
+        'Pin the native owner protocol, kernel, optional compile policy and resource limits.',
+    ),
+    ('cylindrical_owner', 'RADIAL_OWNER_CONTRACT'): (
+        '07d4d26a31de759bf9b189f01f331f1e1a946b405ca62c2d0d0c73814cedd024',
+        'Pin the native owner protocol, kernel, optional compile policy and resource limits.',
+    ),
+    ('cylindrical_projection', '_RADIAL_METADATA_CHUNK_VALUES'): (
+        'cf19116408f9aa4dc22e7eb1308055641a96ec0eebb2df7ed17a3ceb5c9d8e7c',
+        'Bound sampled-shear intermediate arrays at one million values per batch, with one native row as the minimum.',
+    ),
+    ('cylindrical_cuda_projection', '_pack_radial_source_block_compiled'): (
+        '765802ea54a2b542140955b926906800d9fc54561b7e564f210855851ecb3746',
+        'Keep source crop packing optional, cached and nogil; compilation failure before upload retains the NumPy path.',
+    ),
+    ('cylindrical_projection', '_PLANE_BUILD_CHUNK_PIXELS'): (
+        '4afc438f9808e94475fae6bf58c44b4e2b9c6177bd0761924ba3ca533dba3a0c',
+        'Bound single-pass NumPy coordinate strips at one million pixels to reduce interpreter handoffs during concurrent output work.',
+    ),
     ('cylindrical_projection', 'numba_compile_policy'): (
         'a00fd59c3a0ef57a76f093e34ec03927219de47f7f0ad44fe7c22b21bc713347',
         'Numba compilation retains cache=True/nogil=True/fastmath=False and inlines the exact pixel gather; no relaxed floating-point reassociation.',
@@ -713,8 +850,8 @@ REVIEWED_V20_ADDED_STATEMENTS = {
         'Explicit bounded private CUDA/pinned staging and admission reserve policy.',
     ),
     ('cylindrical_cuda_projection', '_KERNEL_SOURCE'): (
-        'eacc90621dd926a899ac8ba211c2891014dbed1cf453b216050c97126f9afb4e',
-        'Preserve exact host-plan gather mathematics; append device tight-bbox/foreground reduction and normalized raw or zero-padded little-endian row-packbits crop encoding with bounded 64-bit payload addresses.',
+        '87efaa993cf5c91cd6999f39f3f8938b19b1d1f89bc2e4bb91a0cd9337a51244',
+        'Preserve exact cropped/dense source addressing and float64 geometry; captured projection optionally reads first-Z from an owned device scalar without changing gather math.',
     ),
     ('cylindrical_projection', '_PLANE_PLAN_CACHE'): (
         'dda54f3a989503868661b93cc95518d3728061aae4a0c40bcf152e5fa990d316',

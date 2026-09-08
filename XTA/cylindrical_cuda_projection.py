@@ -16,6 +16,8 @@ from typing import Any
 
 import numpy as np
 
+from ._deps import _numba
+
 _BLOCK_BYTES = 64 * 1024 * 1024
 _UPLOAD_BYTES = 64 * 1024 * 1024
 _RESERVE_BYTES = 2 * 1024**3
@@ -25,6 +27,40 @@ _CROP_METADATA_DTYPE = np.dtype([
     ('y0', np.int32), ('y1', np.int32), ('x0', np.int32), ('x1', np.int32),
     ('foreground', np.uint64),
 ], align=True)
+
+
+def _pack_radial_source_block(source, bboxes, offsets, first, destination):
+    """Copy an arbitrary interval of concatenated source rectangles, without GIL handoffs.
+
+    Inputs are validated by the CUDA contract. No normalization or floating point
+    addressing occurs, and a block may start/end inside a row or cross empty shells.
+    """
+    position = np.int64(first)
+    source_flat = source.reshape(-1)
+    cursor = 0
+    shell = 0
+    while cursor < destination.size:
+        while np.int64(offsets[shell + 1]) <= position:
+            shell += 1
+        y0, y1, x0, x1 = bboxes[shell]
+        width = x1 - x0
+        within = position - np.int64(offsets[shell])
+        row = y0 + within // width
+        column = x0 + within % width
+        count = min(destination.size - cursor, x1 - column)
+        # Validated nonnegative linear indices avoid per-byte negative-index
+        # correction and let LLVM generate contiguous vector loads/stores.
+        source_first = np.uint64((shell * source.shape[1] + row) * source.shape[2] + column)
+        output_first = np.uint64(cursor)
+        for at in range(count):
+            destination[output_first + np.uint64(at)] = source_flat[source_first + np.uint64(at)]
+        cursor += count
+        position += count
+
+
+_pack_radial_source_block_compiled = (
+    _numba.njit(cache=True, nogil=True)(_pack_radial_source_block) if _numba is not None else None
+)
 
 
 @dataclass(frozen=True)
@@ -103,6 +139,7 @@ class _ProjectionContract:
     use_bboxes: bool
     max_block_depth: int
     block_bytes: int
+    cropped_source: bool
 
     @property
     def geometry_bytes(self):
@@ -190,13 +227,22 @@ def _validate_projection_contract(source, plan, metadata, view, output_shape,
     else:
         boxes = np.zeros((source_shape[0], 4), np.int64)
     arrays['bboxes'] = boxes
+    # Known bounds already constrain every gather. Store only those rectangles;
+    # this changes byte addressing, not the set of samples the kernel can read.
+    sizes = (boxes[:, 1] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 2])
+    cropped_source = bool(use_bboxes and int(sizes.sum()) < array.nbytes)
+    source_offsets = np.zeros(source_shape[0] + 1, np.uint64)
+    if cropped_source:
+        np.cumsum(sizes, dtype=np.uint64, out=source_offsets[1:])
+    arrays['source_offsets'] = source_offsets
     budget = min(operator.index(block_bytes), _BLOCK_BYTES)
     plane_bytes = int(shape[1]) * int(shape[2])
     if budget <= 0 or plane_bytes > budget:
         raise RadialCudaProjectionUnavailable('One Radial output slice exceeds the CUDA block budget')
     depth = min(shape[0], budget // plane_bytes, _MAX_ENCODED_SLICES)
     return _ProjectionContract(shape, source_shape, arrays, base, vertical, plane[1],
-        native_height, native_width, stack_height, stack_length, bool(use_bboxes), depth, depth * plane_bytes)
+        native_height, native_width, stack_height, stack_length, bool(use_bboxes), depth, depth * plane_bytes,
+        cropped_source)
 
 
 _KERNEL_SOURCE = r'''
@@ -205,16 +251,17 @@ extern "C" __global__ void project_radial_plan(
     const unsigned int* offsets, const int* columns,
     const double* sampled, const int* row_map, const int* column_map,
     const double* stack_centers, const double* ideal_axis,
-    const long long* bboxes, unsigned char* out,
+    const long long* bboxes, const unsigned long long* source_offsets,
+    const int* launch_first_z, unsigned char* out,
     int source_h, int source_w, int native_height, int native_width,
     int stack_length, int height_origin, int base_id, int vertical,
     int plane_width, int out_h, int out_w, int first_z,
-    unsigned long long voxel_count, int use_bboxes) {
+    unsigned long long voxel_count, int use_bboxes, int cropped_source) {
     unsigned long long q = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (q >= voxel_count) return;
     out[q] = 0;
     unsigned long long plane_pixels = (unsigned long long)out_h * out_w;
-    int z = first_z + (int)(q / plane_pixels);
+    int z = (first_z < 0 ? launch_first_z[0] : first_z) + (int)(q / plane_pixels);
     unsigned long long rem = q % plane_pixels;
     int y = (int)(rem / out_w), x = (int)(rem % out_w);
     unsigned long long p;
@@ -246,6 +293,11 @@ extern "C" __global__ void project_radial_plan(
         if (use_bboxes && ((long long)pr < bboxes[box] || (long long)pr >= bboxes[box + 1] ||
                           (long long)pc < bboxes[box + 2] || (long long)pc >= bboxes[box + 3])) continue;
         unsigned long long source_at = ((unsigned long long)shell * source_h + pr) * source_w + pc;
+        if (cropped_source) {
+            source_at = source_offsets[shell] +
+                (unsigned long long)(pr - bboxes[box]) * (bboxes[box + 3] - bboxes[box + 2]) +
+                (unsigned long long)(pc - bboxes[box + 2]);
+        }
         if (source[source_at] != 0) { out[q] = 1; return; }
     }
 }
@@ -343,22 +395,35 @@ class RadialCudaProjector:
 
     def __init__(self, source, plan, metadata_tuple, view, output_shape,
                  bboxes=None, use_bboxes=False, device_index=0, *,
-                 block_bytes=_BLOCK_BYTES, upload_bytes=_UPLOAD_BYTES, reserve_bytes=_RESERVE_BYTES):
+                 block_bytes=_BLOCK_BYTES, upload_bytes=_UPLOAD_BYTES, reserve_bytes=_RESERVE_BYTES,
+                 use_graphs=False, skip_empty_blocks=False):
         started = time.perf_counter()
         self.source_upload_seconds = self.geometry_upload_seconds = self.preflight_seconds = 0.0
+        self.source_pack_seconds = self.module_setup_seconds = self.buffer_setup_seconds = 0.0
+        self.source_pack_backend = 'dense_copy'
+        self.cuda_graph_setup_seconds = 0.0
+        self.cuda_graph_enabled = False
+        self.cuda_graph_note = 'disabled' if not use_graphs else 'not_initialized'
+        # Preflight still executes both packing kernels, even for an empty first
+        # slice. Empty-packet elision is enabled only after that check completes.
+        self._skip_empty_blocks = False
         self.constructor_seconds = 0.0
         self.contract = _validate_projection_contract(source, plan, metadata_tuple, view,
             output_shape, bboxes, use_bboxes, block_bytes)
+        self.contract_validation_seconds = time.perf_counter() - started
         self.max_block_depth = self.contract.max_block_depth
         self.device_index = operator.index(device_index)
         self.source_bytes = int(np.asarray(source).nbytes)
+        self.source_layout = 'bbox_u8' if self.contract.cropped_source else 'dense_u8'
+        self.source_h2d_bytes = (int(self.contract.arrays['source_offsets'][-1])
+                                 if self.contract.cropped_source else self.source_bytes)
         self.geometry_bytes = int(self.contract.geometry_bytes)
         self.output_buffer_bytes = int(self.contract.block_bytes)
         self.compact_buffer_bytes = self.output_buffer_bytes
         self.metadata_buffer_bytes = self.max_block_depth * int(_CROP_METADATA_DTYPE.itemsize)
         self.offset_buffer_bytes = (self.max_block_depth + 1) * np.dtype(np.uint64).itemsize
-        self.required_device_bytes = (self.source_bytes + self.geometry_bytes + self.output_buffer_bytes
-            + self.compact_buffer_bytes + self.metadata_buffer_bytes + self.offset_buffer_bytes + _SETUP_BYTES)
+        self.required_device_bytes = (max(1, self.source_h2d_bytes) + self.geometry_bytes + self.output_buffer_bytes
+            + self.compact_buffer_bytes + self.metadata_buffer_bytes + self.offset_buffer_bytes + 4 + _SETUP_BYTES)
         self.reserve_bytes = max(0, operator.index(reserve_bytes))
         self._upload_bytes = operator.index(upload_bytes)
         if self._upload_bytes <= 0 or self.device_index < 0:
@@ -371,6 +436,8 @@ class RadialCudaProjector:
         self._upload_pin = self._upload_stage = self._output_pin = self._output_stage = None
         self._metadata_pin = self._metadata_stage = self._offsets_pin = self._offsets_stage = None
         self._events = {}
+        self._graphs = {}
+        self._first_z_gpu = self._first_z_pin = self._first_z_stage = None
         self._arrays: dict[str, Any] = {}
         self._closed = self._failed = False
         self._reset_projection_stats()
@@ -390,24 +457,32 @@ class RadialCudaProjector:
                         f'plus {self.reserve_bytes / 1024**3:.2f} GiB reserve; '
                         f'{int(free_bytes) / 1024**3:.2f} GiB is free')
                 with cp.cuda.using_allocator(self._pool.malloc), self._stream:
+                    module_started = time.perf_counter()
                     self._module = cp.RawModule(code=_KERNEL_SOURCE, options=('--std=c++11', '--fmad=false'))
                     self._kernel = self._module.get_function('project_radial_plan')
                     self._reset_metadata_kernel = self._module.get_function('reset_radial_crop_metadata')
                     self._reduce_metadata_kernel = self._module.get_function('reduce_radial_crop_metadata')
                     self._encode_kernel = self._module.get_function('encode_radial_crops')
                     self._events = {f'{phase}_{boundary}': cp.cuda.Event()
-                        for phase in ('kernel', 'metadata', 'pack', 'copy') for boundary in ('start', 'end')}
-                    stage_bytes = min(self._upload_bytes, max(self.source_bytes,
+                        for phase in ('kernel', 'metadata', 'pack', 'copy', 'graph') for boundary in ('start', 'end')}
+                    self.module_setup_seconds = time.perf_counter() - module_started
+                    buffer_started = time.perf_counter()
+                    stage_bytes = min(self._upload_bytes, _UPLOAD_BYTES, max(self.source_h2d_bytes,
                         max((array.nbytes for array in self.contract.arrays.values()), default=1)))
                     self._upload_pin = self._pinned_pool.malloc(int(stage_bytes))
                     self._upload_stage = np.frombuffer(self._upload_pin, dtype=np.uint8, count=int(stage_bytes))
+                    self.buffer_setup_seconds = time.perf_counter() - buffer_started
                     upload_started = time.perf_counter()
-                    self._source_gpu = self._upload_array(np.asarray(source))
+                    if self.contract.cropped_source:
+                        self._upload_cropped_source(np.asarray(source))
+                    else:
+                        self._source_gpu = self._upload_array(np.asarray(source))
                     self.source_upload_seconds = time.perf_counter() - upload_started
                     geometry_started = time.perf_counter()
                     for name, array in self.contract.arrays.items():
                         self._arrays[name] = self._upload_array(array)
                     self.geometry_upload_seconds = time.perf_counter() - geometry_started
+                    buffer_started = time.perf_counter()
                     self._upload_stage = self._upload_pin = None
                     self._pinned_pool.free_all_blocks()
                     self._output_gpu = cp.empty((self.max_block_depth, *self.contract.output_shape[1:]), dtype=cp.uint8)
@@ -423,6 +498,10 @@ class RadialCudaProjector:
                     self._offsets_pin = self._pinned_pool.malloc(self.offset_buffer_bytes)
                     self._offsets_stage = np.frombuffer(self._offsets_pin, dtype=np.uint64,
                         count=self.max_block_depth + 1)
+                    self._first_z_gpu = cp.empty(1, dtype=cp.int32)
+                    self._first_z_pin = self._pinned_pool.malloc(4)
+                    self._first_z_stage = np.frombuffer(self._first_z_pin, dtype=np.int32, count=1)
+                    self.buffer_setup_seconds += time.perf_counter() - buffer_started
                     # Execute the actual kernel and D2H path before a caller can
                     # publish a slice, surfacing launch/copy errors at admission.
                     preflight_started = time.perf_counter()
@@ -432,9 +511,24 @@ class RadialCudaProjector:
                     for packed in (False, True):
                         encoded = self._encode_current_output(0, 1, packed)
                         self._validate_encoded_preflight(checked, encoded)
+                    if use_graphs:
+                        graph_started = time.perf_counter()
+                        self._prepare_projection_graphs()
+                        self.cuda_graph_setup_seconds = time.perf_counter() - graph_started
+                        if self.cuda_graph_enabled:
+                            # Compare graph replay with the already-checked direct
+                            # projection before this constructor can publish output.
+                            self._run_projection_graph(0, 1)
+                            encoded = self._encode_current_output(0, 1, False, metadata_ready=True)
+                            self._validate_encoded_preflight(checked, encoded)
                     self.preflight_seconds = time.perf_counter() - preflight_started
+                    self._skip_empty_blocks = bool(skip_empty_blocks)
                     self._reset_projection_stats()
             self.constructor_seconds = time.perf_counter() - started
+        except RadialCudaProjectionUnsafeFailure:
+            # A failed capture fence already established uncertain ownership.
+            # Do not retry cleanup and downgrade it into an ordinary fallback.
+            raise
         except BaseException as exc:
             self.close()
             if isinstance(exc, (RadialCudaProjectionUnavailable, KeyboardInterrupt, SystemExit)):
@@ -453,9 +547,88 @@ class RadialCudaProjector:
             self._stream.synchronize()
         return device
 
+    def _upload_cropped_source(self, source):
+        """Pack strided rectangles directly into one bounded pinned buffer.
+
+        No full host copy or dense device canvas is created. The device owner is
+        published before the first asynchronous copy, including failure paths.
+        Empty shells occupy no payload bytes and are rejected by the bbox guard.
+        """
+        cp = self._cp
+        self._source_gpu = cp.empty(max(1, self.source_h2d_bytes), dtype=cp.uint8)
+        capacity = int(self._upload_stage.size)
+        pack = _pack_radial_source_block_compiled
+        boxes, offsets = self.contract.arrays['bboxes'], self.contract.arrays['source_offsets']
+        if pack is not None:
+            # Compile before any source copy. Optional compilation failures can
+            # still select the original NumPy uploader without partial delivery.
+            try:
+                pack(source, boxes, offsets, 0, self._upload_stage[:0])
+            except Exception:
+                pack = None
+        if pack is not None:
+            self.source_pack_backend = 'numba_nogil'
+            for first in range(0, self.source_h2d_bytes, capacity):
+                count = min(capacity, self.source_h2d_bytes - first)
+                pack_started = time.perf_counter()
+                pack(source, boxes, offsets, first, self._upload_stage[:count])
+                self.source_pack_seconds += time.perf_counter() - pack_started
+                cp.cuda.runtime.memcpyAsync(int(self._source_gpu.data.ptr) + first,
+                    int(self._upload_pin.ptr), count, cp.cuda.runtime.memcpyHostToDevice, int(self._stream.ptr))
+                self._stream.synchronize()
+            return
+        self.source_pack_backend = 'numpy'
+        filled = uploaded = 0
+
+        def flush(count):
+            cp.cuda.runtime.memcpyAsync(int(self._source_gpu.data.ptr) + uploaded,
+                int(self._upload_pin.ptr), count, cp.cuda.runtime.memcpyHostToDevice, int(self._stream.ptr))
+            self._stream.synchronize()
+
+        for shell, (y0, y1, x0, x1) in enumerate(self.contract.arrays['bboxes']):
+            y0, y1, x0, x1 = map(int, (y0, y1, x0, x1))
+            width = x1 - x0
+            if not width or y1 == y0:
+                continue
+            for first_row in range(y0, y1, max(1, capacity // width)):
+                rows = min(y1 - first_row, max(1, capacity // width))
+                if width <= capacity:
+                    count = rows * width
+                    if filled + count > capacity:
+                        flush(filled)
+                        uploaded += filled
+                        filled = 0
+                    pack_started = time.perf_counter()
+                    np.copyto(self._upload_stage[filled:filled + count].reshape(rows, width),
+                              source[shell, first_row:first_row + rows, x0:x1])
+                    self.source_pack_seconds += time.perf_counter() - pack_started
+                    filled += count
+                else:
+                    # Small explicit test budgets or unusually wide masks can
+                    # split a row; concatenated bytes still follow C row order.
+                    for first_col in range(x0, x1, capacity):
+                        if filled:
+                            flush(filled)
+                            uploaded += filled
+                            filled = 0
+                        count = min(capacity, x1 - first_col)
+                        pack_started = time.perf_counter()
+                        np.copyto(self._upload_stage[:count],
+                                  source[shell, first_row, first_col:first_col + count])
+                        self.source_pack_seconds += time.perf_counter() - pack_started
+                        filled = count
+        if filled:
+            flush(filled)
+            uploaded += filled
+        if uploaded != self.source_h2d_bytes:
+            raise RuntimeError('Radial CUDA source crop upload did not match its admitted payload')
+
     def _reset_projection_stats(self):
         self.kernel_seconds = self.metadata_seconds = self.pack_seconds = self.d2h_seconds = 0.0
         self.metadata_d2h_bytes = self.payload_d2h_bytes = self.dense_d2h_bytes = 0
+        self.cuda_graph_blocks = 0
+        self.cuda_graph_seconds = 0.0
+        self.empty_encoded_blocks = 0
 
     def _record(self, phase, boundary):
         self._events[f'{phase}_{boundary}'].record(self._stream)
@@ -464,20 +637,23 @@ class RadialCudaProjector:
         return float(self._cp.cuda.get_elapsed_time(
             self._events[f'{phase}_start'], self._events[f'{phase}_end'])) / 1000.0
 
-    def _launch_projection(self, first_z, count):
+    def _launch_projection(self, first_z, count, *, record=True):
         c, a = self.contract, self._arrays
         voxels = int(count) * int(c.output_shape[1]) * int(c.output_shape[2])
-        self._record('kernel', 'start')
+        if record:
+            self._record('kernel', 'start')
         self._kernel(((voxels + 255) // 256,), (256,), (
             self._source_gpu, a['shells'], a['offsets'], a['columns'], a['sampled'],
-            a['rows'], a['mapped_columns'], a['centers'], a['ideal'], a['bboxes'], self._output_gpu,
+            a['rows'], a['mapped_columns'], a['centers'], a['ideal'], a['bboxes'],
+            a['source_offsets'], self._first_z_gpu, self._output_gpu,
             np.int32(c.source_shape[1]), np.int32(c.source_shape[2]), np.int32(c.native_height),
             np.int32(c.native_width), np.int32(c.stack_length), np.int32(c.height_origin),
             np.int32(c.base_id), np.int32(c.vertical), np.int32(c.plane_width),
             np.int32(c.output_shape[1]), np.int32(c.output_shape[2]), np.int32(first_z),
-            np.uint64(voxels), np.int32(c.use_bboxes),
+            np.uint64(voxels), np.int32(c.use_bboxes), np.int32(c.cropped_source),
         ), stream=self._stream)
-        self._record('kernel', 'end')
+        if record:
+            self._record('kernel', 'end')
         return voxels
 
     def _run_block(self, first_z, count):
@@ -492,26 +668,93 @@ class RadialCudaProjector:
         self.dense_d2h_bytes += voxels
         return self._output_stage[:count].copy()
 
-    def _encode_current_output(self, first_z, count, packed):
+    def _enqueue_crop_metadata(self, count, *, record=True):
         cp = self._cp
         height, width = self.contract.output_shape[1:]
-        self._record('metadata', 'start')
+        if record:
+            self._record('metadata', 'start')
         self._reset_metadata_kernel(((count + 255) // 256,), (256,),
             (self._metadata_gpu, np.int32(count), np.int32(height), np.int32(width)), stream=self._stream)
         self._reduce_metadata_kernel(((width + 31) // 32, (height + 7) // 8, count), (32, 8),
             (self._output_gpu, self._metadata_gpu, np.int32(count), np.int32(height), np.int32(width)), stream=self._stream)
-        self._record('metadata', 'end')
+        if record:
+            self._record('metadata', 'end')
         metadata_bytes = count * _CROP_METADATA_DTYPE.itemsize
-        self._record('copy', 'start')
+        if record:
+            self._record('copy', 'start')
         cp.cuda.runtime.memcpyAsync(int(self._metadata_pin.ptr), int(self._metadata_gpu.data.ptr), metadata_bytes,
             cp.cuda.runtime.memcpyDeviceToHost, int(self._stream.ptr))
-        self._record('copy', 'end')
+        if record:
+            self._record('copy', 'end')
+
+    def _prepare_projection_graphs(self):
+        """Capture at most three common block sizes before output publication.
+
+        The graph joins projection, crop metadata and its pinned D2H copy. The
+        variable first-Z value has an owned pinned/device scalar; no graph node
+        or allocation is edited during replay. Payload compaction keeps its
+        existing exact-size copy after the small metadata handshake.
+        """
+        cp = self._cp
+        counts = {1, self.max_block_depth}
+        tail = self.contract.output_shape[0] % self.max_block_depth
+        if tail:
+            counts.add(tail)
+        try:
+            for count in sorted(counts):
+                self._stream.begin_capture(mode=cp.cuda.runtime.streamCaptureModeThreadLocal)
+                try:
+                    cp.cuda.runtime.memcpyAsync(int(self._first_z_gpu.data.ptr), int(self._first_z_pin.ptr), 4,
+                        cp.cuda.runtime.memcpyHostToDevice, int(self._stream.ptr))
+                    # Captured ordinary events are not portable elapsed-time
+                    # markers. Time the combined replay outside the graph.
+                    self._launch_projection(-1, count, record=False)
+                    self._enqueue_crop_metadata(count, record=False)
+                finally:
+                    graph = self._stream.end_capture()
+                self._graphs[count] = graph
+        except Exception as exc:
+            # Ending an invalidated capture normally restores the stream. If it
+            # cannot be fenced, retain every owner and fail fatally as elsewhere.
+            try:
+                self._stream.synchronize()
+            except BaseException as fence_error:
+                raise RadialCudaProjectionUnsafeFailure('Could not settle Radial CUDA graph capture', self) from fence_error
+            self._graphs.clear()
+            self.cuda_graph_note = f'capture_unavailable:{type(exc).__name__}'
+            return
+        self.cuda_graph_enabled = True
+        self.cuda_graph_note = 'projection_and_crop_metadata'
+
+    def _run_projection_graph(self, first_z, count):
+        self._first_z_stage[0] = first_z
+        self._record('graph', 'start')
+        self._graphs[count].launch(stream=self._stream)
+        self._record('graph', 'end')
         self._stream.synchronize()
-        self.metadata_seconds += self._elapsed('metadata')
-        self.d2h_seconds += self._elapsed('copy')
+        self.cuda_graph_blocks += 1
+        self.cuda_graph_seconds += self._elapsed('graph')
+
+    def _encode_current_output(self, first_z, count, packed, *, metadata_ready=False):
+        cp = self._cp
+        height, width = self.contract.output_shape[1:]
+        if not metadata_ready:
+            self._enqueue_crop_metadata(count)
+            self._stream.synchronize()
+        metadata_bytes = count * _CROP_METADATA_DTYPE.itemsize
+        if not metadata_ready:
+            self.metadata_seconds += self._elapsed('metadata')
+            self.d2h_seconds += self._elapsed('copy')
         self.metadata_d2h_bytes += metadata_bytes
         records, offsets, total, largest = _encoded_records(first_z, self._metadata_stage[:count],
             packed, (height, width), self.compact_buffer_bytes)
+        if total == 0 and self._skip_empty_blocks:
+            # Metadata is already fenced and establishes every plane as empty.
+            # Do not upload offsets, launch a no-op encoder or fence it again.
+            payload = np.empty(0, np.uint8)
+            payload.flags.writeable = False
+            self.empty_encoded_blocks += 1
+            return RadialEncodedBlock(first_z, records, payload, bool(packed))
         self._offsets_stage[:count + 1] = offsets
         cp.cuda.runtime.memcpyAsync(int(self._offsets_gpu.data.ptr), int(self._offsets_pin.ptr), offsets.nbytes,
             cp.cuda.runtime.memcpyHostToDevice, int(self._stream.ptr))
@@ -561,9 +804,14 @@ class RadialCudaProjector:
                 return RadialEncodedBlock(first_z, (), payload, bool(packed))
             try:
                 with self._cp.cuda.Device(self.device_index), self._cp.cuda.using_allocator(self._pool.malloc), self._stream:
-                    self._launch_projection(first_z, count)
-                    result = self._encode_current_output(first_z, count, bool(packed))
-                    self.kernel_seconds += self._elapsed('kernel')
+                    replay = count in self._graphs
+                    if replay:
+                        self._run_projection_graph(first_z, count)
+                    else:
+                        self._launch_projection(first_z, count)
+                    result = self._encode_current_output(first_z, count, bool(packed), metadata_ready=replay)
+                    if not replay:
+                        self.kernel_seconds += self._elapsed('kernel')
                     return result
             except BaseException:
                 self._failed = True
@@ -597,6 +845,8 @@ class RadialCudaProjector:
                     raise RadialCudaProjectionUnsafeFailure('Could not settle Radial CUDA projection stream', self) from exc
             if self._cp is not None and self._stream is not None:
                 with self._cp.cuda.Device(self.device_index):
+                    self._graphs.clear()
+                    self._first_z_gpu = self._first_z_stage = self._first_z_pin = None
                     self._arrays.clear()
                     self._source_gpu = self._output_gpu = self._kernel = self._module = None
                     self._compact_gpu = self._metadata_gpu = self._offsets_gpu = None

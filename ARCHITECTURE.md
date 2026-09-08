@@ -1,10 +1,15 @@
 # XTA architecture
 
-`GPT-6-Astra-Ultra_v20.0.1_SLURM.py` is the sole versioned launcher. It, the
+`GPT-6-Astra-Ultra_v20.0.2_SLURM.py` is the sole versioned launcher. It, the
 installed `xta` console script, and `python -m XTA` all dispatch
 through `XTA.cli.run()`.
 The implementation lives in the importable `XTA` package so spawned processes
 resolve worker functions and data types through canonical module paths.
+
+Main v20.0.2 promotes native shell cleanup and source-bitset projection inside
+inference workers, together with bounded Radial planning and publication
+improvements. Cluster job 142565 completed 205.3 seconds faster than 142543
+(15.4%); the measured command and qualification limits are recorded below.
 
 Main v20.0.1 promotes the completed v20.0.4 source from
 `codex/v20-cylindrical-views`. Main v20.0.0 preserves the original cylindrical
@@ -54,10 +59,13 @@ global shell before applying a trajectory's radius offset. Every periodic patch
 occurrence contributes by OR, retaining differing model predictions in repeated
 wraps. Existing native/LQ layer publication and final source-space union apply.
 New shell inference supports the generic CPU/CUDA routes; CUDA rendering uses
-bounded source sampling. Shells do not enter the old Azimuthal sparse projector,
-fused resident ring or D1 bitset kernels. Their parent-owned terminal projection
-selects CUDA when a device can be admitted, retaining the compiled CPU projector
-and bounded NumPy reference as fallbacks.
+bounded source sampling. Eligible GPU-only, angle-zero, batch-one gray runs with
+zero confidence/radius cleanup thresholds, no interpolation/tiles and no native
+debug exports now project complete native shell chunks in their inference owner.
+They share D1 scheduling/publication while using dedicated native cleanup and
+exact cylindrical pull kernels. Other configurations retain parent projection,
+with CUDA, compiled CPU and NumPy implementations. Shells never enter the old
+Azimuthal sparse projector or the incompatible legacy D1 geometry kernel.
 
 PTA requires positive `--imgsz` with Radial shells, while its existing `--imgsz 0`
 native raster mode still works for the other families. LTA geometry/planning can
@@ -231,6 +239,198 @@ Twenty-nine actual PT masks were replayed through compact CUDA dispatch and the
 real CVOL writer after inference drained. All 45,613,056 decoded voxels matched
 the unchanged NumPy oracle. All 64 real-run NRRD payloads and both videos' decoded
 frames/timestamps matched the v20.0.2 baseline.
+
+### Radial setup optimization after job 142502
+
+Job 142502 took 1,311.9 seconds, including a 670.9-second post-inference tail.
+Of 40 nonempty Radial projections, 36 used compact CUDA and four took the early
+busy-device CPU fallback. CUDA median total/setup/plan times were
+45.82/26.38/11.96 seconds, versus 0.69 seconds of projection kernels and 1.90
+seconds of sink callbacks. Shared-plan waits and concurrent layers overlap;
+these measurements cannot be summed into pipeline walltime.
+
+Plane construction now evaluates the original NumPy equations once per bounded
+strip and assembles the same readonly CSR tables. One-million-pixel strips reduce
+interpreter handoffs during concurrent output work. The two-pass constructor is
+retained as a qualification reference. Final plan admission and the 256 MiB cache
+are unchanged. Temporary occurrence arrays are bounded by the admitted column
+budget; final concatenation briefly retains two copies of the column payload.
+
+When valid source bounding boxes reduce storage, CUDA packs their rectangles
+directly from strided source masks into bounded pinned upload staging. It admits
+and uploads the concatenated uint8 payload instead of a complete dense mask.
+The existing bbox guard and geometry tables remain authoritative; a uint64
+per-shell offset only changes storage addressing. Empty shells need no payload.
+Without useful bounds, the dense upload path remains available. No additional
+foreground scan, full host packing array, or model-output change is introduced.
+Stage leases, preflight, ordered publication and fatal fencing rules are retained.
+
+Start/completion logs include `source_layout`, logical `source_bytes`, actual
+`source_h2d_bytes`, `source_upload_seconds`, `geometry_upload_seconds`, and
+`preflight_seconds`. This exposes source setup separately from projection and
+compact output transfer.
+
+`tools/benchmark_radial_setup.py --output-dir <scratch-directory> --gpu --full-stream`
+checks all ten production plane plans against the original construction, heats
+the GPU for 60 seconds, then compares dense/cropped/cropped/dense input uploads
+with identical production-stride synthetic masks and warmed host pages. Local
+plans matched exactly and built about 1.6–2.0x faster. The full tilted-transverse
+17,879,916,848-voxel output stream had identical SHA-256 in all four runs, with
+independent NumPy checks on three source slices. Source H2D fell from
+11,966,349,312 to 213,516,288 bytes; upload took 2.78–2.84 versus 0.163–0.165
+seconds on the RTX 4090 Laptop GPU. These masks are synthetic rectangles; this
+does not establish production sparsity, output contention or cluster walltime.
+Raw and packed CVOL integration additionally exercises the public dispatcher,
+actual CUDA crop upload, encoded callbacks and full decoded-store equality.
+
+### Radial host setup after job 142515
+
+Job 142515 did not validate an end-to-end improvement: walltime rose from
+1,311.9 to 1,390.8 seconds (+6.0%), split into +25.2 seconds through inference
+drain and +53.7 seconds in the tail. All 36 CUDA layers used cropped sources,
+reducing their logical 324,988,305,408 source bytes to 53,936,219,196 H2D bytes.
+Maximum plan wait fell from 85.29 to 19.95 seconds, but median total CUDA layer
+time increased from 45.82 to 56.41 seconds. Setup still had a median 14.52
+seconds outside its reported plan/upload/preflight subphases. These concurrent
+layer intervals do not sum to critical-path walltime or identify its sole cause.
+
+Tilt metadata now batches the original NumPy sampled-shear operations across
+shells, with at most one million intermediate values per batch (or one native
+row for unusually wide input). Source crop uploads use optional cached Numba
+packing into the existing bounded pinned buffer. Validated uint64 linear byte
+indices allow contiguous vector copies without Python handoffs between shells.
+Unavailable compilation retains the NumPy uploader before any source upload;
+later runtime failures still fence and fail the constructor transaction.
+
+Logs partition host metadata, CUDA admission, contract validation, module setup,
+buffer allocation, source packing and constructor time. Admission includes the
+constructor, packing is part of upload, and other subphases are nested rather
+than additive independent walltimes. CUDA event intervals around separately
+enqueued operations may also include host enqueue gaps; they should not be
+interpreted as isolated kernel execution times under host contention.
+
+`tools/benchmark_radial_host_contention.py --output-dir <scratch-directory>` uses
+real XTA sparse-store NRRD writers concurrently with production-stride synthetic
+Radial setup. In alternating original/candidate/candidate/original trials with
+eight writers, the qualified vector-copy candidate reduced median host metadata
+from 0.3065 to 0.1213 seconds and source upload from 0.8624 to 0.6103 seconds.
+Combined metadata and CUDA construction fell from 1.2888 to 0.8565 seconds.
+All metadata bits and three full GPU output slices matched; 291 background NRRDs
+completed and the last file from each of eight writers decoded exactly. An
+initial Numba slice-copy variant regressed and was replaced before qualification.
+The local benchmark excludes inference, multiple GPUs and low-quality mirrors;
+the new candidate still requires a cluster walltime measurement.
+
+### Job 142523 and disabled dispatch experiments
+
+Job 142523 took 1,375.3 seconds, versus 1,390.8 for 142515. Time through inference
+drain fell by 22.6 seconds, while the tail grew by 7.1 seconds to 731.7 seconds.
+All 36 CUDA layers selected the nogil crop packer. Median setup/upload times
+fell from 24.88/4.37 to 7.08/1.62 seconds; median time after setup increased from
+26.14 to 44.22 seconds. The four early CPU fallbacks moved from coronal to
+transverse views. Comparing the 32 views that used CUDA in both runs still shows
+setup improving from 23.30 to 6.47 seconds and time after setup growing from
+26.04 to 42.04 seconds. These overlapping phase intervals do not establish the
+cause of overall walltime or isolate host, GPU and output contention.
+
+The CUDA projector now exposes two **disabled-by-default experiments** through
+its internal constructor: `use_graphs` and `skip_empty_blocks`. The pipeline
+does not opt into either. Graph capture combines projection, crop metadata and
+its pinned D2H copy, with an owned first-Z scalar and at most three captured
+block sizes. Capture uses thread-local mode; settled unavailability retains
+direct CUDA, while failed fences and late replay errors retain the existing
+fatal/transactional rules. Empty-block elision can skip offset upload and the
+second encoder fence after validated metadata proves a block empty. Preflight
+still exercises both encoders. Graph work is timed as a combined interval in
+`cuda_graph_seconds`, not misreported as individual kernel timings.
+
+`tools/benchmark_radial_graph_dispatch.py` compares full ordered CUDA/CVOL
+streams while eight real full-width NRRD writers and 0.20 mirrors run. Their
+64-slice depth is deliberately bounded. Graph-only trials were mixed: median
+projection/publication changed from 22.72 to 24.67 seconds for broad rectangles,
+and 4.16 to 3.75 seconds for an ellipsoid with a production-like 1.17 GB output
+payload. Adding empty-block elision changed 4.85 to 5.16 seconds in a repeat.
+All four full decoded 17,879,916,848-voxel streams matched in each experiment.
+These results do not justify enabling either experiment in production.
+
+Jobs 142535 (reported capped) and 142543 (reported uncapped) took 1,352.6 and
+1,329.8 seconds, with tails of 700.1 and 697.2 seconds. Both logs report eight
+global NRRD bands, whereas this writer would allow four with the requested sink
+cap. Effective settings/deployed writer provenance are therefore unconfirmed;
+the pair does not conclusively isolate output contention. Defaults remain unchanged.
+
+### Native shell-owner execution
+
+At jobs 142535/142543, the GPU-only fast-bundle setup disabled shared direct union
+globally, then excluded shells from D1. Their worker result mode was
+`file`. Task masks are copied to the parent, accumulated into complete native
+views, cleaned and projected under parent postprocessing. At inference drain in
+both runs, the 30 older-family layers were published while 45 parent jobs
+remained; only four Radial plans had started, on CPU fallback. Projected refs are
+already authoritative for final fusion, so there is no additional duplicate
+terminal radial projection to remove in this command.
+
+`cylindrical_owner` now consumes each complete native radius chunk in its
+inference worker and gathers directly into a persistent source-space bitset.
+The existing plane plan is grouped by nearest owning shell. Each chunk visits
+only its owned base-plane positions while retaining all periodic occurrences,
+the ideal-height validity test, float64 sampled shear, clamp and ties-to-even
+rounding. The CUDA gather sets uint32 source bits atomically. Its geometry is
+the established pull relation; the legacy D1 splat kernel remains guarded.
+
+`tools/probe_radial_streaming_architecture.py` is a small CPU correctness probe,
+not a runtime backend or benchmark. Its 1,560 cases matched the existing pull
+oracle across axes, tilts, wraps and processing/restoration grids, including
+shuffled radius arrival and two-owner bitset reduction. The implemented first
+path uses one owner per view even when multi-owner groups are requested. A
+shape-only prediction target forbids host mask access and checks actual result
+coverage; the owner separately checks chunk/radius coverage before publication.
+
+Native cleanup uses four-connected background union-find within foreground
+bounds, then fills only components that do not reach the crop boundary. A private
+stream and reusable label buffers avoid per-radius device-wide fences and global
+allocator-cache flushes. Cleanup always follows the complete radius union. Both
+cleanup and projection are preflighted before the worker loads its model.
+
+The current command selects `projection_contract=radial_native_pull_v1` inside
+the established D1 owner envelope. Unsupported configurations retain their prior
+route. `YOLO_TTA_RADIAL_OWNER=0` is an explicit compatibility opt-out. The owner
+admits its bitset, geometry, label buffers and reserve against actual free VRAM;
+resource or device failures remain loud and cannot publish a partial result.
+Worker retirement refuses active native owners, and failed CUDA fences retain
+borrowed/device owners through the fatal path.
+
+Completed bitsets use the existing bounded asynchronous CPU CVOL publisher with
+native-shell provenance. Native-empty views retain internal empty contributions
+without adding public NRRD files. Every requested nonempty layer and mirror stays
+independent. Source-bitset D2H and CPU unpack/publication remain measured costs.
+The launcher logs effective and constructed output worker settings plus loaded
+module paths/hashes at task planning and inference drain.
+
+Qualification with a local one-channel PT model and all 50 shell trajectories
+matched all 52 native/LQ NRRDs and both videos' decoded frames/timestamps against
+compatibility execution. Multi-chunk leases were forced; the owner run recorded
+50 completed owners, no host native-view unions and no parent Radial projection.
+The helper excludes older physical families because their D1 path requires a
+TensorRT runtime, which was unavailable locally; production view selection is
+unchanged. Direct CUDA tests cover all axes, tilts, reduced/restored grids,
+3072-square cleanup, coverage/failure rules and real CVOL publication.
+
+The production-grid synthetic ellipsoid produced the same complete decoded
+17,879,916,848-voxel SHA-256 as the retained projector. After a 60-second GPU
+heatsoak, native cleanup/gather took 3.17/0.21 seconds, bitset D2H 0.68 seconds,
+and CPU publication 7.27 seconds on the local GPU. Fixture uploads and final
+validation decoding are separate; these are component measurements.
+
+Cluster job 142565 subsequently completed the full four-GPU TensorRT command
+in 1,124.5 seconds versus 1,329.8 seconds in job 142543, a 205.3-second (15.4%)
+reduction. Its post-inference tail fell from 697.2 to 434.9 seconds. All four
+workers passed native Radial preflight, all 50 shell views (40,915 frames)
+used the native owner contract, and all 155,365 model frames completed with
+zero parent postprocess jobs at inference drain. The time through the drain
+increased from 632.6 to 689.6 seconds as shell cleanup/projection moved into
+the workers. These are individual end-to-end runs; exact output parity was
+qualified separately with the local decoded-output comparisons above.
 
 ## Default sparse execution
 
@@ -660,7 +860,7 @@ one-versus-four-device scheduling and final bytes are covered by deterministic s
 representative H100 execution remains a hardware qualification step:
 
 ```bash
-python -u GPT-6-Astra-Ultra_v20.0.1_SLURM.py \
+python -u GPT-6-Astra-Ultra_v20.0.2_SLURM.py \
   --mode lta \
   --input <target-video> \
   --exemplar <aligned-image-yolo-directory> \

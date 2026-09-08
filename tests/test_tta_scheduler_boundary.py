@@ -176,6 +176,23 @@ def _bind_callbacks(
 
 
 class TtaSchedulerBoundaryTests(unittest.TestCase):
+    def test_native_radial_contract_stays_single_owner_with_group_gate_enabled(self):
+        from XTA.cylindrical_owner import RADIAL_OWNER_CONTRACT
+        state=_state()
+        parent,tasks=self._d1_seed_tasks(state,ranges=((0,8),(8,16)))
+        for task in tasks:task['projection_contract']=RADIAL_OWNER_CONTRACT
+        with tempfile.TemporaryDirectory() as directory:
+            scheduler=_scheduler(Path(directory),state=state,
+                input_overrides={'v1613_d1_owner_active':True,'gpu_device_count':4},
+                operation_overrides={'_env_int':lambda name,default:
+                    1 if name=='YOLO_TTA_D1_OWNER_GROUPS' else 4 if name=='YOLO_TTA_D1_OWNER_GROUP_SIZE' else default})
+            self.assertIsNone(scheduler.ensure_d1_parent_group(tasks[0],(0,1,2,3)))
+            self.assertTrue(scheduler.claim_d1_owner(tasks[0],2))
+            self.assertEqual(scheduler.d1_feasible_workers(tasks[1],(0,1,2,3)),[2])
+            scheduler.release_d1_owner_if_complete(tasks[1],2,{'d1_view_complete':True})
+            self.assertNotIn(parent,state.d1_owner_by_parent)
+            self.assertFalse(state.d1_groups_by_parent)
+
     @staticmethod
     def _d1_seed_tasks(
         state: TtaSchedulerState,

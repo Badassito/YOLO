@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xta"
-version = "20.0.1"
+version = "20.0.2"
 description = "Volume test-time, pretraining, and label-time augmentation"
 requires-python = ">=3.10"
 dependencies = [
@@ -38,7 +38,7 @@ include = ["XTA*"]
 [tool.setuptools.data-files]
 "share/xta" = [
   "ARCHITECTURE.md",
-  "GPT-6-Astra-Ultra_v20.0.1_SLURM.py",
+  "GPT-6-Astra-Ultra_v20.0.2_SLURM.py",
 ]
 "share/xta/tools" = [
   "tools/replay_component_projection.py",

@@ -31,7 +31,7 @@ from tools.benchmark_radial_cuda_projection import WORKING_SHAPE, OUTPUT_SHAPE, 
 
 
 RECIPE = 'v1: zero-extended new C-strided uint8 file; every shell contains 24x128 rectangles at low/middle/high logical-height rows; column origin=(shell*29+337)%(3072-128)'
-EVENTS = ('kernel_seconds', 'metadata_seconds', 'pack_seconds', 'd2h_seconds')
+EVENTS = ('kernel_seconds', 'metadata_seconds', 'pack_seconds', 'd2h_seconds', 'cuda_graph_seconds')
 TRANSFERS = ('metadata_d2h_bytes', 'payload_d2h_bytes', 'dense_d2h_bytes')
 
 
@@ -88,7 +88,7 @@ class CompactSink(DenseSink):
 
 def metrics(projector):
     # Missing counters are an incompatible backend, never silently reported zero.
-    return {name: getattr(projector, name) for name in EVENTS + TRANSFERS}
+    return {name: getattr(projector, name) for name in EVENTS + TRANSFERS + ('cuda_graph_blocks', 'empty_encoded_blocks')}
 
 
 def save(report, path):

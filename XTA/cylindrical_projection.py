@@ -27,6 +27,8 @@ from .workspace import _cpu_count
 
 # Coordinate intermediates are bounded independently of source volume size.
 _PULL_CHUNK_VOXELS = 128 * 1024
+_PLANE_BUILD_CHUNK_PIXELS = 1024 * 1024
+_RADIAL_METADATA_CHUNK_VALUES = 1024 * 1024
 _PLANE_PLAN_CACHE_BYTES = 256 * 1024 * 1024
 _PLANE_PLAN_MAX_BYTES = 384 * 1024 * 1024
 _OUTPUT_BLOCK_BYTES = 8 * 1024 * 1024
@@ -80,13 +82,15 @@ def _plane_geometry(view, output_shape):
     return base, tuple(work[a] for a in axes), tuple(output_shape[a] for a in axes)
 
 
-def _plane_occurrence_strips(view, radii, output_shape):
+def _plane_occurrence_strips(view, radii, output_shape, *, first_pixel=0, stop_pixel=None,
+                             chunk_pixels=_PULL_CHUNK_VOXELS):
     """Evaluate the original pull equations once per bounded 2D strip."""
     _, work_plane, plane = _plane_geometry(view, output_shape)
     height, width = plane
     native_width = int(view.src_w)
-    for first in range(0, height * width, _PULL_CHUNK_VOXELS):
-        flat = np.arange(first, min(height * width, first + _PULL_CHUNK_VOXELS), dtype=np.int64)
+    stop_pixel = height * width if stop_pixel is None else min(height * width, stop_pixel)
+    for first in range(first_pixel, stop_pixel, chunk_pixels):
+        flat = np.arange(first, min(stop_pixel, first + chunk_pixels), dtype=np.int64)
         yy, xx = flat // width, flat % width
         xx = (xx + .5) * work_plane[1] / width - .5
         yy = (yy + .5) * work_plane[0] / height - .5
@@ -124,7 +128,7 @@ def _plane_occurrence_strips(view, radii, output_shape):
             column_float += period
 
 
-def _build_radial_plane_plan(view, radii, output_shape):
+def _build_radial_plane_plan_reference(view, radii, output_shape):
     base, _, plane = _plane_geometry(view, output_shape)
     pixels = math.prod(plane)
     if pixels > np.iinfo(np.uint32).max or pixels * 12 > _PLANE_PLAN_MAX_BYTES:
@@ -145,6 +149,57 @@ def _build_radial_plane_plan(view, radii, output_shape):
     for positions, _, native_columns in _plane_occurrence_strips(view, radii, output_shape):
         columns[counts[positions]] = native_columns
         counts[positions] += 1
+    for array in (shells, offsets, columns):
+        array.flags.writeable = False
+    return RadialPlanePlan(base, tuple(plane), shells, offsets, columns)
+
+
+def _build_radial_plane_plan(view, radii, output_shape):
+    """Evaluate exact NumPy geometry once, assembling CSR in bounded strips.
+
+    The reference evaluates every transcendental twice. Reusing one strip's
+    occurrences also reduces Python/NumPy handoffs during concurrent output
+    encoding. Strip payloads are bounded by the final plan budget; concatenation
+    temporarily retains at most two copies of the admitted column payload.
+    """
+    base, _, plane = _plane_geometry(view, output_shape)
+    pixels = math.prod(plane)
+    if pixels > np.iinfo(np.uint32).max or pixels * 12 > _PLANE_PLAN_MAX_BYTES:
+        raise _RadialPlanePlanTooLarge('Radial plane ownership exceeds the bounded plan budget')
+    shells = np.full(pixels, -1, np.int32)
+    offsets = np.empty(pixels + 1, np.uint32)
+    offsets[0] = 0
+    parts = []
+    total = 0
+    for first in range(0, pixels, _PLANE_BUILD_CHUNK_PIXELS):
+        stop = min(pixels, first + _PLANE_BUILD_CHUNK_PIXELS)
+        counts = np.zeros(stop - first, np.uint32)
+        occurrences = []
+        strip_total = 0
+        for positions, local_shell, columns in _plane_occurrence_strips(
+                view, radii, output_shape, first_pixel=first, stop_pixel=stop,
+                chunk_pixels=_PLANE_BUILD_CHUNK_PIXELS):
+            strip_total += int(columns.size)
+            if (total + strip_total > np.iinfo(np.uint32).max or
+                    pixels * 8 + 4 + (total + strip_total) * 4 > _PLANE_PLAN_MAX_BYTES):
+                raise _RadialPlanePlanTooLarge('Radial periodic occurrences exceed the bounded plan budget')
+            shells[positions] = local_shell
+            local = (positions - first).astype(np.int32)
+            counts[local] += 1
+            occurrences.append((local, columns))
+        np.cumsum(counts, dtype=np.uint32, out=offsets[first + 1:stop + 1])
+        # Local write cursors preserve the reference's per-pixel wrap order.
+        counts[0] = 0
+        counts[1:] = offsets[first + 1:stop]
+        part = np.empty(strip_total, np.int32)
+        for local, columns in occurrences:
+            part[counts[local]] = columns
+            counts[local] += 1
+        offsets[first + 1:stop + 1] += np.uint32(total)
+        total += strip_total
+        parts.append(part)
+        del occurrences, counts
+    columns = np.concatenate(parts)
     for array in (shells, offsets, columns):
         array.flags.writeable = False
     return RadialPlanePlan(base, tuple(plane), shells, offsets, columns)
@@ -216,10 +271,16 @@ def _radial_projection_metadata(view, source_shape, output_shape, plan):
         tangent = math.tan(math.radians(float(view.tilt_angle_deg)))
         ideal *= tangent
         columns = np.arange(int(view.src_w), dtype=np.float64)
-        for shell, radius in enumerate(view.radial_radii):
-            theta = np.remainder((float(view.radial_arc_origin) + columns) / radius, 2.0 * math.pi)
+        arc = float(view.radial_arc_origin) + columns
+        radii = np.asarray(view.radial_radii, dtype=np.float64)
+        # Preserve NumPy's exact operations, but do not reacquire the interpreter
+        # between a handful of small ufuncs for each of thousands of shells.
+        rows = max(1, _RADIAL_METADATA_CHUNK_VALUES // max(1, int(view.src_w)))
+        for first in range(0, len(radii), rows):
+            radius = radii[first:first + rows, None]
+            theta = np.remainder(arc[None, :] / radius, 2.0 * math.pi)
             offset = radius * (np.sin(theta) if vertical else np.cos(theta))
-            sampled[shell] = tangent * offset
+            sampled[first:first + rows] = tangent * offset
     else:
         ideal[:] = 0.0
     row_map = _processing_index(np.arange(int(view.src_h), dtype=np.int64), int(view.src_h), int(source_shape[1])).astype(np.int32)
@@ -628,7 +689,7 @@ def backproject_radial_volume_to_volume(
     failed = False
     try:
         project = None
-        plan_seconds = setup_seconds = sink_seconds = 0.0
+        plan_seconds = setup_seconds = sink_seconds = metadata_host_seconds = cuda_admission_seconds = 0.0
         plan_bytes = 0
         cache_hit = False
         backend_name = 'cpu_numpy_reference'
@@ -642,9 +703,11 @@ def backproject_radial_volume_to_volume(
                 plan = None
             plan_seconds = time.perf_counter() - started
             if plan is not None:
+                metadata_started = time.perf_counter()
                 metadata = _radial_projection_metadata(
                     radial_view, source.shape, shape, plan,
                 )
+                metadata_host_seconds = time.perf_counter() - metadata_started
                 centers, ideal, sampled, row_map, column_map, stack_length, vertical = metadata
                 arguments = (
                     source, plan.shell_index, plan.column_offsets, plan.native_columns,
@@ -652,9 +715,11 @@ def backproject_radial_volume_to_volume(
                     int(radial_view.radial_height_origin), int(radial_view.src_h), plan.base_id,
                     bool(vertical), int(plan.plane_shape[1]), int(shape[1]), int(shape[2]),
                 )
+                admission_started = time.perf_counter()
                 cuda_stage = _try_radial_cuda_stage(
                     source, plan, metadata, radial_view, shape, bboxes, use_bboxes,
                 )
+                cuda_admission_seconds = time.perf_counter() - admission_started
                 if cuda_stage is not None:
                     project = cuda_stage.project
                     backend_name = 'cuda_factored'
@@ -687,11 +752,25 @@ def backproject_radial_volume_to_volume(
         if compact_output:
             backend_name = 'cuda_factored_compact'
             runtime_telemetry().gauge('projection.radial.backend', backend_name)
+        setup_metrics = (f', metadata_host_seconds={metadata_host_seconds:.6f}'
+                         f', cuda_admission_seconds={cuda_admission_seconds:.6f}')
+        if cuda_stage is not None:
+            projector = cuda_stage.projector
+            setup_metrics += ''.join(f', {name}={float(getattr(projector, name, 0.0)):.6f}' for name in
+                ('source_upload_seconds', 'source_pack_seconds', 'geometry_upload_seconds',
+                 'preflight_seconds', 'contract_validation_seconds', 'module_setup_seconds',
+                 'buffer_setup_seconds', 'constructor_seconds', 'cuda_graph_setup_seconds'))
+            setup_metrics += (f', source_layout={getattr(projector, "source_layout", "unknown")}'
+                              f', source_bytes={int(getattr(projector, "source_bytes", source.nbytes))}'
+                              f', source_h2d_bytes={int(getattr(projector, "source_h2d_bytes", source.nbytes))}'
+                              f', source_pack_backend={getattr(projector, "source_pack_backend", "unknown")}'
+                              f', cuda_graph_enabled={int(getattr(projector, "cuda_graph_enabled", False))}'
+                              f', cuda_graph_note={getattr(projector, "cuda_graph_note", "unknown")}')
         print(f'Radial projection start {radial_view.name}: backend={backend_name}, '
               f'workers={actual_workers}, block_z={block_depth}, plan_MiB={plan_bytes / 2**20:.2f}, '
               f'cache_hit={int(cache_hit)}, plan_s={plan_seconds:.6f}, setup_s={setup_seconds:.6f}'
               + (f', device=cuda:{cuda_stage.device_index}' if cuda_stage is not None else '')
-              + (f', payload={encoded_format}' if compact_output else ''), flush=True)
+              + (f', payload={encoded_format}' if compact_output else '') + setup_metrics, flush=True)
         try:
             if not sink_only:
                 output = allocate_workspace_array(
@@ -744,15 +823,16 @@ def backproject_radial_volume_to_volume(
             device_metrics = ''
             if cuda_stage is not None:
                 projector = cuda_stage.projector
-                timings = ('kernel_seconds', 'metadata_seconds', 'pack_seconds', 'd2h_seconds')
-                transfers = ('metadata_d2h_bytes', 'payload_d2h_bytes', 'dense_d2h_bytes')
+                timings = ('kernel_seconds', 'metadata_seconds', 'pack_seconds', 'd2h_seconds', 'cuda_graph_seconds')
+                transfers = ('metadata_d2h_bytes', 'payload_d2h_bytes', 'dense_d2h_bytes',
+                             'cuda_graph_blocks', 'empty_encoded_blocks')
                 device_metrics = ''.join(f', {name}={float(getattr(projector, name, 0.0)):.6f}' for name in timings)
                 device_metrics += ''.join(f', {name}={int(getattr(projector, name, 0))}' for name in transfers)
             print(f'Radial projection complete {radial_view.name}: backend={backend_name}, '
                   f'workers={actual_workers}, plan_MiB={plan_bytes / 2**20:.2f}, cache_hit={int(cache_hit)}, '
                   f'plan_s={plan_seconds:.6f}, setup_s={setup_seconds:.6f}, '
                   f'total_s={time.perf_counter() - total_started:.6f}, sink_wall_s={sink_seconds:.6f}'
-                  + device_metrics, flush=True)
+                  + setup_metrics + device_metrics, flush=True)
             return output if output is not None else SinkOnlyProjectionResult(shape)
         except BaseException as exc:
             failed = True

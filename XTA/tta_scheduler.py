@@ -27,6 +27,7 @@ from .experimental_features import (
     d1_owner_groups_requested as configured_d1_owner_groups_requested,
 )
 from .geometry import ViewInfo
+from .cylindrical_owner import is_radial_owner_task
 
 
 @dataclass(frozen=True)
@@ -1278,6 +1279,9 @@ class TtaScheduler:
         """Atomically bind all existing parent leases to deterministic participants."""
         parent = self.d1_task_parent_key(task)
         if parent is None or not self.d1_owner_group_mode_active():
+            return None
+        if is_radial_owner_task(task):
+            self._reject_d1_group_parent(parent, 'native Radial projection uses one owner per view')
             return None
         existing = self.state.d1_groups_by_parent.get(parent)
         if existing is not None:

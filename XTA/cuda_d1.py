@@ -877,6 +877,7 @@ def _d1_finalize_bitset_layer(
     store_dir: Path,
     model_name: str,
     view: ViewInfo,
+    projection_kind: str = 'legacy',
 ) -> Dict[str, object]:
     """Stream the completed owner bitset into a path-backed cvol and return its layer ref."""
     key = _nrrd_layer_key(
@@ -890,8 +891,10 @@ def _d1_finalize_bitset_layer(
         desc=f'D1 source-space layer {model_name}/{view.name}',
         extra_meta={
             'nrrd_layer_key': str(key),
-            'producer': 'v16.1.3_d1_owner_gpu_bitset',
-            'projection_payload_fusion': 'project_infer_proto_close_backproject',
+            'producer': ('radial_native_owner_bitset' if projection_kind == 'radial_native_pull_v1'
+                         else 'v16.1.3_d1_owner_gpu_bitset'),
+            'projection_payload_fusion': (projection_kind if projection_kind != 'legacy'
+                                         else 'project_infer_proto_close_backproject'),
             'source_geometry_bitset': True,
         },
     )
@@ -945,8 +948,9 @@ def _d1_finalize_bitset_layer(
         pass_index=0,
         stage='pre_interpolation',
         description=(
-            'Angle-variant YOLO mask with resident proto closing and immediate '
-            'owner-GPU backprojection into source geometry.'
+            'Native-plane-cleaned Radial YOLO mask with exact shell-owner pull projection.'
+            if projection_kind == 'radial_native_pull_v1' else
+            'Angle-variant YOLO mask with resident proto closing and immediate owner-GPU backprojection into source geometry.'
         ),
         segment_extent_ijk=extent,
         segment_extent_shape_tyx=tuple(int(v) for v in output_shape),
@@ -978,6 +982,7 @@ def _d1_submit_publication(
                 store_dir=state.store_dir,
                 model_name=state.key[0],
                 view=state.view,
+                projection_kind=getattr(state, 'projection_kind', 'legacy'),
             )
             result['d1_publication_seconds'] = max(0.0, time.perf_counter() - started)
             return result

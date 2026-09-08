@@ -23,6 +23,12 @@ from typing import (
 )
 import numpy as np
 from ._deps import cv2
+from .cylindrical_owner import (
+    DeviceOnlyRadialTarget, active_radial_owners, consume_radial_device_union, is_radial_owner_task,
+    shutdown_radial_owners,
+    preflight_radial_owner,
+)
+from .cylindrical_cuda_projection import RadialCudaProjectionUnsafeFailure
 
 from .cuda_backend import (
     GpuRenderedYoloSource,
@@ -1307,8 +1313,12 @@ def run_prediction_volume_in_worker(
     kind = str(task['kind'])
     if str(task.get('result_mode', 'file')) == HYBRID_DEFERRED_RESULT_MODE:
         raise ValueError('CUDA worker received an unresolved hybrid full-frame task')
-    if is_radial_view(view) and str(task.get('result_mode', 'file')) == 'd1_owner':
+    if (is_radial_view(view) and str(task.get('result_mode', 'file')) == 'd1_owner'
+            and not is_radial_owner_task(task)):
         raise ValueError('Radial shell tasks require native union results for parent projection; D1 is unsupported')
+    if (str(task.get('result_mode', 'file')) == 'd1_owner'
+            and not is_radial_owner_task(task) and active_radial_owners()):
+        raise RuntimeError('Worker cannot start legacy D1 while a Radial owner is incomplete')
     if kind not in {'fullframe', 'tile'}:
         raise ValueError(f'Unsupported v16.4.0 worker task kind: {kind!r}')
     if kind == 'fullframe' and not isinstance(job, AugJob):
@@ -1451,7 +1461,8 @@ def run_prediction_volume_in_worker(
         if str(task.get('result_mode', 'file')) == 'd1_owner':
             # D1 never creates a host-dense task/view union. This sentinel exists only to
             # satisfy the generic prediction API; any host fallback is rejected explicitly.
-            result_mask = np.zeros((1, 1, 1), dtype=np.uint8)
+            result_mask = (DeviceOnlyRadialTarget(result_shape) if is_radial_owner_task(task)
+                           else np.zeros((1, 1, 1), dtype=np.uint8))
             result_conf = None
         elif str(task.get('result_mode', 'file')) == 'direct_union':
             # Every angle variant owns a disjoint per-view accumulator. Full-frame slice
@@ -1648,12 +1659,15 @@ def run_prediction_volume_in_worker(
                 device_hole_fill=bool(task.get('device_hole_fill', False)),
                 defer_device_union_flush=bool(gpu_union_flush_overlap_enabled()),
                 device_union_consumer=(
-                    (lambda accumulator: _d1_consume_device_union(task, accumulator))
+                    (lambda accumulator: (
+                        consume_radial_device_union(task, accumulator, target=result_mask) if is_radial_owner_task(task)
+                        else _d1_consume_device_union(task, accumulator)))
                     if str(task.get('result_mode', 'file')) == 'd1_owner' else None
                 ),
                 require_device_union=bool(str(task.get('result_mode', 'file')) == 'd1_owner'),
                 require_proto_hole_treatment=bool(
                     str(task.get('result_mode', 'file')) == 'd1_owner'
+                    and not is_radial_owner_task(task)
                 ),
                 azimuthal_padding_union_mm=azimuthal_padding_mask,
                 azimuthal_padding_confmap_mm=azimuthal_padding_conf,
@@ -1748,6 +1762,7 @@ def run_prediction_volume_in_worker(
                     ),
                 } for frame in public_stats['azimuthal_padding_frames'])
         for d1_key in (
+            'radial_owner', 'radial_owner_empty',
             'd1_view_complete', 'd1_covered_slices', 'd1_total_slices',
             'd1_backprojected_task_slices', 'd1_bitset_words',
             'd1_view_compute_seconds', 'd1_layer_ref', 'd1_cvol_stats',
@@ -1893,6 +1908,7 @@ def _release_gpu_worker_inference_assets(
     from . import cuda_d1, inference as inference_module
     with cuda_d1._D1_WORKER_VIEW_LOCK:
         active = tuple(cuda_d1._D1_WORKER_VIEW_STATES)
+    active += active_radial_owners()
     if active:
         raise RuntimeError(f'Cannot retire inference assets with active D1 views/group leases: {active}')
     ring_count = _resident_trt_pipeline_retirement_ready()
@@ -1920,6 +1936,7 @@ def _release_gpu_worker_inference_assets(
         raise RuntimeError('TensorRT cache changed across the inference retirement fence')
     _shutdown_gpu_union_retirement_manager()
     _shutdown_d1_worker_pipeline()
+    shutdown_radial_owners()
     stats['phase'] = 'release_renderer'
     if engine is not None:
         stats['renderer'] = engine.release_inference_assets()
@@ -2020,6 +2037,8 @@ def _gpu_inference_worker_main(
                 f'v16.1.7 D1 backprojection NVRTC preflight passed on cuda:{int(gpu_index)}: '
                 'header-free source-geometry atomic-OR kernel compiled before TensorRT load.'
             )
+        if bool(init_dict.get('radial_owner_preflight', False)):
+            preflight_radial_owner()
         model = load_ultralytics_model(str(model_path), task='segment')
         ensure_yolo_ready_for_predict(model, cfg)
         validate_yolo_model_input_channels(
@@ -2342,7 +2361,7 @@ def _gpu_inference_worker_main(
                     'type': 'result', 'task_id': task_id, 'gpu_index': int(gpu_index),
                     'ok': True, 'stats': completed,
                 })
-        except _ResidentTensorRTRingFatalError as exc:  # pragma: no cover - unsafe TRT state
+        except (_ResidentTensorRTRingFatalError, RadialCudaProjectionUnsafeFailure) as exc:  # pragma: no cover - unsafe device state
             # A failed post/infer-stream drain or binding-address restore means this process's
             # TensorRT contexts can no longer be reused safely. Surface a worker-fatal result
             # and exit instead of dequeuing another view on the compromised backend.
@@ -2363,6 +2382,7 @@ def _gpu_inference_worker_main(
     finally:
         _wait_for_deferred_publications()
         _shutdown_d1_worker_pipeline()
+        shutdown_radial_owners()
         _shutdown_resident_trt_pipeline_cache()
         _shutdown_gpu_union_retirement_manager()
         _close_fd_list(persistent_source_memfds.values())

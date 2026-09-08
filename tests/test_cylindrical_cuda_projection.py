@@ -4,6 +4,8 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
 import os
+from pathlib import Path
+import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
@@ -154,6 +156,190 @@ class RadialCudaProjectionContractTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('XTA_RUN_CUDA_RADIAL_PROJECTION') == '1', 'explicit CUDA projection qualification only')
 class RadialCudaProjectionParityTests(unittest.TestCase):
+    def test_production_defaults_keep_graph_and_empty_block_experiments_disabled(self):
+        source, view = case()
+        source[:] = 0
+        shape = (5, 7, 9)
+        plan, metadata, boxes = contract(source, view, shape)
+        with mock.patch.object(cuda.RadialCudaProjector, '_prepare_projection_graphs',
+                               side_effect=AssertionError('production capture')), \
+                cuda.RadialCudaProjector(source, plan, metadata, view, shape,
+                                        boxes, True, 0, reserve_bytes=0) as projector:
+            self.assertFalse(projector.cuda_graph_enabled)
+            assert_encoded(self, projector.project_encoded(0, 5), np.zeros(shape, np.uint8))
+            self.assertEqual(projector.cuda_graph_blocks, 0)
+            self.assertEqual(projector.empty_encoded_blocks, 0)
+
+    def test_empty_metadata_skips_offset_upload_and_encoder_after_preflight(self):
+        source, view = case()
+        source[:] = 0
+        shape = (5, 7, 9)
+        plan, metadata, boxes = contract(source, view, shape)
+        for use_graphs in (False, True):
+            with cuda.RadialCudaProjector(source, plan, metadata, view, shape, boxes, True, 0,
+                    reserve_bytes=0, use_graphs=use_graphs, skip_empty_blocks=True) as projector:
+                projector._encode_kernel = mock.Mock(side_effect=AssertionError('empty encoder launched'))
+                for packed in (False, True):
+                    assert_encoded(self, projector.project_encoded(0, 5, packed), np.zeros(shape, np.uint8))
+                self.assertEqual(projector.empty_encoded_blocks, 2)
+                self.assertEqual(projector.pack_seconds, 0.)
+                self.assertEqual(projector.payload_d2h_bytes, 0)
+
+    def test_unsafe_graph_preflight_retains_constructor_owners(self):
+        source, view = case()
+        shape = (5, 7, 9)
+        plan, metadata, boxes = contract(source, view, shape)
+        def unfenced(projector):
+            raise cuda.RadialCudaProjectionUnsafeFailure('unfenced graph sentinel', projector)
+        with mock.patch.object(cuda.RadialCudaProjector, '_prepare_projection_graphs', unfenced), \
+                self.assertRaises(cuda.RadialCudaProjectionUnsafeFailure) as caught:
+            cuda.RadialCudaProjector(source, plan, metadata, view, shape, boxes, True, 0,
+                                    reserve_bytes=0, use_graphs=True)
+        projector = caught.exception.projector
+        try:
+            self.assertFalse(projector._closed)
+            self.assertIsNotNone(projector._source_gpu)
+            self.assertGreater(projector._pool.used_bytes(), 0)
+        finally:
+            # Only this synthetic fault test knows its actual stream is settled.
+            projector.close()
+
+    def test_graph_replay_moves_source_z_and_bounds_graph_cache_and_fallback_sizes(self):
+        for base in ('transverse', 'sagittal', 'coronal'):
+            source, initial = case(base, shape=(11, 17, 19), size=8)
+            view = replace(initial, radial_tilted_source=True, tilt_direction='horizontal', tilt_angle_deg=-30.)
+            shape = (9, 13, 17)
+            plan, metadata, boxes = contract(source, view, shape)
+            expected = numpy_oracle(source, view, shape)
+            for enabled in (False, True):
+                with cuda.RadialCudaProjector(source, plan, metadata, view, shape, boxes, True, 0,
+                        block_bytes=3 * shape[1] * shape[2], reserve_bytes=0, use_graphs=enabled) as projector:
+                    self.assertEqual(projector.cuda_graph_enabled, enabled)
+                    self.assertLessEqual(len(projector._graphs), 3)
+                    for first, count in ((0, 3), (4, 3), (8, 1), (2, 2)):
+                        for packed in (False, True):
+                            assert_encoded(self, projector.project_encoded(first, count, packed), expected[first:first + count])
+                    # The uncommon two-slice request uses direct launches; replay
+                    # counters count actual graphs, not every encoded packet.
+                    self.assertEqual(projector.cuda_graph_blocks, 6 if enabled else 0)
+                    np.testing.assert_array_equal(projector.project(2, 2), expected[2:4])
+
+    def test_graph_capture_failure_settles_before_direct_cuda_fallback(self):
+        source, view = case()
+        shape = (5, 7, 9)
+        plan, metadata, boxes = contract(source, view, shape)
+        original = cuda.RadialCudaProjector._launch_projection
+        def fail_capture(projector, first, count, **kwargs):
+            if first == -1:
+                raise RuntimeError('capture rejection sentinel')
+            return original(projector, first, count, **kwargs)
+        with mock.patch.object(cuda.RadialCudaProjector, '_launch_projection', fail_capture), \
+                cuda.RadialCudaProjector(source, plan, metadata, view, shape, boxes, True, 0,
+                                        reserve_bytes=0, use_graphs=True) as projector:
+            self.assertFalse(projector.cuda_graph_enabled)
+            self.assertFalse(projector._graphs)
+            self.assertIn('capture_unavailable', projector.cuda_graph_note)
+            assert_encoded(self, projector.project_encoded(0, 5), numpy_oracle(source, view, shape))
+
+    def test_graph_replay_failure_poisoning_prevents_late_direct_retry(self):
+        source, view = case()
+        shape = (5, 7, 9)
+        plan, metadata, boxes = contract(source, view, shape)
+        with cuda.RadialCudaProjector(source, plan, metadata, view, shape, boxes, True, 0,
+                                       reserve_bytes=0, use_graphs=True) as projector:
+            self.assertTrue(projector.cuda_graph_enabled)
+            projector._graphs[5] = SimpleNamespace(launch=mock.Mock(side_effect=RuntimeError('replay failed')))
+            with self.assertRaisesRegex(RuntimeError, 'replay failed'):
+                projector.project_encoded(0, 5)
+            with self.assertRaisesRegex(RuntimeError, 'closed or failed'):
+                projector.project_encoded(0, 5)
+
+    def test_cropped_upload_without_optional_packer_or_with_compilation_failure(self):
+        source, view = case(shape=(9, 11, 13), size=16)
+        source[:] = 0
+        source[:, 1:6, 3:12] = 255
+        shape = (7, 10, 12)
+        plan, metadata, boxes = contract(source, view, shape)
+        expected = numpy_oracle(source, view, shape)
+        for packer in (None, mock.Mock(side_effect=RuntimeError('optional compiler unavailable'))):
+            with mock.patch.object(cuda, '_pack_radial_source_block_compiled', packer), \
+                    cuda.RadialCudaProjector(source, plan, metadata, view, shape,
+                                             boxes, True, 0, reserve_bytes=0) as projector:
+                self.assertEqual(projector.source_pack_backend, 'numpy')
+                np.testing.assert_array_equal(projector.project(0, shape[0]), expected)
+
+    def test_cropped_input_public_dispatch_through_real_raw_and_packed_stores(self):
+        from XTA.interpolation import (IncrementalRawBBoxMaskStoreWriter, RawBBoxMaskStore,
+                                       CVOL_FORMAT, INTERNAL_PACKED_CVOL_FORMAT)
+        for base in ('transverse', 'sagittal', 'coronal'):
+            source, view = case(base, shape=(9, 11, 13), size=16)
+            source[:] = 0
+            source[::2, 1:6, 3:12] = 255
+            shape = (7, 10, 12)
+            _, _, boxes = contract(source, view, shape)
+            expected = numpy_oracle(source, view, shape)
+            for fmt in (CVOL_FORMAT, INTERNAL_PACKED_CVOL_FORMAT):
+                with tempfile.TemporaryDirectory() as temporary:
+                    path = Path(temporary) / 'projected.cvol'
+                    writer = IncrementalRawBBoxMaskStoreWriter(shape=shape, store_dir=path,
+                                                               format_name=fmt, desc='Radial crop input')
+                    lease = SimpleNamespace(device_index=0, release=mock.Mock())
+                    def admit(source, plan, metadata, view, shape, bboxes, use_bboxes):
+                        projector = cuda.RadialCudaProjector(source, plan, metadata, view, shape,
+                                                             bboxes, use_bboxes, 0, reserve_bytes=0)
+                        self.assertEqual(projector.source_layout, 'bbox_u8')
+                        return reference._RadialCudaStage(projector, lease)
+                    try:
+                        with mock.patch.object(reference, '_try_radial_cuda_stage', side_effect=admit), \
+                                mock.patch.object(reference, '_project_radial_block', side_effect=AssertionError('CPU fallback')), \
+                                mock.patch.object(reference, 'radial_cuda_backproject_enabled', return_value=True):
+                            reference.backproject_radial_volume_to_volume(source, view,
+                                Path(temporary) / 'unused.dat', 'Radial crop integration',
+                                out_shape_tyx=shape, known_slice_bboxes=boxes,
+                                sink_only=True, projection_block_callback=writer)
+                        writer.finalize()
+                        lease.release.assert_called_once()
+                        store = RawBBoxMaskStore.open(path)
+                        try:
+                            np.testing.assert_array_equal(np.stack([store.decode_slice(z)
+                                for z in range(shape[0])]), expected)
+                        finally:
+                            store.close()
+                    finally:
+                        writer.discard()
+
+    def test_cropped_source_upload_strides_empty_shells_and_split_rows(self):
+        for base in ('transverse', 'sagittal', 'coronal'):
+            source, initial = case(base, shape=(9, 11, 13), size=16)
+            source[:] = 0
+            source[::2, 1:6, 3:12] = 255
+            source[-1, 8:10, 2:7] = 1
+            view = replace(initial, radial_tilted_source=True,
+                           tilt_direction='horizontal', tilt_angle_deg=-30.)
+            shape = (7, 10, 12)
+            plan, metadata, boxes = contract(source, view, shape)
+            packed_source = np.concatenate([source[z, y0:y1, x0:x1].reshape(-1)
+                for z, (y0, y1, x0, x1) in enumerate(boxes)])
+            expected = numpy_oracle(source, view, shape)
+            for budget in (1, 7, 37, 4096):
+                with self.subTest(base=base, upload_bytes=budget), cuda.RadialCudaProjector(
+                        source, plan, metadata, view, shape, boxes, True, 0,
+                        upload_bytes=budget, reserve_bytes=0) as projector:
+                    self.assertEqual(projector.source_layout, 'bbox_u8')
+                    self.assertEqual(projector.source_h2d_bytes, packed_source.nbytes)
+                    self.assertLess(projector.source_h2d_bytes, source.nbytes)
+                    np.testing.assert_array_equal(projector._source_gpu.get(), packed_source)
+                    np.testing.assert_array_equal(projector.project(0, shape[0]), expected)
+                    for packed in (False, True):
+                        assert_encoded(self, projector.project_encoded(0, shape[0], packed), expected)
+            source[:] = 0
+            boxes[:] = 0
+            with cuda.RadialCudaProjector(source, plan, metadata, view, shape, boxes, True, 0,
+                                          reserve_bytes=0) as projector:
+                self.assertEqual(projector.source_h2d_bytes, 0)
+                self.assertEqual(projector._source_gpu.nbytes, 1)
+                np.testing.assert_array_equal(projector.project(0, shape[0]), 0)
+
     def test_encoded_raw_packed_metadata_and_owned_threaded_payloads(self):
         for base in ('transverse', 'sagittal', 'coronal'):
             source, initial = case(base, processing=(3, 2))

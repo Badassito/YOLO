@@ -2785,6 +2785,9 @@ def _prediction_accumulation_target(
                 f'prediction result {int(spec.result_index)} maps outside task union '
                 f'{tuple(int(v) for v in view_union_mm.shape)}'
             )
+        claim = getattr(view_union_mm, 'claim_result', None)
+        if callable(claim):
+            claim(target_index)
         return (
             view_union_mm,
             view_confmap_mm,
@@ -3996,6 +3999,7 @@ def predict_source_and_accumulate(
                 # written by the task-end flush, and this cleanup was gated to scan-only work anyway.
                 if (
                     stream_cleanup
+                    and not (require_device_union and count_stats)
                     and not bool(getattr(masks_obj, 'cleanup_done_on_gpu', False))
                     and not bool(getattr(masks_obj, 'accumulated_on_device', False))
                 ):

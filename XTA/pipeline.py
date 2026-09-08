@@ -37,6 +37,7 @@ from typing import (
 )
 import numpy as np
 from ._deps import _numba, cv2
+from .cylindrical_owner import RADIAL_OWNER_CONTRACT, radial_owner_eligible, radial_runtime_provenance
 
 # Explicit lower-layer dependencies keep imports one-way.
 from .config import (
@@ -4470,6 +4471,13 @@ def _main_impl() -> None:
             'retina_processor': str(retina_processor),
             'fast_bundle_active': bool(v1613_bundle_active),
             'd1_pipeline_active': bool(v1613_d1_owner_active),
+            'radial_owner_preflight': any(radial_owner_eligible(
+                view, d1_active=v1613_d1_owner_active, cpu_workers=cpu_worker_process_active,
+                kind='fullframe', interpolation=args.interpolation_distance, tiled=dense_tiling_active,
+                angle_count=len(angles), min_conf=args.min_conf, min_radius=args.min_radius,
+                batch=args.gpu_batch, gray=channel_format.kind == 'gray' and channel_format.channel_count == 1,
+                retain_native=bool(keep_temp_artifacts or save_images_enabled or save_labels_enabled or save_binary_enabled),
+            ) for view in views),
             'cv2_threads': max(1, _env_int('YOLO_TTA_GPU_WORKER_CV2_THREADS', 1)),
             # angle-variant GPU fast-path (min_conf None when inactive) + min_radius.
             'angle_variant_gpu_fastpath_min_conf': angle_variant_gpu_fastpath_min_conf_value,
@@ -4823,7 +4831,18 @@ def _main_impl() -> None:
                     and gpu_eligible
                     and not azimuthal_parent_requires_seam_union
                 )
-                if hybrid_deferred:
+                radial_owner = radial_owner_eligible(
+                    view, d1_active=v1613_d1_owner_active, cpu_workers=cpu_worker_process_active,
+                    kind=kind, interpolation=args.interpolation_distance,
+                    tiled=bool(dense_tiling_active), angle_count=len(angles),
+                    min_conf=args.min_conf, min_radius=args.min_radius, batch=args.gpu_batch,
+                    gray=channel_format.kind == 'gray' and channel_format.channel_count == 1,
+                    retain_native=bool(keep_temp_artifacts or save_images_enabled or save_labels_enabled or save_binary_enabled),
+                )
+                if radial_owner:
+                    rmask = rconf = None
+                    result_mode = 'd1_owner'
+                elif hybrid_deferred:
                     # First claim resolves the whole view: OpenVINO -> shared direct union;
                     # CUDA -> D1. This prevents mere CPU eligibility from disabling D1 for
                     # every Cartesian/Tilted view before either backend performs work.
@@ -4894,6 +4913,7 @@ def _main_impl() -> None:
                     'result_mask_path': (str(rmask) if rmask is not None else None),
                     'result_conf_path': (str(rconf) if rconf is not None else None),
                     'result_mode': str(result_mode), 'union_num_slices': int(n_slices),
+                    'projection_contract': RADIAL_OWNER_CONTRACT if radial_owner else None,
                     'prediction_batch': max(1, int(args.gpu_batch)),
                     'azimuthal_padding_dir': str(gpu_worker_result_dir / 'azimuthal_batch_padding'),
                     'hybrid_cpu_eligible_origin': bool(hybrid_deferred),
@@ -4954,6 +4974,13 @@ def _main_impl() -> None:
                     )
                 next_task_id += 1
         scheduler_state.gpu_worker_total_tasks = int(next_task_id)
+        print('Execution provenance: ' + json.dumps(radial_runtime_provenance(), sort_keys=True), flush=True)
+        radial_owner_tasks = [task for task in gpu_worker_tasks_by_id.values()
+                              if task.get('projection_contract') == RADIAL_OWNER_CONTRACT]
+        if radial_owner_tasks:
+            print(f'Native Radial owner routing: views={len({(task["model_name"], task["view"].name) for task in radial_owner_tasks})}, '
+                  f'frames={sum(int(task["slice_count"]) for task in radial_owner_tasks)}, '
+                  f'contract={RADIAL_OWNER_CONTRACT}; per-radius native cleanup and source bitset projection in inference workers.', flush=True)
         scheduler_state.gpu_worker_seed_task_count = int(next_task_id)
         scheduler_state.gpu_worker_next_dynamic_task_id = int(next_task_id)
         # A full-frame view is finalized only after every (angle x slice-chunk) result for it has been
@@ -5369,7 +5396,7 @@ def _main_impl() -> None:
                 d1_layer_ref_by_parent[meta_key] = layer_ref
                 nrrd_layer_refs.append(layer_ref)
                 sink = nrrd_layer_sink()
-                if sink is not None:
+                if sink is not None and not bool(stats.get('radial_owner_empty', False)):
                     sink.submit_layer(
                         layer_ref,
                         nrrd_layer_output_suffix(
@@ -5629,6 +5656,7 @@ def _main_impl() -> None:
             str(hybrid_view_mode_by_parent[parent]) for parent in hybrid_parents
         )
         print('\n=== Process-local inference queue drained; scheduler postprocessing continues ===')
+        print('Execution provenance at inference drain: ' + json.dumps(radial_runtime_provenance(), sort_keys=True), flush=True)
         drained_backend_notes: List[str] = []
         if gpu_worker_process_active:
             drained_backend_notes.append(

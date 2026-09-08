@@ -51,9 +51,12 @@ def _sample_blocks(indices, maximum):
 
 
 def _stage_stats(projector):
-    names = ('source_bytes', 'geometry_bytes', 'output_buffer_bytes', 'required_device_bytes',
+    names = ('source_bytes', 'source_layout', 'source_h2d_bytes', 'geometry_bytes', 'output_buffer_bytes', 'required_device_bytes',
              'reserve_bytes', 'device_index', 'max_block_depth', 'source_upload_seconds',
-             'geometry_upload_seconds', 'preflight_seconds')
+             'source_pack_seconds', 'source_pack_backend', 'contract_validation_seconds',
+             'module_setup_seconds', 'buffer_setup_seconds', 'constructor_seconds',
+             'geometry_upload_seconds', 'preflight_seconds', 'cuda_graph_setup_seconds',
+             'cuda_graph_enabled', 'cuda_graph_note')
     result = {name: getattr(projector, name, None) for name in names}
     result['max_owned_host_output_bytes'] = 2 * int(projector.max_block_depth) * OUTPUT_SHAPE[1] * OUTPUT_SHAPE[2]
     return result
@@ -63,6 +66,7 @@ def _stage_stats(projector):
 def _measure_uploads(projector_type, source_shape, measurements):
     """Time the actual synchronized upload method without replacing its work."""
     original = projector_type._upload_array
+    original_cropped = projector_type._upload_cropped_source
     measurements.update(observed_source_upload_seconds=0.0, observed_geometry_upload_seconds=0.0,
         source_upload_scope='Destination allocation, host byte normalization/staging and synchronized H2D; excludes module compilation and kernel/D2H preflight')
     def timed(projector, host):
@@ -73,7 +77,14 @@ def _measure_uploads(projector_type, source_shape, measurements):
             key = ('observed_source_upload_seconds' if tuple(host.shape) == tuple(source_shape)
                    else 'observed_geometry_upload_seconds')
             measurements[key] += time.perf_counter() - started
-    with mock.patch.object(projector_type, '_upload_array', timed):
+    def timed_cropped(projector, source):
+        started = time.perf_counter()
+        try:
+            return original_cropped(projector, source)
+        finally:
+            measurements['observed_source_upload_seconds'] += time.perf_counter() - started
+    with mock.patch.object(projector_type, '_upload_array', timed), \
+            mock.patch.object(projector_type, '_upload_cropped_source', timed_cropped):
         yield
 
 
