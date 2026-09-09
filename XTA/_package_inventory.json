@@ -10397,5 +10397,192 @@
     "complete_modules": [
       "spherical_projection_bounds"
     ]
+  },
+  "v21_0_3_review": {
+    "release": "21.0.3",
+    "previous_review_sha256": "f33ab49e331d8d175194c8d70919e7e398a399f39e1503c891b969c260d60a35",
+    "source_git_commit": "74c4fbab7f2ff1f874dfce10e43fbc7c04efa7db",
+    "definitions": [
+      {
+        "module": "backprojection",
+        "name": "_MainProcessGpuStageCoordinator",
+        "previous_sha256": "1dd87c3b64b0fa82b0eb70bf9602e69fe03a8908f2f1dbe9e51235a53680c0fe",
+        "sha256": "af7bf0811ceb304def0bc83adcfa585db9d496526291aa91226c248bb65ebf0e",
+        "reason": "Rotate pressure-retirement GPU selection after completed turns and expose reservation state, preserving exclusive ownership, terminal fences, and the existing inference-admission policy."
+      },
+      {
+        "module": "inference",
+        "name": "_announce_direct_compaction_layout",
+        "previous_sha256": null,
+        "sha256": "1e909b9e4f7883be9a6a41e029878b45d9e50e6cbf054fd2a7ec86ab889197f1",
+        "reason": "Log bounded per-process head/proto layout and eligibility decisions without reading GPU tensor contents or changing the scalar/tiled selection conditions."
+      },
+      {
+        "module": "inference",
+        "name": "_build_direct_device_compacted_payload",
+        "previous_sha256": "0e1a22fbea424f4b34a93302dc90057f5600b627093a157cf2867ba3effbdd15",
+        "sha256": "5f4299c8d648ab7a568d56fd1ef372e2e6f5e79994589c26d419c794f094cccc",
+        "reason": "Log bounded per-process head/proto layout and eligibility decisions without reading GPU tensor contents or changing the scalar/tiled selection conditions."
+      },
+      {
+        "module": "pipeline",
+        "name": "_main_impl",
+        "previous_sha256": "8c1b0a2e406b6b4bdffb6a30ca4837f35f8bd8090214b630a68f5dbb342e51f8",
+        "sha256": "7bc946e55a60f7f1a426cc86aee3e854554ce6ef8d0310698c51f4ea859b0c5a",
+        "reason": "Expose pressure-retirement reservation and backlog fields in scheduler waits so deliberate GPU draining can be distinguished from an idle unassigned device."
+      },
+      {
+        "module": "spherical_preflight",
+        "name": "_edge_points",
+        "previous_sha256": null,
+        "sha256": "2ee48b1e2c425833b5ca28c10b5c3ed043ee57fc37e4f3855b0a68eed0624f87",
+        "reason": "Bound production CPU reference checks to deterministic windows covering image/ROI edges, foreground bounds, and interior points; retain full small-plane/explicit qualification and reject mismatches."
+      },
+      {
+        "module": "spherical_preflight",
+        "name": "_grid",
+        "previous_sha256": null,
+        "sha256": "7bece2d10b90eccbe5da3bfda0be1990b1e57654c6eb5ecc79c39e7073b25d72",
+        "reason": "Bound production CPU reference checks to deterministic windows covering image/ROI edges, foreground bounds, and interior points; retain full small-plane/explicit qualification and reject mismatches."
+      },
+      {
+        "module": "spherical_preflight",
+        "name": "spherical_preflight_windows",
+        "previous_sha256": null,
+        "sha256": "fd259a8aea00f1dd4073f6662d848c7cfe21ca1feef1b2d0a05c27c937de5009",
+        "reason": "Bound production CPU reference checks to deterministic windows covering image/ROI edges, foreground bounds, and interior points; retain full small-plane/explicit qualification and reject mismatches."
+      },
+      {
+        "module": "spherical_preflight",
+        "name": "validate_spherical_preflight_plane",
+        "previous_sha256": null,
+        "sha256": "44141534b7555f14fd1e8b967f5eae9542974e5c36f2d345a77b93506c41abba",
+        "reason": "Bound production CPU reference checks to deterministic windows covering image/ROI edges, foreground bounds, and interior points; retain full small-plane/explicit qualification and reject mismatches."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "backproject_spherical_volume_to_volume",
+        "previous_sha256": "050296baa9d00598216824cc26feddc05359c186c5c09f3947c755dc1a33649c",
+        "sha256": "b8978fedb0a1ac10a152f65a127131b366ce312a11d791d9f12257bef7efb670",
+        "reason": "Report bounded preflight mode and checked-pixel counts alongside existing constructor and projection timings."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "name": "SphericalCudaProjector",
+        "previous_sha256": "5e0f88882cb7994f20aa09bad2b24f97be43ad0542eb64f3fdaac243e82b86f6",
+        "sha256": "e742a497e7b7d4c75cdff96b1878e7ab836ecb376358fd20a241e937459edcdb",
+        "reason": "Use the bounded CPU math preflight for large planes while retaining GPU plane execution, full raw/packed codec checks, exact small-plane checks, and fatal CUDA cleanup ownership."
+      }
+    ],
+    "statements": [
+      {
+        "module": "__init__",
+        "label": "Assign:7",
+        "previous_sha256": "a40ac77dec7b1d0599ff9f0e01c0b05317adaac921b866711260f165e8ed6a20",
+        "sha256": "c441a56933819fc5a6f31bf8b8685f593fee45095a6d544bc657de25465b13a4",
+        "reason": "Promote the runtime identity to release 21.0.3 without changing historical release records."
+      },
+      {
+        "module": "cli",
+        "label": "Assign:13",
+        "previous_sha256": "0c8f3802eb62127168c0daa98ace9e62637b7f03e28018aa537b7752cf28d07c",
+        "sha256": "d95d6728f6265a4bd725229af48429162bee5cb2558f6e05a8f6c03de2fb7811",
+        "reason": "Align current dispatcher version and launcher identity with release 21.0.3."
+      },
+      {
+        "module": "cli",
+        "label": "Assign:14",
+        "previous_sha256": "200bb7ce8b4df68f06a8c7f08e4b2f5f57cf341eeaa4aa1703932615950dd476",
+        "sha256": "d2d303497acf02c1e86e3eda5c5fe686f9c4e3c245e955be51634cf343704976",
+        "reason": "Align current dispatcher version and launcher identity with release 21.0.3."
+      },
+      {
+        "module": "config",
+        "label": "Assign:22",
+        "previous_sha256": "0c8f3802eb62127168c0daa98ace9e62637b7f03e28018aa537b7752cf28d07c",
+        "sha256": "d95d6728f6265a4bd725229af48429162bee5cb2558f6e05a8f6c03de2fb7811",
+        "reason": "Align current pipeline version and compact launcher identity with release 21.0.3."
+      },
+      {
+        "module": "config",
+        "label": "Assign:24",
+        "previous_sha256": "44dc59363a245d310f82050db238323c8c30c5ad92e65d88a1684d4cf2d54706",
+        "sha256": "6b0aa2563588ef8edb57d3b1d711ab5d6d623c48d4203ac790d02767afd4d061",
+        "reason": "Align current pipeline version and compact launcher identity with release 21.0.3."
+      },
+      {
+        "module": "inference",
+        "label": "binding__DIRECT_COMPACTION_LAYOUTS",
+        "previous_sha256": null,
+        "sha256": "22f76ed907ead412827d2ab521e369c9fc9783a4934c26313305e3b8a0c4cc94",
+        "reason": "Log bounded per-process head/proto layout and eligibility decisions without reading GPU tensor contents or changing the scalar/tiled selection conditions."
+      },
+      {
+        "module": "inference",
+        "label": "binding__DIRECT_COMPACTION_LAYOUT_LOCK",
+        "previous_sha256": null,
+        "sha256": "8f2595b6f7b55bf170c7f823fd45cdf924ba351b66186fd68b8d77b23d7cf16b",
+        "reason": "Log bounded per-process head/proto layout and eligibility decisions without reading GPU tensor contents or changing the scalar/tiled selection conditions."
+      },
+      {
+        "module": "spherical_preflight",
+        "label": "binding__FULL_PLANE_PIXELS",
+        "previous_sha256": null,
+        "sha256": "d1412c5203e3e8da94f4c30da1fb77ee1701c926f8d6a7098a030b73965f13c3",
+        "reason": "Bound production CPU reference checks to deterministic windows covering image/ROI edges, foreground bounds, and interior points; retain full small-plane/explicit qualification and reject mismatches."
+      },
+      {
+        "module": "spherical_preflight",
+        "label": "binding__PROBE_PIXELS",
+        "previous_sha256": null,
+        "sha256": "f35065ab91ba7cecf61acde310791f9a967348d90473f6bf9a60b56f2ed40b41",
+        "reason": "Bound production CPU reference checks to deterministic windows covering image/ROI edges, foreground bounds, and interior points; retain full small-plane/explicit qualification and reject mismatches."
+      },
+      {
+        "module": "spherical_preflight",
+        "label": "binding__WINDOW_PIXELS",
+        "previous_sha256": null,
+        "sha256": "706b195adab1d7d331264aca5c82046dc357b3622475e90e398a167acb2f519b",
+        "reason": "Bound production CPU reference checks to deterministic windows covering image/ROI edges, foreground bounds, and interior points; retain full small-plane/explicit qualification and reject mismatches."
+      },
+      {
+        "module": "spherical_preflight",
+        "label": "import___future__",
+        "previous_sha256": null,
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Bound production CPU reference checks to deterministic windows covering image/ROI edges, foreground bounds, and interior points; retain full small-plane/explicit qualification and reject mismatches."
+      },
+      {
+        "module": "spherical_preflight",
+        "label": "import_numpy",
+        "previous_sha256": null,
+        "sha256": "271fc31378e1108a9784c29c3c4768de571ce080301b4ad9721ba767fcf5842b",
+        "reason": "Bound production CPU reference checks to deterministic windows covering image/ROI edges, foreground bounds, and interior points; retain full small-plane/explicit qualification and reject mismatches."
+      },
+      {
+        "module": "spherical_preflight",
+        "label": "module_docstring",
+        "previous_sha256": null,
+        "sha256": "033e8182e5552e6b9ed6c031fa1a0c3bd20e0a1925783bdb9aff7382fddc5ac6",
+        "reason": "Bound production CPU reference checks to deterministic windows covering image/ROI edges, foreground bounds, and interior points; retain full small-plane/explicit qualification and reject mismatches."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "label": "import_.spherical_preflight",
+        "previous_sha256": null,
+        "sha256": "ccb170dcc393e19ef0054183e2daeacc245699639c1cb731f086951c8b7565db",
+        "reason": "Use the bounded CPU math preflight for large planes while retaining GPU plane execution, full raw/packed codec checks, exact small-plane checks, and fatal CUDA cleanup ownership."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "label": "import_os",
+        "previous_sha256": null,
+        "sha256": "ac3a74d6dd975a8e8fe4b7f85fce794793a9355595b850e3926964913948d386",
+        "reason": "Use the bounded CPU math preflight for large planes while retaining GPU plane execution, full raw/packed codec checks, exact small-plane checks, and fatal CUDA cleanup ownership."
+      }
+    ],
+    "complete_modules": [
+      "spherical_preflight"
+    ]
   }
 }

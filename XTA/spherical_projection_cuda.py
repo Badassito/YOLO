@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import operator
+import os
 import threading
 import time
 
@@ -15,6 +16,7 @@ import numpy as np
 
 from .qsc import QSC_FACE_BASES
 from .spherical_projection_bounds import spherical_output_bounds
+from .spherical_preflight import validate_spherical_preflight_plane
 
 from .cylindrical_cuda_projection import (
     RadialCudaProjector, RadialEncodedBlock, RadialEncodedSlice, RadialCudaProjectionUnsafeFailure,
@@ -132,7 +134,7 @@ class SphericalCudaProjector:
 
     def __init__(self, source, view, output_shape, bboxes=None, device_index=0, *,
                  block_bytes=_BLOCK_BYTES, upload_bytes=_UPLOAD_BYTES, reserve_bytes=_RESERVE_BYTES):
-        from .spherical_projection import _validate_spherical_projection, _project_spherical_block
+        from .spherical_projection import _validate_spherical_projection, _pull_spherical_chunk
 
         started = time.perf_counter()
         source = np.asarray(source)
@@ -185,6 +187,8 @@ class SphericalCudaProjector:
         self._closed = self._failed = False
         self._skip_empty_blocks = False
         self.source_upload_seconds = self.source_pack_seconds = self.geometry_upload_seconds = self.preflight_seconds = 0.0
+        self.preflight_mode = 'not_started'
+        self.preflight_pixels = 0
         self.source_pack_backend = 'dense_copy'
         self._reset_projection_stats()
         self.roi_projection_voxels = self.roi_skipped_blocks = 0
@@ -240,14 +244,29 @@ class SphericalCudaProjector:
                     point_z = (view.full_t - 1) / 2 + (radii[0] + radii[-1]) / 2 * normal_world[2]
                     face_z = int(np.clip(np.rint((point_z + .5) * shape[0] / view.full_t - .5), 0, shape[0] - 1))
                     self.preflight_planes = tuple(dict.fromkeys((shape[0] // 2, face_z)))
+                    full_math_preflight = os.environ.get('YOLO_TTA_SPHERICAL_FULL_MATH_PREFLIGHT', '0').strip().lower() in (
+                        '1', 'true', 'yes', 'on',
+                    )
                     for checked_z in self.preflight_planes:
                         checked = self._run_block(checked_z, 1)
-                        expected = _project_spherical_block(source, view, radii, rotation, shape, checked_z, 1,
-                                                            boxes if self.use_bboxes else None)
-                        if not np.array_equal(checked, expected):
-                            differences = int(np.count_nonzero(checked != expected))
-                            raise SphericalCudaProjectionUnavailable(
-                                f'Spherical CUDA preflight differs from CPU at {differences} voxels on source Z={checked_z}')
+                        foreground_bounds = None
+                        if not full_math_preflight and plane_bytes > 64 * 1024:
+                            # The existing GPU metadata reduction supplies crop edges
+                            # without a full CPU scan of this production-sized plane.
+                            self._enqueue_crop_metadata(1, record=False)
+                            self._stream.synchronize()
+                            foreground = self._metadata_stage[0]
+                            if int(foreground['foreground']) > 0:
+                                foreground_bounds = tuple(int(foreground[key]) for key in ('y0', 'y1', 'x0', 'x1'))
+                        mode, pixels = validate_spherical_preflight_plane(
+                            checked[0],
+                            lambda first, stop: _pull_spherical_chunk(
+                                source, view, radii, rotation, shape, checked_z, first, stop,
+                                boxes if self.use_bboxes else None),
+                            self.output_bounds, foreground_bounds, z=checked_z, full=full_math_preflight,
+                        )
+                        self.preflight_mode = mode
+                        self.preflight_pixels += pixels
                     for packed in (False, True):
                         self._validate_encoded_preflight(checked, self._encode_current_output(checked_z, 1, packed))
                     self.preflight_seconds = time.perf_counter() - then

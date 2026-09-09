@@ -501,6 +501,7 @@ class _MainProcessGpuStageCoordinator:
         self._spherical_retirement_pressure = False
         self._spherical_retirement_requests: Dict[str, float] = {}
         self._spherical_retirement_device: Optional[int] = None
+        self._spherical_retirement_cursor = 0
         self._spherical_retirement_retry_after = 0.0
         self._wake_callback: Optional[Callable[[], None]] = None
 
@@ -513,6 +514,7 @@ class _MainProcessGpuStageCoordinator:
             self._spherical_retirement_pressure = False
             self._spherical_retirement_requests.clear()
             self._spherical_retirement_device = None
+            self._spherical_retirement_cursor = 0
             self._spherical_retirement_retry_after = 0.0
             self._inference_asset_retirement_pending = False
             self._inference_priority_active = bool(
@@ -583,8 +585,13 @@ class _MainProcessGpuStageCoordinator:
                 return
             self._spherical_retirement_requests[str(purpose)] = time.monotonic() + 30.0
             if prior not in devices:
+                order = sorted(self._worker_devices)
+                ranks = {device: (index - self._spherical_retirement_cursor) % len(order)
+                         for index, device in enumerate(order)}
                 self._spherical_retirement_device = min(
-                    devices, key=lambda device: (self._inference_inflight.get(device, 0), device))
+                    devices, key=lambda device: (self._inference_inflight.get(device, 0), ranks[device]))
+                self._spherical_retirement_cursor = (
+                    order.index(self._spherical_retirement_device) + 1) % len(order)
             callback = self._wake_callback if prior != self._spherical_retirement_device else None
         if callback is not None:
             try:
@@ -688,6 +695,7 @@ class _MainProcessGpuStageCoordinator:
             self._spherical_retirement_requests.clear()
             self._spherical_retirement_device = None
             self._spherical_retirement_retry_after = 0.0
+            self._spherical_retirement_cursor = 0
             self._wake_callback = None
 
     def can_dispatch_inference(self, device_index: int) -> bool:
@@ -840,6 +848,7 @@ class _MainProcessGpuStageCoordinator:
                 'pending_inference_backlog': bool(self._pending_inference_backlog),
                 'spherical_retirement_pressure': bool(self._spherical_retirement_pressure),
                 'spherical_retirement_reserved_device': self._reserved_spherical_device_locked(),
+                'spherical_retirement_request_count': len(self._spherical_retirement_requests),
             }
 
 _MAIN_PROCESS_GPU_STAGE_COORDINATOR = _MainProcessGpuStageCoordinator()

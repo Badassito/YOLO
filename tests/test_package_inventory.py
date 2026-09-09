@@ -31,6 +31,48 @@ def inspect_seams(source: str):
 
 
 class PackageInventoryTests(unittest.TestCase):
+    def test_third_patch_cannot_skip_the_latest_coordinator_revision(self) -> None:
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        prior = inventory.reviewed_v21_contract(manifest)
+        first = inventory.reviewed_v21_patch_contract(manifest, prior)
+        second = inventory.reviewed_v21_0_2_contract(manifest, prior, first)
+        third = inventory.reviewed_v21_0_3_contract(manifest, prior, first, second)
+        self.assertEqual(third['previous_review_sha256'], inventory.REVIEWED_V21_0_2_SHA256)
+        earlier = next(item for item in first['definitions']
+                       if item['name'] == '_MainProcessGpuStageCoordinator')
+        current = next(item for item in third['definitions']
+                       if item['name'] == '_MainProcessGpuStageCoordinator')
+        current['previous_sha256'] = earlier['sha256']
+        reauthenticated = hashlib.sha256(json.dumps(
+            third, sort_keys=True, separators=(',', ':'),
+        ).encode('utf-8')).hexdigest()
+        with mock.patch.object(inventory, 'REVIEWED_V21_0_3_SHA256', reauthenticated):
+            with self.assertRaisesRegex(RuntimeError, 'v21.0.3 supersession does not match its historical pin'):
+                inventory.reviewed_v21_0_3_contract(manifest, prior, first, second)
+
+    def test_third_patch_authenticates_preflight_and_layout_diagnostics(self) -> None:
+        for target in ('validate_spherical_preflight_plane', '_announce_direct_compaction_layout'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            record = next(item for item in manifest['v21_0_3_review']['definitions'] if item['name'] == target)
+            record['sha256'] = '0' * 64
+            with self.subTest(target=target), self.assertRaisesRegex(RuntimeError, 'v21.0.3 review digest mismatch'):
+                inventory.reviewed_v21_0_3_contract(
+                    manifest, manifest['v21_review'], manifest['v21_0_1_review'], manifest['v21_0_2_review'],
+                )
+
+    def test_third_patch_checks_the_runtime_preflight_pixel_budget(self) -> None:
+        original_digest = inventory.digest
+
+        def changed_budget(node):
+            targets = getattr(node, 'targets', ())
+            if any(getattr(target, 'id', None) == '_PROBE_PIXELS' for target in targets):
+                return '0' * 64
+            return original_digest(node)
+
+        with mock.patch.object(inventory, 'digest', side_effect=changed_budget):
+            with self.assertRaisesRegex(RuntimeError, 'reviewed statement changed or is missing: spherical_preflight.binding__PROBE_PIXELS'):
+                verify_inventory()
+
     def test_second_patch_cannot_skip_the_intermediate_release(self) -> None:
         manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
         prior = inventory.reviewed_v21_contract(manifest)
@@ -62,21 +104,22 @@ class PackageInventoryTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'reviewed definition changed or is missing:'):
                     verify_inventory()
 
-    def test_new_bounds_module_rejects_an_unreviewed_top_level_statement(self) -> None:
+    def test_new_complete_modules_reject_an_unreviewed_top_level_statement(self) -> None:
         original_parse = ast.parse
 
         def parse_with_extra_statement(source, filename='<unknown>', *args, **kwargs):
             tree = original_parse(source, filename, *args, **kwargs)
-            if str(filename).replace('\\', '/').endswith('/spherical_projection_bounds.py'):
+            if str(filename).replace('\\', '/').endswith(f'/{module}.py'):
                 tree.body.append(ast.Assign(
                     targets=[ast.Name(id='UNREVIEWED_POLICY', ctx=ast.Store())],
                     value=ast.Constant(value=True),
                 ))
             return tree
 
-        with mock.patch.object(inventory.ast, 'parse', side_effect=parse_with_extra_statement):
-            with self.assertRaisesRegex(RuntimeError, 'complete-module statement coverage differs: spherical_projection_bounds'):
-                verify_inventory()
+        for module in ('spherical_projection_bounds', 'spherical_preflight'):
+            with self.subTest(module=module), mock.patch.object(inventory.ast, 'parse', side_effect=parse_with_extra_statement):
+                with self.assertRaisesRegex(RuntimeError, f'complete-module statement coverage differs: {module}'):
+                    verify_inventory()
 
     def test_patch_review_keeps_the_prior_release_authenticated(self) -> None:
         manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))

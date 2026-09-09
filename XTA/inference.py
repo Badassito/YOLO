@@ -3497,6 +3497,41 @@ def _split_segmentation_backend_outputs(preds: object) -> Optional[Tuple[object,
 _DIRECT_DEVICE_COMPACTION_ANNOUNCED = False
 
 _DIRECT_DEVICE_COMPACTION_FALLBACK_WARNED = False
+_DIRECT_COMPACTION_LAYOUTS: set[Tuple[object, ...]] = set()
+_DIRECT_COMPACTION_LAYOUT_LOCK = threading.Lock()
+
+
+def _announce_direct_compaction_layout(torch_mod, head, proto, *, enabled, allow_tiled, kernel_name):
+    """Explain at most 64 distinct layout/policy decisions without reading device data."""
+    head_shape, proto_shape = tuple(map(int, head.shape)), tuple(map(int, proto.shape))
+    key = (head_shape, str(head.dtype), proto_shape, str(proto.dtype),
+           bool(enabled), bool(allow_tiled), str(kernel_name))
+    with _DIRECT_COMPACTION_LAYOUT_LOCK:
+        if key in _DIRECT_COMPACTION_LAYOUTS or len(_DIRECT_COMPACTION_LAYOUTS) >= 64:
+            return
+        _DIRECT_COMPACTION_LAYOUTS.add(key)
+    reasons = []
+    if not enabled:
+        reasons.append('tiled_option_disabled')
+    if not allow_tiled:
+        reasons.append('tiled_disabled_after_workspace_failure')
+    if head.dtype != torch_mod.float16:
+        reasons.append('head_dtype_not_float16')
+    if proto.dtype != torch_mod.float16:
+        reasons.append('proto_dtype_not_float16')
+    if proto_shape[-3] != 32:
+        reasons.append('prototype_channels_not_32')
+    if proto_shape[-2] <= 0 or proto_shape[-1] <= 0:
+        reasons.append('prototype_extent_not_positive')
+    if proto_shape[-1] % 2:
+        reasons.append('prototype_width_not_even')
+    if kernel_name == 'scalar_workspace_fallback':
+        reasons.append('tiled_workspace_allocation_failed')
+    print(f'Direct compaction layout [pid={os.getpid()}]: '
+          f'head_shape={head_shape}, head_dtype={head.dtype}, '
+          f'proto_shape={proto_shape}, proto_dtype={proto.dtype}, '
+          f'tiled_option={bool(enabled)}, selected={kernel_name}, '
+          f'reason={";".join(reasons) if reasons else "eligible"}', flush=True)
 
 def direct_device_compaction_enabled() -> bool:
     """Fuse the generic direct loop's confidence gate + proto union without host counts."""
@@ -3563,8 +3598,9 @@ def _build_direct_device_compacted_payload(
         cp_conf_proto = cp.asarray(conf_proto) if conf_proto is not None else None
         packed_refs = ()
         kernel_name = 'scalar'
+        tiled_enabled = _env_flag('YOLO_TTA_DIRECT_TILED_PROTO_UNION', True)
         use_tiled = bool(
-            allow_tiled and _env_flag('YOLO_TTA_DIRECT_TILED_PROTO_UNION', True)
+            allow_tiled and tiled_enabled
             and _tiled_f16_proto_union_applicable(torch, head, proto)
         )
         if use_tiled:
@@ -3584,6 +3620,11 @@ def _build_direct_device_compacted_payload(
                                                (compact_coeff, compact_boxes, compact_confs))
                 packed_refs = (compact_coeff, compact_boxes, compact_confs, cp_coeff, cp_boxes, cp_confs)
         if use_tiled:
+            kernel_name = 'tiled_f16'
+        _announce_direct_compaction_layout(
+            torch, head, proto, enabled=tiled_enabled, allow_tiled=allow_tiled, kernel_name=kernel_name,
+        )
+        if use_tiled:
             kernels.compact_f16_tiled(
                 ((anchors + 255) // 256,), (256,),
                 (cp_head, np.int32(anchors), np.float32(confidence_threshold), cp_indices, cp_count,
@@ -3597,7 +3638,6 @@ def _build_direct_device_compacted_payload(
                  np.int32(masks), np.int32(ph), np.int32(pw), cp_max_logit,
                  cp_conf_proto if cp_conf_proto is not None else np.uintp(0)), stream=external,
             )
-            kernel_name = 'tiled_f16'
         else:
             compact = kernels.compact_f16 if head.dtype == torch.float16 else kernels.compact_f32
             compact(

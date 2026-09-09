@@ -12,6 +12,47 @@ from XTA import inference
 
 
 class DirectTiledDispatchTests(unittest.TestCase):
+    def test_layout_diagnostic_names_precise_guards_once_and_retains_no_tensors(self):
+        torch_mod = SimpleNamespace(float16='float16')
+        cases = (
+            ('float16', 'float16', (32, 5, 66), True, True, 'tiled_f16', 'eligible'),
+            ('float32', 'float16', (32, 5, 66), True, True, 'scalar', 'head_dtype_not_float16'),
+            ('float16', 'float32', (32, 5, 66), True, True, 'scalar', 'proto_dtype_not_float16'),
+            ('float16', 'float16', (16, 5, 66), True, True, 'scalar', 'prototype_channels_not_32'),
+            ('float16', 'float16', (32, 5, 65), True, True, 'scalar', 'prototype_width_not_even'),
+            ('float16', 'float16', (32, 5, 66), False, True, 'scalar', 'tiled_option_disabled'),
+            ('float16', 'float16', (32, 5, 66), True, False, 'scalar', 'tiled_disabled_after_workspace_failure'),
+            ('float16', 'float16', (32, 5, 66), True, True, 'scalar_workspace_fallback', 'tiled_workspace_allocation_failed'),
+        )
+        with mock.patch.object(inference, '_DIRECT_COMPACTION_LAYOUTS', set()):
+            for hd, pd, shape, enabled, allowed, kernel, reason in cases:
+                output = io.StringIO()
+                head = SimpleNamespace(shape=(5 + shape[0], 257), dtype=hd)
+                proto = SimpleNamespace(shape=shape, dtype=pd)
+                with self.subTest(reason=reason), redirect_stdout(output):
+                    for _ in range(3):
+                        inference._announce_direct_compaction_layout(torch_mod, head, proto,
+                            enabled=enabled, allow_tiled=allowed, kernel_name=kernel)
+                lines = output.getvalue().splitlines()
+                self.assertEqual(len(lines), 1)
+                self.assertIn(f'head_shape={head.shape}, head_dtype={hd}', lines[0])
+                self.assertIn(f'proto_shape={shape}, proto_dtype={pd}', lines[0])
+                self.assertIn(f'tiled_option={enabled}, selected={kernel}, reason={reason}', lines[0])
+            self.assertEqual(len(inference._DIRECT_COMPACTION_LAYOUTS), len(cases))
+            self.assertTrue(all(isinstance(key[1], str) and isinstance(key[3], str)
+                                for key in inference._DIRECT_COMPACTION_LAYOUTS))
+
+    def test_layout_diagnostic_has_a_process_wide_bound(self):
+        output = io.StringIO()
+        with mock.patch.object(inference, '_DIRECT_COMPACTION_LAYOUTS', set()), redirect_stdout(output):
+            for anchors in range(1, 81):
+                inference._announce_direct_compaction_layout(SimpleNamespace(float16='float16'),
+                    SimpleNamespace(shape=(37, anchors), dtype='float16'),
+                    SimpleNamespace(shape=(32, 3, 4), dtype='float16'),
+                    enabled=True, allow_tiled=True, kernel_name='tiled_f16')
+            self.assertEqual(len(inference._DIRECT_COMPACTION_LAYOUTS), 64)
+        self.assertEqual(len(output.getvalue().splitlines()), 64)
+
     def test_layout_selection_owner_retention_and_bounded_allocation_fallback(self):
         import torch
         for dtype, channels, width, enabled, oom, expected in (

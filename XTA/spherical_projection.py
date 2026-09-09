@@ -423,12 +423,14 @@ def backproject_spherical_volume_to_volume(
         if stage is not None:
             for name in ('kernel_seconds', 'metadata_seconds', 'pack_seconds', 'd2h_seconds',
                          'metadata_d2h_bytes', 'payload_d2h_bytes', 'dense_d2h_bytes', 'source_h2d_bytes',
-                         'roi_projection_voxels', 'roi_skipped_blocks', 'constructor_seconds', 'preflight_seconds'):
+                         'roi_projection_voxels', 'roi_skipped_blocks', 'constructor_seconds', 'preflight_seconds',
+                         'preflight_mode', 'preflight_pixels'):
                 runtime_telemetry().gauge(f'projection.spherical.{name}', getattr(stage.projector, name, 0))
         metrics = '' if stage is None else ''.join(
             f', {name}={getattr(stage.projector, name, 0)}' for name in
             ('source_h2d_bytes', 'metadata_d2h_bytes', 'payload_d2h_bytes', 'dense_d2h_bytes',
              'roi_projection_voxels', 'roi_skipped_blocks', 'constructor_seconds', 'preflight_seconds',
+             'preflight_mode', 'preflight_pixels',
              'kernel_seconds', 'metadata_seconds', 'pack_seconds', 'd2h_seconds'))
         print(f'Spherical projection complete {spherical_view.name}: backend={backend}, '
               f'total_s={time.perf_counter() - started:.6f}, cpu_slices={cpu_slices}, '

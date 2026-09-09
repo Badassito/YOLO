@@ -75,7 +75,9 @@ class SphericalPressureTests(unittest.TestCase):
             self.assertTrue(self.coordinator.can_dispatch_inference(0))
         with mock.patch.object(bp.time, 'monotonic', return_value=21.):
             self.assertIsNone(self.request())
-            self.assertFalse(self.coordinator.can_dispatch_inference(0))
+            self.assertEqual(self.coordinator.snapshot()['spherical_retirement_reserved_device'], 1)
+            self.assertTrue(self.coordinator.can_dispatch_inference(0))
+            self.assertFalse(self.coordinator.can_dispatch_inference(1))
 
     def test_only_live_demand_reserves_and_terminal_retirement_wins(self):
         self.coordinator.set_spherical_retirement_pressure(True)
@@ -95,6 +97,27 @@ class SphericalPressureTests(unittest.TestCase):
         self.assertIsNone(self.coordinator.try_acquire_specific_stage(self.torch, 1, self.purpose + ' other'))
         self.assertEqual(self.coordinator.snapshot()['spherical_retirement_reserved_device'], 0)
         self.assertTrue(self.coordinator.can_dispatch_inference(1))
+
+    def test_equal_load_pressure_turns_rotate_over_all_zero_based_workers(self):
+        self.coordinator.set_spherical_retirement_pressure(True)
+        chosen = []
+        for _ in range(8):
+            self.assertIsNone(self.request())
+            chosen.append(self.coordinator.snapshot()['spherical_retirement_reserved_device'])
+            self.coordinator.cancel_spherical_retirement_request(self.purpose)
+        self.assertEqual(chosen, [0, 1, 2, 3, 0, 1, 2, 3])
+        self.coordinator.reset()
+        self.coordinator.configure_workers([0, 2])
+        self.coordinator.set_pending_inference_backlog(True)
+        self.coordinator.set_spherical_retirement_pressure(True)
+        for worker in (0, 2):
+            self.coordinator.begin_inference(worker)
+        chosen = []
+        for _ in range(4):
+            self.assertIsNone(self.request())
+            chosen.append(self.coordinator.snapshot()['spherical_retirement_reserved_device'])
+            self.coordinator.cancel_spherical_retirement_request(self.purpose)
+        self.assertEqual(chosen, [0, 2, 0, 2])
 
     def test_failed_driver_query_releases_reservation_and_cools_down(self):
         self.coordinator.set_spherical_retirement_pressure(True)

@@ -28,6 +28,7 @@ REVIEWED_V21_SHA256 = '47204e5024f23a6e8db72c215fd0dadf9e46a5bfa49aef50056add8ff
 # independently checked against this authenticated appendix.
 REVIEWED_V21_0_1_SHA256 = '63b96f6742d72dc7f79b9b7cd130eee93a6e9530249e40bf0c3f697c2389fc6a'
 REVIEWED_V21_0_2_SHA256 = 'f33ab49e331d8d175194c8d70919e7e398a399f39e1503c891b969c260d60a35'
+REVIEWED_V21_0_3_SHA256 = '9d09663dab895ff2c9da78175b5e5acbf6a6bd96adfcff66a441a2c97ea90eeb'
 
 # These definitions have reviewed, intentional implementation changes.
 INTENTIONALLY_CHANGED = {
@@ -1236,6 +1237,17 @@ def reviewed_v21_0_2_contract(
     )
 
 
+def reviewed_v21_0_3_contract(
+    manifest: dict[str, object], v21: dict[str, object],
+    first_patch: dict[str, object], second_patch: dict[str, object],
+) -> dict[str, object]:
+    return _reviewed_v21_patch_contract(
+        manifest, v21, key='v21_0_3_review', release='21.0.3',
+        expected_digest=REVIEWED_V21_0_3_SHA256, previous_digest=REVIEWED_V21_0_2_SHA256,
+        earlier_patches=(first_patch, second_patch),
+    )
+
+
 def main() -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     baseline_digest = hashlib.sha256(json.dumps(
@@ -1246,7 +1258,8 @@ def main() -> None:
     rename_replacements = azimuthal_rename_replacements(manifest)
     v21 = reviewed_v21_contract(manifest)
     patch = reviewed_v21_patch_contract(manifest, v21)
-    patches = (patch, reviewed_v21_0_2_contract(manifest, v21, patch))
+    second_patch = reviewed_v21_0_2_contract(manifest, v21, patch)
+    patches = (patch, second_patch, reviewed_v21_0_3_contract(manifest, v21, patch, second_patch))
     patch_definitions = {
         (item['module'], item['name']): item for review in patches for item in review['definitions']
     }

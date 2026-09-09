@@ -1,6 +1,6 @@
 # XTA architecture
 
-`GPT-6-Astra-Ultra_v21.0.2_SLURM.py` is the sole versioned launcher. It, the
+`GPT-6-Astra-Ultra_v21.0.3_SLURM.py` is the sole versioned launcher. It, the
 installed `xta` console script, and `python -m XTA` all dispatch
 through `XTA.cli.run()`.
 The implementation lives in the importable `XTA` package so spawned processes
@@ -203,6 +203,54 @@ The uncropped 4.5 GiB source-address qualification also passes dense/raw/packed
 checks after ROI pruning; all foreground lies beyond the 32-bit address boundary.
 These local GPU runs are functional checks. Cluster TensorRT timing and overall
 walltime improvements remain to be measured; the 142754 result is the baseline.
+
+### Spherical preflight and device-zero audit (v21.0.3)
+
+Job 142765 loaded the v21.0.2 package and completed in 1,502.0 seconds, only
+34.9 seconds faster than 142754. No off-by-one defect was reproduced in the
+Spherical compaction/projection or tilted-Radial boundary audit. All 120 Spherical
+trajectories accounted for 1,212 frames each, all 110 nonempty projections covered
+1,931 output slices, and all 50 Radial owners reported complete slice coverage.
+GPU zero appeared in the worker mapping, inference dispatch and owner lifecycle.
+
+In 20 of 21 logged samples where GPU zero had no inference while other workers
+did, it held a Spherical projection lease. GPU zero handled 60 of the 110
+projections; its constructors held the exclusive device for 580.76 seconds,
+including 545.74 seconds in preflight, versus 10.33 seconds of projection kernels.
+Across all devices, preflight elapsed time summed to 919.81 seconds and kernel
+time to 15.81 seconds. Cross-device sums overlap and are not pipeline walltime.
+The dominant avoidable cost was the CPU oracle evaluating whole production-sized
+probe planes while the GPU lease remained held.
+
+Runtime mathematical preflight now compares deterministic contiguous CPU-oracle
+windows on those same one or two GPU probe planes. Planes of at most 65,536 pixels
+remain exhaustive; larger planes compare at most 32,768 pixels each. Image edges,
+ROI edges and their immediate neighbors, foreground crop edges, and regular
+interior windows are included. This bounds the CPU mathematical check, not the
+resulting output. The full GPU-derived raw/packed codec check remains in place;
+any checked mismatch still fails admission and settles device resources.
+`YOLO_TTA_SPHERICAL_FULL_MATH_PREFLIGHT=1` restores the exhaustive runtime CPU
+oracle with its original bounded 128K chunks. Logs include the selected preflight
+mode and compared pixel count. Offline validation still compares full arrays,
+including production-sized 3064-by-3022 planes and large source addresses.
+
+Equal-load pressure reservations now rotate over the configured worker IDs,
+including zero and sparse ID sets, instead of repeatedly breaking ties toward
+zero. Already queued inference still drains before exclusive device ownership.
+Scheduler diagnostics show pressure, the reserved device, and pending requests,
+so a drained reservation can be distinguished from an unused worker.
+
+Every Spherical and Radial generic frame in 142765 used scalar GPU compaction;
+none selected the tiled FP16 specialization, and none reported a fallback failure.
+Requested FP16 execution does not establish the engine's output binding dtypes.
+The direct loop now reports actual head/prototype shape and dtype, the tiled
+option, selected kernel, and precise eligibility reasons once per distinct layout
+(bounded to 64 notices per process). This adds no casting or numerical changes.
+Validation covers actual corruption at all four GPU plane corners, complete
+3064-by-3022 output planes against the unchanged CPU oracle, both compact codecs,
+and uncropped addresses beyond 4 GiB. All 63 real-model NRRD masks and spatial
+headers match the v21.0.2 fixture exactly after the scheduling/preflight changes.
+Cluster timing of v21.0.3 remains unqualified until a new run is available.
 
 ## Cylindrical view family (v20)
 
@@ -1142,7 +1190,7 @@ one-versus-four-device scheduling and final bytes are covered by deterministic s
 representative H100 execution remains a hardware qualification step:
 
 ```bash
-python -u GPT-6-Astra-Ultra_v21.0.2_SLURM.py \
+python -u GPT-6-Astra-Ultra_v21.0.3_SLURM.py \
   --mode lta \
   --input <target-video> \
   --exemplar <aligned-image-yolo-directory> \
