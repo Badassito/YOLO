@@ -296,6 +296,7 @@ from .backprojection import (
     _set_main_process_gpu_inference_priority_active,
     _set_main_process_gpu_asset_retirement_pending,
     _set_main_process_gpu_pending_inference,
+    _set_main_process_gpu_spherical_retirement_pressure,
     _set_main_process_gpu_stage_wake_callback,
     fused_angle_variant_azimuthal_component_layer_enabled,
     main_process_gpu_stage_inference_priority_enabled,
@@ -4402,6 +4403,9 @@ def _main_impl() -> None:
             _sanitize_filesystem_token=_sanitize_filesystem_token,
             _set_main_process_gpu_pending_inference=(
             _set_main_process_gpu_pending_inference
+            ),
+            _set_main_process_gpu_spherical_retirement_pressure=(
+                _set_main_process_gpu_spherical_retirement_pressure
             ),
             _set_main_process_gpu_stage_wake_callback=(
                 _set_main_process_gpu_stage_wake_callback

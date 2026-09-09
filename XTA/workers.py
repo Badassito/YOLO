@@ -1507,6 +1507,10 @@ def run_prediction_volume_in_worker(
         # planes; a tile is cropped/warped/resized directly on device before inference.
         render_path = 'cpu'
         gpu_engine = _worker_gpu_render_engine()
+        spherical_cache_before = (
+            dict(getattr(gpu_engine, '_spherical_direction_cache_stats', {}))
+            if gpu_engine is not None and str(view.family) == 'spherical' else None
+        )
         if gpu_engine is not None:
             try:
                 resident_view_supported = bool(
@@ -1730,6 +1734,25 @@ def run_prediction_volume_in_worker(
             'slice_meta': stats.get('slice_meta'),
             'azimuthal_padding_processed': int(stats.get('azimuthal_padding_processed', 0)),
         }
+        if spherical_cache_before is not None:
+            spherical_cache_delta = {
+                name: value - spherical_cache_before.get(name, 0)
+                for name, value in getattr(gpu_engine, '_spherical_direction_cache_stats', {}).items()
+            }
+            public_stats['spherical_direction_cache'] = spherical_cache_delta
+            if spherical_cache_delta.get('cache_misses', 0) or spherical_cache_delta.get('cache_host_fallbacks', 0):
+                print(
+                    f"Spherical direction cache {view.name} task={task.get('task_id', '?')}: "
+                    f"misses={spherical_cache_delta.get('cache_misses', 0)}, "
+                    f"hits={spherical_cache_delta.get('cache_hits', 0)}, "
+                    f"evictions={spherical_cache_delta.get('cache_evictions', 0)}, "
+                    f"host_fallbacks={spherical_cache_delta.get('cache_host_fallbacks', 0)}, "
+                    f"build_s={spherical_cache_delta.get('host_build_seconds', 0.0):.6f}, "
+                    f"upload_s={spherical_cache_delta.get('upload_seconds', 0.0):.6f}, "
+                    f"h2d_copies={spherical_cache_delta.get('h2d_copies', 0)}, "
+                    f"h2d_MiB={spherical_cache_delta.get('h2d_bytes', 0) / (1024 ** 2):.3f}",
+                    flush=True,
+                )
         if int(public_stats['azimuthal_padding_processed']) > 0:
             padding_specs = azimuthal_batch_padding_frame_specs(
                 view,

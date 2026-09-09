@@ -14,9 +14,10 @@ import time
 import numpy as np
 
 from .qsc import QSC_FACE_BASES
+from .spherical_projection_bounds import spherical_output_bounds
 
 from .cylindrical_cuda_projection import (
-    RadialCudaProjector, RadialEncodedBlock, RadialCudaProjectionUnsafeFailure,
+    RadialCudaProjector, RadialEncodedBlock, RadialEncodedSlice, RadialCudaProjectionUnsafeFailure,
     _BLOCK_BYTES, _UPLOAD_BYTES, _RESERVE_BYTES, _SETUP_BYTES, _MAX_ENCODED_SLICES,
     _CROP_METADATA_DTYPE, _KERNEL_SOURCE as _CROP_KERNEL_BUNDLE,
 )
@@ -45,15 +46,16 @@ extern "C" __global__ void project_spherical_qsc(
     int nshells, int source_h, int source_w, int native_h, int native_w,
     int work_t, int work_h, int work_w, int out_t, int out_h, int out_w,
     int face, int intervals, int origin_u, int origin_v, int first_z,
+    int roi_x0, int roi_y0, int roi_z0, int roi_width, int roi_height,
     double minimum, double maximum, unsigned long long voxel_count,
     int use_boxes, int cropped) {
     unsigned long long q = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (q >= voxel_count) return;
-    out[q] = 0;
-    unsigned long long plane = (unsigned long long)out_h * out_w;
-    int z = first_z + (int)(q / plane);
+    unsigned long long plane = (unsigned long long)roi_height * roi_width;
+    int z = roi_z0 + (int)(q / plane);
     unsigned long long rem = q % plane;
-    int y = (int)(rem / out_w), x = (int)(rem % out_w);
+    int y = roi_y0 + (int)(rem / roi_width), x = roi_x0 + (int)(rem % roi_width);
+    unsigned long long output_at = ((unsigned long long)(z - first_z) * out_h + y) * out_w + x;
     double dx = (((x + .5) * work_w / out_w) - .5) - ((work_w - 1) / 2.0);
     double dy = (((y + .5) * work_h / out_h) - .5) - ((work_h - 1) / 2.0);
     double dz = (((z + .5) * work_t / out_t) - .5) - ((work_t - 1) / 2.0);
@@ -110,7 +112,7 @@ extern "C" __global__ void project_spherical_qsc(
     if (use_boxes && (pr < boxes[box] || pr >= boxes[box + 1] || pc < boxes[box + 2] || pc >= boxes[box + 3])) return;
     unsigned long long source_at = ((unsigned long long)shell * source_h + pr) * source_w + pc;
     if (cropped) source_at = offsets[shell] + (unsigned long long)(pr - boxes[box]) * (boxes[box + 3] - boxes[box + 2]) + (pc - boxes[box + 2]);
-    out[q] = source[source_at] != 0;
+    out[output_at] = source[source_at] != 0;
 }
 '''
 
@@ -150,6 +152,7 @@ class SphericalCudaProjector:
         arrays = {'radii': np.ascontiguousarray(radii), 'rotation': np.ascontiguousarray(rotation),
                   'bboxes': np.ascontiguousarray(boxes), 'source_offsets': offsets}
         self.contract = _SphericalContract(shape, tuple(source.shape), arrays, cropped)
+        self.output_bounds = spherical_output_bounds(view, shape, boxes if self.use_bboxes else None)
         budget = min(operator.index(block_bytes), _BLOCK_BYTES)
         plane_bytes = shape[1] * shape[2]
         if budget <= 0 or plane_bytes > budget or (shape[1] + 7) // 8 > 65535:
@@ -184,6 +187,7 @@ class SphericalCudaProjector:
         self.source_upload_seconds = self.source_pack_seconds = self.geometry_upload_seconds = self.preflight_seconds = 0.0
         self.source_pack_backend = 'dense_copy'
         self._reset_projection_stats()
+        self.roi_projection_voxels = self.roi_skipped_blocks = 0
         try:
             import cupy as cp
             self._cp = cp
@@ -249,6 +253,7 @@ class SphericalCudaProjector:
                     self.preflight_seconds = time.perf_counter() - then
                     self._skip_empty_blocks = True
                     self._reset_projection_stats()
+                    self.roi_projection_voxels = self.roi_skipped_blocks = 0
             self.constructor_seconds = time.perf_counter() - started
         except SphericalCudaProjectionUnsafeFailure:
             raise
@@ -274,14 +279,21 @@ class SphericalCudaProjector:
     def _launch_projection(self, first, count):
         c, a, v = self.contract, self._arrays, self.view
         voxels = count * c.output_shape[1] * c.output_shape[2]
+        z0, z1, y0, y1, x0, x1 = self.output_bounds.block(first, count)
+        roi_voxels = (z1 - z0) * (y1 - y0) * (x1 - x0)
         self._record('kernel', 'start')
-        self._kernel(((voxels + 255) // 256,), (256,), (
-            self._source_gpu, a['radii'], a['rotation'], a['bboxes'], a['source_offsets'], self._output_gpu,
-            *(np.int32(value) for value in (c.source_shape[0], c.source_shape[1], c.source_shape[2], v.src_h, v.src_w,
-                v.full_t, v.full_h, v.full_w, *c.output_shape, v.spherical_face, v.spherical_face_intervals,
-                v.spherical_u_origin, v.spherical_v_origin, first)),
-            np.float64(v.spherical_min_radius), np.float64(v.spherical_max_radius), np.uint64(voxels),
-            np.int32(self.use_bboxes), np.int32(c.cropped_source)), stream=self._stream)
+        # The public block remains full-sized; cheap zero fill preserves every
+        # outside-ROI byte while the expensive QSC pull touches only its bounds.
+        self._cp.cuda.runtime.memsetAsync(int(self._output_gpu.data.ptr), 0, voxels, int(self._stream.ptr))
+        if roi_voxels:
+            self._kernel(((roi_voxels + 255) // 256,), (256,), (
+                self._source_gpu, a['radii'], a['rotation'], a['bboxes'], a['source_offsets'], self._output_gpu,
+                *(np.int32(value) for value in (c.source_shape[0], c.source_shape[1], c.source_shape[2], v.src_h, v.src_w,
+                    v.full_t, v.full_h, v.full_w, *c.output_shape, v.spherical_face, v.spherical_face_intervals,
+                    v.spherical_u_origin, v.spherical_v_origin, first, x0, y0, z0, x1 - x0, y1 - y0)),
+                np.float64(v.spherical_min_radius), np.float64(v.spherical_max_radius), np.uint64(roi_voxels),
+                np.int32(self.use_bboxes), np.int32(c.cropped_source)), stream=self._stream)
+        self.roi_projection_voxels += roi_voxels
         self._record('kernel', 'end')
         return voxels
 
@@ -324,6 +336,16 @@ class SphericalCudaProjector:
                 payload = np.empty(0, np.uint8)
                 payload.flags.writeable = False
                 return RadialEncodedBlock(first, (), payload, bool(packed))
+            z0, z1, y0, y1, x0, x1 = self.output_bounds.block(first, count)
+            if self._skip_empty_blocks and (z0 == z1 or y0 == y1 or x0 == x1):
+                # Empty slabs are proven from geometry/metadata, so no device
+                # launch, dense zero fill, crop scan or PCIe handshake is needed.
+                payload = np.empty(0, np.uint8)
+                payload.flags.writeable = False
+                records = tuple(RadialEncodedSlice(z, 0, 0, 0, 0, 0, 0, 0)
+                                for z in range(first, first + count))
+                self.roi_skipped_blocks += 1
+                return RadialEncodedBlock(first, records, payload, bool(packed))
             try:
                 with self._cp.cuda.Device(self.device_index), self._cp.cuda.using_allocator(self._pool.malloc), self._stream:
                     self._launch_projection(first, count)

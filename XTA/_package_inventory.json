@@ -10091,5 +10091,311 @@
         "reason": "Bound quiet GPU-admission retries to eight additional published CPU slices."
       }
     ]
+  },
+  "v21_0_2_review": {
+    "release": "21.0.2",
+    "previous_review_sha256": "63b96f6742d72dc7f79b9b7cd130eee93a6e9530249e40bf0c3f697c2389fc6a",
+    "source_git_commit": "a42a6f333f20b2f12838e2b4bcf979bf1c7ba511",
+    "definitions": [
+      {
+        "module": "backprojection",
+        "name": "_MainProcessGpuStageCoordinator",
+        "previous_sha256": "c8052c7f9f31bd9215b9630afe3fb1b12c29cc94e69a67f00ddf19cb249b8f23",
+        "sha256": "1dd87c3b64b0fa82b0eb70bf9602e69fe03a8908f2f1dbe9e51235a53680c0fe",
+        "reason": "Permit one demanded Spherical retirement under retained-native-memory pressure, preserving exclusive GPU ownership, inference progress, terminal fences, and admission-failure backoff."
+      },
+      {
+        "module": "backprojection",
+        "name": "_cancel_main_process_spherical_retirement_request",
+        "previous_sha256": null,
+        "sha256": "a6a94e6dea56159bd87079872d3e32feaec2a579960f83e143b86cb61532a751",
+        "reason": "Permit one demanded Spherical retirement under retained-native-memory pressure, preserving exclusive GPU ownership, inference progress, terminal fences, and admission-failure backoff."
+      },
+      {
+        "module": "backprojection",
+        "name": "_set_main_process_gpu_spherical_retirement_pressure",
+        "previous_sha256": null,
+        "sha256": "87dbd24a468dedecf7f51bdaf1124db8713f47203ddde91b7b2582b89da4dfd6",
+        "reason": "Permit one demanded Spherical retirement under retained-native-memory pressure, preserving exclusive GPU ownership, inference progress, terminal fences, and admission-failure backoff."
+      },
+      {
+        "module": "inference",
+        "name": "GpuFlattenedRetinaPayload",
+        "previous_sha256": "eb47b0e332b0d925d428c7386ea395691d5d84515f01bf4b16e088ebabb6c8bf",
+        "sha256": "1008fc4e22851a05ab98b21d71c90bf986a29d3d63245d179b16540daf741948",
+        "reason": "Use bounded tiled FP16 direct proto union when eligible; preserve all accepted detections, scalar and allocation fallback, asynchronous owners, and per-task compaction diagnostics."
+      },
+      {
+        "module": "inference",
+        "name": "_build_direct_device_compacted_payload",
+        "previous_sha256": "01022e9cde7573fbd0883364c2aefde85cce82dffa0020cb4962cdb815f02324",
+        "sha256": "0e1a22fbea424f4b34a93302dc90057f5600b627093a157cf2867ba3effbdd15",
+        "reason": "Use bounded tiled FP16 direct proto union when eligible; preserve all accepted detections, scalar and allocation fallback, asynchronous owners, and per-task compaction diagnostics."
+      },
+      {
+        "module": "inference",
+        "name": "_direct_predict_stream",
+        "previous_sha256": "1ab2d45201bee40db76ca483939a7451b610b3f6bd5be1e76d5b82d47719f84e",
+        "sha256": "44c9396c3fcf04bc68b4daf1299306cbf70309b9475e05a6a2dc39a7f43cecb1",
+        "reason": "Use bounded tiled FP16 direct proto union when eligible; preserve all accepted detections, scalar and allocation fallback, asynchronous owners, and per-task compaction diagnostics."
+      },
+      {
+        "module": "pipeline",
+        "name": "_main_impl",
+        "previous_sha256": "da0b607476484cb15d1be1930d08b3f219e26b8f8a702d20658938e19057b683",
+        "sha256": "8c1b0a2e406b6b4bdffb6a30ca4837f35f8bd8090214b630a68f5dbb342e51f8",
+        "reason": "Connect the bounded native-union scheduler retirement-pressure signal to main-process GPU ownership coordination."
+      },
+      {
+        "module": "spherical_cuda",
+        "name": "_build_cached_directions",
+        "previous_sha256": null,
+        "sha256": "ea761c414e435e9fa94d4c70e9f36c64b43247b87cd6a43c83356cf52506c7d2",
+        "reason": "Batch exact64-row float64 QSC direction construction into one cache-budget-limited host entry and two uploads; retain strip fallback, LRU accounting, stream ownership, and diagnostic counters."
+      },
+      {
+        "module": "spherical_cuda",
+        "name": "_build_direction_block",
+        "previous_sha256": "b49370cbf362da2bec67b9cdc27491c0c75cbae722ee6eee89db629023fab73d",
+        "sha256": "e36921c0b0ccafdf8e36e334bb6d092fadd3aaabd2caefd72804e3cb88c939d6",
+        "reason": "Batch exact64-row float64 QSC direction construction into one cache-budget-limited host entry and two uploads; retain strip fallback, LRU accounting, stream ownership, and diagnostic counters."
+      },
+      {
+        "module": "spherical_cuda",
+        "name": "_build_host_direction_block",
+        "previous_sha256": null,
+        "sha256": "53ebf1e2f4fea2855809a028679892135612e156194a15a0130accfa64188079",
+        "reason": "Batch exact64-row float64 QSC direction construction into one cache-budget-limited host entry and two uploads; retain strip fallback, LRU accounting, stream ownership, and diagnostic counters."
+      },
+      {
+        "module": "spherical_cuda",
+        "name": "_direction_blocks",
+        "previous_sha256": "24248ae9793ce73a7af82f6b91c7078e5e29aa8af05d39c1d9554b876268a1a1",
+        "sha256": "0f2327857d71b60024116405228e03314372a6992633da62be0113efa3b195d8",
+        "reason": "Batch exact64-row float64 QSC direction construction into one cache-budget-limited host entry and two uploads; retain strip fallback, LRU accounting, stream ownership, and diagnostic counters."
+      },
+      {
+        "module": "spherical_cuda",
+        "name": "_direction_cache_stats",
+        "previous_sha256": null,
+        "sha256": "dc395c1af12bb140969d045d97df8a92f03e1dc07a47163c250daf341e195ca0",
+        "reason": "Batch exact64-row float64 QSC direction construction into one cache-budget-limited host entry and two uploads; retain strip fallback, LRU accounting, stream ownership, and diagnostic counters."
+      },
+      {
+        "module": "spherical_cuda",
+        "name": "_upload_direction_arrays",
+        "previous_sha256": null,
+        "sha256": "26012e4ce00cbc5389d63d14be8897cd5b0a0bd718956de6fbe370cf6cd75435",
+        "reason": "Batch exact64-row float64 QSC direction construction into one cache-budget-limited host entry and two uploads; retain strip fallback, LRU accounting, stream ownership, and diagnostic counters."
+      },
+      {
+        "module": "spherical_cuda",
+        "name": "spherical_direction_cache_stats",
+        "previous_sha256": null,
+        "sha256": "765cd02e4a47d85401da7c51f085b4f2cc980b7fd4690d464dbf0940c134c38e",
+        "reason": "Batch exact64-row float64 QSC direction construction into one cache-budget-limited host entry and two uploads; retain strip fallback, LRU accounting, stream ownership, and diagnostic counters."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "_try_spherical_cuda_stage",
+        "previous_sha256": "21feddd354306f7df76be218d99c9fb81874b7a3bdfe5a8e51bef14a870ce48d",
+        "sha256": "1f38e4ff4710dabe00cfc2cdcefc007fe1195254160831d8368f7f65bdb6d2f0",
+        "reason": "Restrict Spherical pull work to conservative source-space output bounds, preserve ordered exactly-once CPU/GPU continuation and cleanup, and report retirement setup/transfer timings."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "backproject_spherical_volume_to_volume",
+        "previous_sha256": "3513250f15b2b0797de628789b40b830f0940df3c1d963a5088e1fef2c8a058d",
+        "sha256": "050296baa9d00598216824cc26feddc05359c186c5c09f3947c755dc1a33649c",
+        "reason": "Restrict Spherical pull work to conservative source-space output bounds, preserve ordered exactly-once CPU/GPU continuation and cleanup, and report retirement setup/transfer timings."
+      },
+      {
+        "module": "spherical_projection_bounds",
+        "name": "SphericalOutputBounds",
+        "previous_sha256": null,
+        "sha256": "d1e5bcd2bfd5e2645809ffdae5b6924ed2d456131a112798b0eed8f39f41e5e3",
+        "reason": "Derive conservative closed-face and radius output bounds with outward float64 rounding and native/working-grid scaling; keep original QSC sampling and gray8 arithmetic unchanged."
+      },
+      {
+        "module": "spherical_projection_bounds",
+        "name": "_face_direction_bounds",
+        "previous_sha256": null,
+        "sha256": "a886dfcc9eab8d15428b764a7f1d94dd7b3a5c2a8df57214a142312601edd609",
+        "reason": "Derive conservative closed-face and radius output bounds with outward float64 rounding and native/working-grid scaling; keep original QSC sampling and gray8 arithmetic unchanged."
+      },
+      {
+        "module": "spherical_projection_bounds",
+        "name": "spherical_output_bounds",
+        "previous_sha256": null,
+        "sha256": "74a471e40b2927262ea40456c34170e697eea1a96cc34a748881d18af0f400fe",
+        "reason": "Derive conservative closed-face and radius output bounds with outward float64 rounding and native/working-grid scaling; keep original QSC sampling and gray8 arithmetic unchanged."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "name": "SphericalCudaProjector",
+        "previous_sha256": "227883e5e6d500a5ec234f5c8e94a6624d33a094f819615cffadc7292b245186",
+        "sha256": "5e0f88882cb7994f20aa09bad2b24f97be43ad0542eb64f3fdaac243e82b86f6",
+        "reason": "Skip CUDA output blocks only when conservative Spherical bounds prove them empty; preserve encoded payload contracts and expose setup, source-upload, and kernel timings."
+      },
+      {
+        "module": "tta_scheduler",
+        "name": "TtaScheduler",
+        "previous_sha256": "596f4ca180ab0586b60731ff0a6e04d7f3a905ddf6c6d5198d284d57a4f9110d",
+        "sha256": "12fbfb21b6671b140c3c2ff752949bef3fbb77b41718e9adfe296d7d4aa8aff8",
+        "reason": "Publish completed-parent retirement pressure from the existing native-memory ledger and clear it on inference shutdown without bypassing admission or queue accounting."
+      },
+      {
+        "module": "tta_scheduler",
+        "name": "TtaSchedulerOperations",
+        "previous_sha256": "0cb0bf2391878ffc922e57b27053d9fd288c8af35b39306620d61a0e31aa9f96",
+        "sha256": "6ebb834b083f9b335f0d3edd1283ff0a1e0353753001496922084c11530daf81",
+        "reason": "Publish completed-parent retirement pressure from the existing native-memory ledger and clear it on inference shutdown without bypassing admission or queue accounting."
+      },
+      {
+        "module": "workers",
+        "name": "run_prediction_volume_in_worker",
+        "previous_sha256": "ba1fd167a1290a2aff4cfca0ed4031737017ed617ecc90e7f9f123a4b1a1aa90",
+        "sha256": "63a0b88d4f6f1d03abd8f50f993be448c0191a52400e6e88b8d5008ba7072017",
+        "reason": "Expose per-task Spherical direction-cache deltas and print a compact summary only when cache misses or host-staging fallback occur."
+      }
+    ],
+    "statements": [
+      {
+        "module": "__init__",
+        "label": "Assign:7",
+        "previous_sha256": "6a742b02802340395260e500dbcb023d4c0fd5d0294e942b10e7d5415899428b",
+        "sha256": "a40ac77dec7b1d0599ff9f0e01c0b05317adaac921b866711260f165e8ed6a20",
+        "reason": "Promote the runtime identity to release21.0.2 while preserving historical release records."
+      },
+      {
+        "module": "cli",
+        "label": "Assign:13",
+        "previous_sha256": "f9527c686eb7f0c60b225ab4a65d393427038969588ae58bd5dbcf6bbc082c02",
+        "sha256": "0c8f3802eb62127168c0daa98ace9e62637b7f03e28018aa537b7752cf28d07c",
+        "reason": "Align current mode-dispatcher version and sole launcher identity with21.0.2."
+      },
+      {
+        "module": "cli",
+        "label": "Assign:14",
+        "previous_sha256": "21d1b283da4eb18f61218f62c0e831f969a828c3d25b2a0d7e11d8844fb4d638",
+        "sha256": "200bb7ce8b4df68f06a8c7f08e4b2f5f57cf341eeaa4aa1703932615950dd476",
+        "reason": "Align current mode-dispatcher version and sole launcher identity with21.0.2."
+      },
+      {
+        "module": "config",
+        "label": "Assign:22",
+        "previous_sha256": "f9527c686eb7f0c60b225ab4a65d393427038969588ae58bd5dbcf6bbc082c02",
+        "sha256": "0c8f3802eb62127168c0daa98ace9e62637b7f03e28018aa537b7752cf28d07c",
+        "reason": "Align current pipeline version, compact identity, and launcher binding with21.0.2."
+      },
+      {
+        "module": "config",
+        "label": "Assign:24",
+        "previous_sha256": "9fd1e0602d48b99dd061d3ce83e475c4fad778fe9515d073d067cb39c01d64b7",
+        "sha256": "44dc59363a245d310f82050db238323c8c30c5ad92e65d88a1684d4cf2d54706",
+        "reason": "Align current pipeline version, compact identity, and launcher binding with21.0.2."
+      },
+      {
+        "module": "pipeline",
+        "label": "import_.backprojection",
+        "previous_sha256": "03e2f0fb6467fbd3faa304c41cb2b016ee1d9f556fbfa16aa35e802a906a4f61",
+        "sha256": "a23474321866fc594ddfd02d18d75a9c729d2172a95a3e5c7833ed3e69946400",
+        "reason": "Connect the bounded native-union scheduler retirement-pressure signal to main-process GPU ownership coordination."
+      },
+      {
+        "module": "spherical_cuda",
+        "label": "import_time",
+        "previous_sha256": null,
+        "sha256": "ff05bad0fd9a7212d3cd85fd2726055168be21bc8f6e0d93b29965794b0675d4",
+        "reason": "Batch exact64-row float64 QSC direction construction into one cache-budget-limited host entry and two uploads; retain strip fallback, LRU accounting, stream ownership, and diagnostic counters."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "binding__CUDA_RECHECK_SECONDS",
+        "previous_sha256": null,
+        "sha256": "28fe914e5942bc94b40940115ceb06aaf45ef1863a4cd1e5968f3b5e5bc352db",
+        "reason": "Restrict Spherical pull work to conservative source-space output bounds, preserve ordered exactly-once CPU/GPU continuation and cleanup, and report retirement setup/transfer timings."
+      },
+      {
+        "module": "spherical_projection_bounds",
+        "label": "binding__ROUNDING_MARGIN",
+        "previous_sha256": null,
+        "sha256": "e6de7611957ff05e1c1c97b5e2b6c9d241b8ca73487b417c333e57dd41b9c4a9",
+        "reason": "Derive conservative closed-face and radius output bounds with outward float64 rounding and native/working-grid scaling; keep original QSC sampling and gray8 arithmetic unchanged."
+      },
+      {
+        "module": "spherical_projection_bounds",
+        "label": "import_.qsc",
+        "previous_sha256": null,
+        "sha256": "12feb3c055408ee18ae0ed23995b91cfdad0df504c2b23f5b3c4c20e6b417812",
+        "reason": "Derive conservative closed-face and radius output bounds with outward float64 rounding and native/working-grid scaling; keep original QSC sampling and gray8 arithmetic unchanged."
+      },
+      {
+        "module": "spherical_projection_bounds",
+        "label": "import___future__",
+        "previous_sha256": null,
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "reason": "Derive conservative closed-face and radius output bounds with outward float64 rounding and native/working-grid scaling; keep original QSC sampling and gray8 arithmetic unchanged."
+      },
+      {
+        "module": "spherical_projection_bounds",
+        "label": "import_dataclasses",
+        "previous_sha256": null,
+        "sha256": "321ed2ed3afceb74be547c9905ed4c676e453b1a68fe7cb2d3e214caeac2624d",
+        "reason": "Derive conservative closed-face and radius output bounds with outward float64 rounding and native/working-grid scaling; keep original QSC sampling and gray8 arithmetic unchanged."
+      },
+      {
+        "module": "spherical_projection_bounds",
+        "label": "import_itertools",
+        "previous_sha256": null,
+        "sha256": "40a563c3ea6bd814e811210fa0356dc0a8b27209e3f0a58728877f2eec0b1044",
+        "reason": "Derive conservative closed-face and radius output bounds with outward float64 rounding and native/working-grid scaling; keep original QSC sampling and gray8 arithmetic unchanged."
+      },
+      {
+        "module": "spherical_projection_bounds",
+        "label": "import_math",
+        "previous_sha256": null,
+        "sha256": "f329650e2c61a07a1bab85b32296a6d93760e313e108904819fa27d09cf3954d",
+        "reason": "Derive conservative closed-face and radius output bounds with outward float64 rounding and native/working-grid scaling; keep original QSC sampling and gray8 arithmetic unchanged."
+      },
+      {
+        "module": "spherical_projection_bounds",
+        "label": "import_numpy",
+        "previous_sha256": null,
+        "sha256": "271fc31378e1108a9784c29c3c4768de571ce080301b4ad9721ba767fcf5842b",
+        "reason": "Derive conservative closed-face and radius output bounds with outward float64 rounding and native/working-grid scaling; keep original QSC sampling and gray8 arithmetic unchanged."
+      },
+      {
+        "module": "spherical_projection_bounds",
+        "label": "module_docstring",
+        "previous_sha256": null,
+        "sha256": "ab993676759654a2aa173f571a0c646037e87090ebd7642fea3d330fece8b663",
+        "reason": "Derive conservative closed-face and radius output bounds with outward float64 rounding and native/working-grid scaling; keep original QSC sampling and gray8 arithmetic unchanged."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "label": "Assign:41",
+        "previous_sha256": "baedceadb82f8bd0b9ccdc6f30080e46e31eaffa21442e844bb0ac396c5c5b27",
+        "sha256": "89d2d235d3a93461b16186d10e84b5692d60b23efec7a514887017a6bfcb1c14",
+        "reason": "Skip CUDA output blocks only when conservative Spherical bounds prove them empty; preserve encoded payload contracts and expose setup, source-upload, and kernel timings."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "label": "ImportFrom:18",
+        "previous_sha256": "06d19ce80d11c361ba5abce6a586318fec07e47603b7091d1fc63bf50b5fecb9",
+        "sha256": "3a90c07dcd9a57fc53051eba1664bd54037bee65df1065a79b0af150f6bef8a4",
+        "reason": "Skip CUDA output blocks only when conservative Spherical bounds prove them empty; preserve encoded payload contracts and expose setup, source-upload, and kernel timings."
+      },
+      {
+        "module": "spherical_projection_cuda",
+        "label": "import_.spherical_projection_bounds",
+        "previous_sha256": null,
+        "sha256": "8baa4aa5ce50520c890687cb78aff03b08b33fec308853cdf1178f665db0240b",
+        "reason": "Skip CUDA output blocks only when conservative Spherical bounds prove them empty; preserve encoded payload contracts and expose setup, source-upload, and kernel timings."
+      }
+    ],
+    "complete_modules": [
+      "spherical_projection_bounds"
+    ]
   }
 }

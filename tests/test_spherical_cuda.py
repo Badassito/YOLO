@@ -91,6 +91,34 @@ def rotation_xyz():
 
 @unittest.skipUnless(os.environ.get('XTA_TEST_SPHERICAL_CUDA') == '1', 'explicit available-GPU qualification only')
 class SphericalHardwareRendererTests(unittest.TestCase):
+    def test_multistrip_cached_upload_preserves_native_pixels_and_stream_ownership(self):
+        import torch
+        from XTA.cuda_backend import _GpuWorkerRenderEngine
+        from XTA.spherical_geometry import render_shell_frame
+        volume = np.random.default_rng(281).integers(0, 256, (11, 13, 15), dtype=np.uint8)
+        engine = _GpuWorkerRenderEngine('cuda:0')
+        self.assertEqual(engine.ensure_volume_array(volume), 'resident')
+        view = spherical_view(volume.shape, face=4, size=130, intervals=124,
+                              origin=(-2, -3), rotation=rotation_xyz(), radii=(.63, 5.))
+        try:
+            before = spherical_cuda.spherical_direction_cache_stats(engine)
+            for index in (0, 1):
+                with torch.cuda.stream(engine._stream):
+                    actual = spherical_cuda.render_spherical_native_resident(engine, view, index)
+                engine._stream.synchronize()
+                np.testing.assert_array_equal(actual.cpu().numpy(), render_shell_frame(volume, view, index))
+            after = spherical_cuda.spherical_direction_cache_stats(engine)
+            self.assertEqual(after['h2d_copies'] - before['h2d_copies'], 2)
+            self.assertEqual(after['h2d_bytes'] - before['h2d_bytes'], 130 * 130 * 25)
+            self.assertEqual(after['host_build_blocks'] - before['host_build_blocks'], 3)
+            self.assertEqual(after['cache_misses'] - before['cache_misses'], 1)
+            self.assertEqual(after['cache_hits'] - before['cache_hits'], 1)
+            self.assertTrue(engine._spherical_native_kernel_announced)
+            self.assertFalse(getattr(engine, '_spherical_native_kernel_disabled', False))
+        finally:
+            engine._stream.synchronize()
+            engine.release_inference_assets()
+
     def test_native_cuda_matches_materialized_reference_with_deferred_t(self):
         import torch
         from XTA.cuda_backend import _GpuWorkerRenderEngine
@@ -200,7 +228,7 @@ class SphericalResidentNumericalTests(unittest.TestCase):
         volume = np.zeros((9, 11, 13), np.uint8)
         engine = resident_engine(volume)
         view = spherical_view(volume.shape)
-        with mock.patch.object(spherical_cuda, '_build_direction_block', wraps=spherical_cuda._build_direction_block) as build:
+        with mock.patch.object(spherical_cuda, '_build_cached_directions', wraps=spherical_cuda._build_cached_directions) as build:
             spherical_cuda.render_spherical_native_resident(engine, view, 0)
             spherical_cuda.render_spherical_native_resident(engine, view, 1)
             self.assertEqual(build.call_count, 1)
@@ -214,6 +242,78 @@ class SphericalResidentNumericalTests(unittest.TestCase):
         spherical_cuda.clear_spherical_render_cache(engine)
         self.assertFalse(engine._spherical_direction_cache)
         self.assertEqual(engine._spherical_direction_cache_bytes, 0)
+
+    def test_cached_multi_strip_directions_are_exact_with_only_two_upload_calls(self):
+        engine = resident_engine(np.zeros((9, 11, 13), np.uint8))
+        for face, rotation in product(range(6), (np.eye(3), rotation_xyz())):
+            view = spherical_view(face=face, size=130, intervals=124, origin=(-2, -3), rotation=rotation)
+            _, _, key = spherical_cuda._render_contract(engine, view, 0)
+            expected = [spherical_cuda._build_direction_block(engine, key, start, min(start + 64, 130))
+                        for start in range(0, 130, 64)]
+            expected_directions = engine.torch.cat([block[0] for block in expected]).numpy()
+            expected_valid = engine.torch.cat([block[1] for block in expected]).numpy()
+            before = spherical_cuda.spherical_direction_cache_stats(engine)
+            with mock.patch.object(engine.torch, 'as_tensor', wraps=engine.torch.as_tensor) as upload:
+                [(first, directions, valid)] = list(spherical_cuda._direction_blocks(engine, key))
+                repeated = list(spherical_cuda._direction_blocks(engine, key))
+            with self.subTest(face=face, rotation=tuple(rotation.reshape(-1))):
+                self.assertEqual(first, 0)
+                self.assertEqual(upload.call_count, 2)
+                self.assertIs(repeated[0][1], directions)
+                np.testing.assert_array_equal(directions.numpy(), expected_directions)
+                np.testing.assert_array_equal(valid.numpy(), expected_valid)
+                after = spherical_cuda.spherical_direction_cache_stats(engine)
+                self.assertEqual(after['cache_misses'] - before['cache_misses'], 1)
+                self.assertEqual(after['cache_hits'] - before['cache_hits'], 1)
+                self.assertEqual(after['host_build_blocks'] - before['host_build_blocks'], 3)
+                self.assertEqual(after['upload_calls'] - before['upload_calls'], 2)
+                self.assertEqual(after['h2d_copies'], 0, 'CPU qualification does not perform H2D')
+            spherical_cuda.clear_spherical_render_cache(engine)
+
+    def test_host_cache_allocation_failure_keeps_bounded_strip_fallback(self):
+        volume = np.random.default_rng(41).integers(0, 256, (9, 11, 13), dtype=np.uint8)
+        engine = resident_engine(volume)
+        view = spherical_view(volume.shape, size=70, intervals=66, origin=(-1, -1), radii=(2.4,))
+        original_empty = np.empty
+
+        def fail_full_host_entry(shape, *args, **kwargs):
+            if shape == (70, 70, 3):
+                raise MemoryError('host cache staging unavailable')
+            return original_empty(shape, *args, **kwargs)
+
+        from XTA.spherical_geometry import render_shell_frame
+        with mock.patch.object(np, 'empty', side_effect=fail_full_host_entry):
+            actual = spherical_cuda.render_spherical_native_resident(engine, view, 0).numpy()
+        np.testing.assert_array_equal(actual, render_shell_frame(volume, view, 0))
+        self.assertFalse(engine._spherical_direction_cache)
+        self.assertEqual(engine._spherical_direction_cache_bytes, 0)
+        stats = spherical_cuda.spherical_direction_cache_stats(engine)
+        self.assertEqual(stats['cache_host_fallbacks'], 1)
+        self.assertEqual(stats['host_build_blocks'], 2)
+        self.assertEqual(stats['upload_calls'], 4)
+
+    def test_partial_upload_failure_never_publishes_a_cache_entry(self):
+        engine = resident_engine(np.zeros((9, 11, 13), np.uint8))
+        view = spherical_view()
+        _, _, key = spherical_cuda._render_contract(engine, view, 0)
+        original_as_tensor = engine.torch.as_tensor
+        calls = 0
+
+        def fail_second_upload(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError('validity upload rejected')
+            return original_as_tensor(*args, **kwargs)
+
+        with mock.patch.object(engine.torch, 'as_tensor', side_effect=fail_second_upload):
+            with self.assertRaisesRegex(RuntimeError, 'validity upload rejected'):
+                list(spherical_cuda._direction_blocks(engine, key))
+        self.assertFalse(engine._spherical_direction_cache)
+        self.assertEqual(engine._spherical_direction_cache_bytes, 0)
+        list(spherical_cuda._direction_blocks(engine, key))
+        self.assertEqual(engine._spherical_direction_cache_bytes, view.src_h * view.src_w * 25)
+        self.assertEqual(spherical_cuda.spherical_direction_cache_stats(engine)['upload_calls'], 3)
 
     def test_oversized_direction_plans_stream_bounded_strips(self):
         volume = np.random.default_rng(2).integers(0, 256, (9, 11, 13), dtype=np.uint8)

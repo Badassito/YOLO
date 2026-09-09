@@ -607,6 +607,7 @@ class GpuFlattenedRetinaPayload:
     # Keep raw head/proto and compaction workspaces alive until ready_event has ordered every
     # consumer. CuPy launches are invisible to torch's allocator stream tracking by themselves.
     device_refs: Optional[Tuple[object, ...]] = field(default=None, repr=False)
+    compaction_kernel: str = ''
 
 @dataclass(frozen=True)
 class DeferredCpuRetinaMaskPayload:
@@ -3507,6 +3508,8 @@ def _build_direct_device_compacted_payload(
     im: object,
     confidence_threshold: float,
     min_conf_applied: bool = False,
+    *,
+    allow_tiled: bool = True,
 ) -> Optional[GpuFlattenedRetinaPayload]:
     """Build one flattened mask using the resident kernels on the current CUDA stream.
 
@@ -3558,29 +3561,60 @@ def _build_direct_device_compacted_payload(
         cp_count = cp.asarray(count)
         cp_max_logit = cp.asarray(max_logit)
         cp_conf_proto = cp.asarray(conf_proto) if conf_proto is not None else None
-        compact = kernels.compact_f16 if head.dtype == torch.float16 else kernels.compact_f32
-        compact(
-            ((anchors + 255) // 256,), (256,),
-            (
-                cp_head, np.int32(anchors), np.float32(confidence_threshold),
-                cp_indices, cp_count,
-                np.int32(img_h), np.int32(img_w), np.uintp(0),
-            ),
-            stream=external,
+        packed_refs = ()
+        kernel_name = 'scalar'
+        use_tiled = bool(
+            allow_tiled and _env_flag('YOLO_TTA_DIRECT_TILED_PROTO_UNION', True)
+            and _tiled_f16_proto_union_applicable(torch, head, proto)
         )
-        htag = 'f16' if head.dtype == torch.float16 else 'f32'
-        ptag = 'f16' if proto.dtype == torch.float16 else 'f32'
-        union_kernel = getattr(kernels, f'union_{htag}_{ptag}')
-        union_kernel(
-            (((ph * pw) + 255) // 256,), (256,),
-            (
-                cp_head, cp_proto, cp_indices, cp_count,
-                np.int32(anchors), np.int32(masks), np.int32(ph), np.int32(pw),
-                np.int32(img_h), np.int32(img_w), cp_max_logit,
-                cp_conf_proto if cp_conf_proto is not None else np.uintp(0),
-            ),
-            stream=external,
-        )
+        if use_tiled:
+            # Preserve every accepted detection: capacity is the bounded backend
+            # anchor count, exactly as in the resident ring. Keep these owners with
+            # the payload until its asynchronous producer/consumer work settles.
+            try:
+                compact_coeff = torch.empty((anchors, masks), dtype=torch.float16, device=device)
+                compact_boxes = torch.empty((anchors, 4), dtype=torch.float32, device=device)
+                compact_confs = torch.empty((anchors,), dtype=torch.float32, device=device)
+            except torch.OutOfMemoryError:
+                compact_coeff = compact_boxes = compact_confs = None
+                use_tiled = False
+                kernel_name = 'scalar_workspace_fallback'
+            else:
+                cp_coeff, cp_boxes, cp_confs = (cp.asarray(value) for value in
+                                               (compact_coeff, compact_boxes, compact_confs))
+                packed_refs = (compact_coeff, compact_boxes, compact_confs, cp_coeff, cp_boxes, cp_confs)
+        if use_tiled:
+            kernels.compact_f16_tiled(
+                ((anchors + 255) // 256,), (256,),
+                (cp_head, np.int32(anchors), np.float32(confidence_threshold), cp_indices, cp_count,
+                 np.int32(img_h), np.int32(img_w), np.uintp(0),
+                 np.int32(masks), np.int32(ph), np.int32(pw), np.int32(img_h), np.int32(img_w),
+                 cp_coeff, cp_boxes, cp_confs), stream=external,
+            )
+            kernels.union_f16_f16_tiled(
+                ((pw + 63) // 64, (ph + 3) // 4), (32, 4),
+                (cp_proto, cp_coeff, cp_boxes, cp_confs, cp_count,
+                 np.int32(masks), np.int32(ph), np.int32(pw), cp_max_logit,
+                 cp_conf_proto if cp_conf_proto is not None else np.uintp(0)), stream=external,
+            )
+            kernel_name = 'tiled_f16'
+        else:
+            compact = kernels.compact_f16 if head.dtype == torch.float16 else kernels.compact_f32
+            compact(
+                ((anchors + 255) // 256,), (256,),
+                (cp_head, np.int32(anchors), np.float32(confidence_threshold), cp_indices, cp_count,
+                 np.int32(img_h), np.int32(img_w), np.uintp(0)), stream=external,
+            )
+            htag = 'f16' if head.dtype == torch.float16 else 'f32'
+            ptag = 'f16' if proto.dtype == torch.float16 else 'f32'
+            union_kernel = getattr(kernels, f'union_{htag}_{ptag}')
+            union_kernel(
+                (((ph * pw) + 255) // 256,), (256,),
+                (cp_head, cp_proto, cp_indices, cp_count,
+                 np.int32(anchors), np.int32(masks), np.int32(ph), np.int32(pw),
+                 np.int32(img_h), np.int32(img_w), cp_max_logit,
+                 cp_conf_proto if cp_conf_proto is not None else np.uintp(0)), stream=external,
+            )
 
         # One plane, not one plane per instance. The terminal view warp remains in the existing
         # post path; the resident-ring specialization fuses this upsample with that warp.
@@ -3612,10 +3646,11 @@ def _build_direct_device_compacted_payload(
             ),
             gpu_min_radius=float(fastpath_radius),
             ready_event=ready_event,
+            compaction_kernel=kernel_name,
             device_refs=(
                 head, proto, indices, count, max_logit, conf_proto,
                 cp_head, cp_proto, cp_indices, cp_count, cp_max_logit, cp_conf_proto,
-            ),
+            ) + packed_refs,
         )
         return payload
     except Exception:
@@ -3639,6 +3674,9 @@ def _direct_predict_stream(
     nc = max(1, len(names))
     conf_thres = float(cfg.conf)
     device_compaction_active = bool(direct_device_compaction_enabled())
+    tiled_compaction_active = True
+    kernel_counts = {'tiled_f16': 0, 'scalar': 0, 'scalar_workspace_fallback': 0, 'synchronized': 0}
+    failed_probes = 0
 
     global _DIRECT_PREDICT_ANNOUNCED, _DIRECT_DEVICE_COMPACTION_ANNOUNCED, _DIRECT_DEVICE_COMPACTION_FALLBACK_WARNED
     if not _DIRECT_PREDICT_ANNOUNCED:
@@ -3688,6 +3726,7 @@ def _direct_predict_stream(
                         min_conf_applied=bool(
                             _direct_fastpath is not None and float(_direct_fastpath[0]) > 0.0
                         ),
+                        allow_tiled=tiled_compaction_active,
                     )
                     for i in range(int(bsz))
                 ]
@@ -3700,6 +3739,9 @@ def _direct_predict_stream(
                             'YOLO_TTA_DIRECT_DEVICE_COMPACTION=0 restores the synchronized fallback.'
                         )
                     for payload in compacted_payloads:
+                        if payload.compaction_kernel == 'scalar_workspace_fallback':
+                            tiled_compaction_active = False
+                        kernel_counts[payload.compaction_kernel or 'scalar'] += 1
                         yield _DirectPredictResult(payload)  # type: ignore[arg-type]
                     continue
                 if not _DIRECT_DEVICE_COMPACTION_FALLBACK_WARNED:
@@ -3711,6 +3753,8 @@ def _direct_predict_stream(
                 # A deterministic dtype/CuPy/NVRTC failure or OOM should not repeat the same
                 # clone/allocation/probe on every remaining batch in this source.
                 device_compaction_active = False
+                failed_probes += 1
+            kernel_counts['synchronized'] += bsz
             scores = head[:, 4:4 + nc, :]
             if nc == 1:
                 conf_all = scores[:, 0, :]
@@ -3749,6 +3793,9 @@ def _direct_predict_stream(
                         'set YOLO_TTA_DIRECT_PREDICT=0 to use model.predict'
                     )
                 yield _DirectPredictResult(payload)
+    print(f'Direct compaction {source_label}: '
+          + ', '.join(f'{name}={count}' for name, count in kernel_counts.items())
+          + f', failed_probes={failed_probes}', flush=True)
 
 def predict_source_and_accumulate(
     model,

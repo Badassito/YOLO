@@ -498,6 +498,10 @@ class _MainProcessGpuStageCoordinator:
         self._inference_priority_active = False
         self._inference_asset_retirement_pending = False
         self._pending_inference_backlog = False
+        self._spherical_retirement_pressure = False
+        self._spherical_retirement_requests: Dict[str, float] = {}
+        self._spherical_retirement_device: Optional[int] = None
+        self._spherical_retirement_retry_after = 0.0
         self._wake_callback: Optional[Callable[[], None]] = None
 
     def configure_workers(self, worker_devices: Sequence[int]) -> None:
@@ -506,6 +510,10 @@ class _MainProcessGpuStageCoordinator:
             self._inference_inflight.clear()
             self._stage_leases.clear()
             self._pending_inference_backlog = False
+            self._spherical_retirement_pressure = False
+            self._spherical_retirement_requests.clear()
+            self._spherical_retirement_device = None
+            self._spherical_retirement_retry_after = 0.0
             self._inference_asset_retirement_pending = False
             self._inference_priority_active = bool(
                 self._worker_devices and main_process_gpu_stage_inference_priority_enabled()
@@ -518,6 +526,81 @@ class _MainProcessGpuStageCoordinator:
             changed = bool(self._pending_inference_backlog) != bool(active)
             self._pending_inference_backlog = bool(active)
             callback = self._wake_callback if changed else None
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def set_spherical_retirement_pressure(self, active: bool) -> None:
+        """Permit one demanded retirement turn when completed canvases fill RAM."""
+        with self._lock:
+            changed = self._spherical_retirement_pressure != bool(active)
+            self._spherical_retirement_pressure = bool(active)
+            if not active:
+                self._spherical_retirement_requests.clear()
+                self._spherical_retirement_device = None
+            callback = self._wake_callback if changed else None
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def _reserved_spherical_device_locked(self) -> Optional[int]:
+        now = time.monotonic()
+        self._spherical_retirement_requests = {
+            purpose: expiry for purpose, expiry in self._spherical_retirement_requests.items()
+            if expiry > now
+        }
+        if (not self._spherical_retirement_requests or not self._spherical_retirement_pressure
+                or self._inference_asset_retirement_pending or not self._pending_inference_backlog):
+            self._spherical_retirement_device = None
+        return self._spherical_retirement_device
+
+    def _request_spherical_retirement_turn(self, candidates: Sequence[int], purpose: str) -> None:
+        """Drain one worker queue for a live projector; other workers keep inferring.
+
+        Demands expire after 30 seconds and are cancelled on CPU completion.
+        Failed CUDA admission imposes a cooldown instead of parking a worker.
+        """
+        if not self._is_spherical_retirement(purpose):
+            return
+        with self._lock:
+            if (not self._spherical_retirement_pressure or not self._pending_inference_backlog
+                    or self._inference_asset_retirement_pending
+                    or time.monotonic() < self._spherical_retirement_retry_after
+                    or not _env_flag('YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT', True)):
+                return
+            if any(self._is_spherical_retirement(owner) for owner in self._stage_leases.values()):
+                return
+            prior = self._reserved_spherical_device_locked()
+            if prior is not None and prior not in candidates:
+                return
+            devices = [int(device) for device in candidates if int(device) in self._worker_devices
+                       and int(device) not in self._stage_leases]
+            if not devices:
+                return
+            self._spherical_retirement_requests[str(purpose)] = time.monotonic() + 30.0
+            if prior not in devices:
+                self._spherical_retirement_device = min(
+                    devices, key=lambda device: (self._inference_inflight.get(device, 0), device))
+            callback = self._wake_callback if prior != self._spherical_retirement_device else None
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def cancel_spherical_retirement_request(self, purpose: str, *, failed: bool = False) -> None:
+        with self._lock:
+            self._spherical_retirement_requests.pop(str(purpose), None)
+            if failed:
+                self._spherical_retirement_retry_after = time.monotonic() + 10.0
+                self._spherical_retirement_requests.clear()
+            if not self._spherical_retirement_requests:
+                self._spherical_retirement_device = None
+            callback = self._wake_callback
         if callback is not None:
             try:
                 callback()
@@ -564,7 +647,12 @@ class _MainProcessGpuStageCoordinator:
         # let that retirement use an idle GPU even in a mixed D1 run. The acquire
         # methods still fence queued/running inference and other device owners.
         if self._is_spherical_retirement(purpose_l):
-            return bool(self._pending_inference_backlog and int(device_index) in self._worker_devices)
+            if not self._pending_inference_backlog or int(device_index) not in self._worker_devices:
+                return False
+            reserved = self._reserved_spherical_device_locked()
+            return bool(reserved != int(device_index)
+                        or str(purpose) not in self._spherical_retirement_requests
+                        or any(self._is_spherical_retirement(owner) for owner in self._stage_leases.values()))
         # In the non-D1 fast-bundle fallback, a completed view may borrow an idle
         # worker GPU for backprojection while other devices still infer. Terminal
         # asset retirement above takes precedence over that overlap permission.
@@ -596,10 +684,16 @@ class _MainProcessGpuStageCoordinator:
             self._inference_priority_active = False
             self._inference_asset_retirement_pending = False
             self._pending_inference_backlog = False
+            self._spherical_retirement_pressure = False
+            self._spherical_retirement_requests.clear()
+            self._spherical_retirement_device = None
+            self._spherical_retirement_retry_after = 0.0
             self._wake_callback = None
 
     def can_dispatch_inference(self, device_index: int) -> bool:
         with self._lock:
+            if self._reserved_spherical_device_locked() == int(device_index):
+                return False
             owner = self._stage_leases.get(int(device_index))
             return owner is None or bool(
                 main_process_gpu_stage_inference_overlap_enabled()
@@ -609,6 +703,8 @@ class _MainProcessGpuStageCoordinator:
     def begin_inference(self, device_index: int) -> bool:
         device = int(device_index)
         with self._lock:
+            if self._reserved_spherical_device_locked() == device:
+                return False
             owner = self._stage_leases.get(device)
             if owner is not None and (
                 not main_process_gpu_stage_inference_overlap_enabled()
@@ -640,6 +736,7 @@ class _MainProcessGpuStageCoordinator:
             return None
         if device < 0 or device >= count:
             return None
+        self._request_spherical_retirement_turn([device], purpose)
         with self._lock:
             overlap = bool(main_process_gpu_stage_inference_overlap_enabled())
             if device in self._stage_leases:
@@ -652,6 +749,9 @@ class _MainProcessGpuStageCoordinator:
             if aux_pool is not None and not bool(aux_pool.revoke_worker(device)):
                 return None
             self._stage_leases[device] = str(purpose)
+            if self._is_spherical_retirement(purpose):
+                self._spherical_retirement_requests.pop(str(purpose), None)
+                self._spherical_retirement_device = None
             return _MainProcessGpuStageLease(self, device, str(purpose))
 
     def try_acquire_stage(self, torch_mod: object, purpose: str) -> Optional[_MainProcessGpuStageLease]:
@@ -661,6 +761,7 @@ class _MainProcessGpuStageCoordinator:
             return None
         if count <= 0:
             return None
+        self._request_spherical_retirement_turn(range(count), purpose)
         with self._lock:
             configured = sorted(
                 int(idx) for idx in self._worker_devices
@@ -704,8 +805,15 @@ class _MainProcessGpuStageCoordinator:
                     best_free = int(free_bytes)
                     best_index = int(idx)
             if best_index is None:
+                if self._is_spherical_retirement(purpose):
+                    self._spherical_retirement_requests.clear()
+                    self._spherical_retirement_device = None
+                    self._spherical_retirement_retry_after = time.monotonic() + 10.0
                 return None
             self._stage_leases[int(best_index)] = str(purpose)
+            if self._is_spherical_retirement(purpose):
+                self._spherical_retirement_requests.pop(str(purpose), None)
+                self._spherical_retirement_device = None
             return _MainProcessGpuStageLease(self, int(best_index), str(purpose))
 
     def release_stage(self, device_index: int, purpose: str) -> None:
@@ -730,6 +838,8 @@ class _MainProcessGpuStageCoordinator:
                 'inference_priority_active': bool(self._inference_priority_active),
                 'inference_asset_retirement_pending': bool(self._inference_asset_retirement_pending),
                 'pending_inference_backlog': bool(self._pending_inference_backlog),
+                'spherical_retirement_pressure': bool(self._spherical_retirement_pressure),
+                'spherical_retirement_reserved_device': self._reserved_spherical_device_locked(),
             }
 
 _MAIN_PROCESS_GPU_STAGE_COORDINATOR = _MainProcessGpuStageCoordinator()
@@ -752,6 +862,14 @@ def _set_main_process_gpu_asset_retirement_pending(active: bool) -> None:
 
 def _set_main_process_gpu_pending_inference(active: bool) -> None:
     _MAIN_PROCESS_GPU_STAGE_COORDINATOR.set_pending_inference_backlog(bool(active))
+
+
+def _set_main_process_gpu_spherical_retirement_pressure(active: bool) -> None:
+    _MAIN_PROCESS_GPU_STAGE_COORDINATOR.set_spherical_retirement_pressure(bool(active))
+
+
+def _cancel_main_process_spherical_retirement_request(purpose: str, *, failed: bool = False) -> None:
+    _MAIN_PROCESS_GPU_STAGE_COORDINATOR.cancel_spherical_retirement_request(str(purpose), failed=failed)
 
 def _set_main_process_gpu_stage_wake_callback(callback: Optional[Callable[[], None]]) -> None:
     _MAIN_PROCESS_GPU_STAGE_COORDINATOR.set_wake_callback(callback)

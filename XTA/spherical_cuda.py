@@ -10,6 +10,7 @@ from collections import OrderedDict
 from types import SimpleNamespace
 import math
 import os
+import time
 
 import numpy as np
 
@@ -28,6 +29,24 @@ def clear_spherical_render_cache(engine):
     if cache is not None:
         cache.clear()
     engine._spherical_direction_cache_bytes = 0
+
+
+def _direction_cache_stats(engine):
+    stats = getattr(engine, '_spherical_direction_cache_stats', None)
+    if stats is None:
+        stats = engine._spherical_direction_cache_stats = {
+            'cache_hits': 0, 'cache_misses': 0, 'cache_evictions': 0,
+            'cache_host_fallbacks': 0,
+            'host_build_blocks': 0, 'host_build_seconds': 0.0,
+            'upload_calls': 0, 'upload_seconds': 0.0,
+            'h2d_copies': 0, 'h2d_bytes': 0,
+        }
+    return stats
+
+
+def spherical_direction_cache_stats(engine):
+    """Snapshot monotonic render counters for per-task deltas; retain no owners."""
+    return dict(_direction_cache_stats(engine))
 
 
 def _render_contract(engine, view, index):
@@ -63,7 +82,7 @@ def _render_contract(engine, view, index):
     return radius, shape, key
 
 
-def _build_direction_block(engine, key, row0, row1):
+def _build_host_direction_block(key, row0, row1):
     _, face, intervals, rows, columns, u_origin, v_origin, rotation = key
     column = u_origin + np.arange(columns, dtype=np.float64)[None, :]
     row = v_origin + np.arange(row0, row1, dtype=np.float64)[:, None]
@@ -73,12 +92,53 @@ def _build_direction_block(engine, key, row0, row1):
     u = np.clip(-1. + 2. * column / intervals, -1., 1.)
     v = np.clip(1. - 2. * row / intervals, -1., 1.)
     directions = qsc_inverse(face, u, v) @ np.asarray(rotation).reshape(3, 3).T
-    return (
-        engine.torch.as_tensor(np.ascontiguousarray(directions),
-                               dtype=engine.torch.float64, device=engine.device),
-        engine.torch.as_tensor(np.ascontiguousarray(valid),
-                               dtype=engine.torch.bool, device=engine.device),
-    )
+    return np.ascontiguousarray(directions), np.ascontiguousarray(valid)
+
+
+def _upload_direction_arrays(engine, host_directions, host_valid):
+    stats = _direction_cache_stats(engine)
+    started = time.perf_counter()
+    on_cuda = str(engine.device).startswith('cuda')
+    results = []
+    try:
+        for host, dtype in ((host_directions, engine.torch.float64), (host_valid, engine.torch.bool)):
+            # Blocking transfers complete before the temporary host owners leave
+            # scope. The caller's active render stream remains authoritative.
+            results.append(engine.torch.as_tensor(host, dtype=dtype, device=engine.device))
+            stats['upload_calls'] += 1
+            if on_cuda:
+                stats['h2d_copies'] += 1
+                stats['h2d_bytes'] += host.nbytes
+    finally:
+        stats['upload_seconds'] += time.perf_counter() - started
+    return tuple(results)
+
+
+def _build_direction_block(engine, key, row0, row1):
+    started = time.perf_counter()
+    host_directions, host_valid = _build_host_direction_block(key, row0, row1)
+    stats = _direction_cache_stats(engine)
+    stats['host_build_blocks'] += 1
+    stats['host_build_seconds'] += time.perf_counter() - started
+    return _upload_direction_arrays(engine, host_directions, host_valid)
+
+
+def _build_cached_directions(engine, key):
+    """Build at most one cache-budget host entry, then transfer its two arrays."""
+    rows, columns = key[3:5]
+    started = time.perf_counter()
+    host_directions = np.empty((rows, columns, 3), dtype=np.float64)
+    host_valid = np.empty((rows, columns), dtype=np.bool_)
+    stats = _direction_cache_stats(engine)
+    for row0 in range(0, rows, _ROW_BLOCK):
+        row1 = min(rows, row0 + _ROW_BLOCK)
+        block_directions, block_valid = _build_host_direction_block(key, row0, row1)
+        host_directions[row0:row1] = block_directions
+        host_valid[row0:row1] = block_valid
+        stats['host_build_blocks'] += 1
+        del block_directions, block_valid
+    stats['host_build_seconds'] += time.perf_counter() - started
+    return _upload_direction_arrays(engine, host_directions, host_valid)
 
 
 def _direction_blocks(engine, key):
@@ -89,26 +149,30 @@ def _direction_blocks(engine, key):
         cache = engine._spherical_direction_cache = OrderedDict()
         engine._spherical_direction_cache_bytes = 0
     entry = cache.get(key)
+    stats = _direction_cache_stats(engine)
     if entry is not None:
+        stats['cache_hits'] += 1
         cache.move_to_end(key)
     else:
+        stats['cache_misses'] += 1
         size = rows * columns * (3 * 8 + 1)
         if size <= _DIRECTION_CACHE_BYTES:
             while cache and engine._spherical_direction_cache_bytes + size > _DIRECTION_CACHE_BYTES:
                 _, (_, _, old_size) = cache.popitem(last=False)
                 engine._spherical_direction_cache_bytes -= old_size
-            directions = engine.torch.empty((rows, columns, 3), dtype=engine.torch.float64, device=engine.device)
-            valid = engine.torch.empty((rows, columns), dtype=engine.torch.bool, device=engine.device)
-            # QSC's temporary arrays are limited to a strip even when retaining
-            # a whole patch on the GPU. Never build a full-face host mesh.
-            for row0 in range(0, rows, _ROW_BLOCK):
-                row1 = min(rows, row0 + _ROW_BLOCK)
-                block_directions, block_valid = _build_direction_block(engine, key, row0, row1)
-                directions[row0:row1].copy_(block_directions)
-                valid[row0:row1].copy_(block_valid)
-            entry = (directions, valid, size)
-            cache[key] = entry
-            engine._spherical_direction_cache_bytes += size
+                stats['cache_evictions'] += 1
+            # Keep QSC temporaries strip-bounded. Only the final direction and
+            # validity arrays occupy a full, cache-budget-limited host entry.
+            try:
+                directions, valid = _build_cached_directions(engine, key)
+            except MemoryError:
+                # Host staging is an optimization. Preserve the original
+                # bounded-strip route if its larger final host entry cannot fit.
+                stats['cache_host_fallbacks'] += 1
+            else:
+                entry = (directions, valid, size)
+                cache[key] = entry
+                engine._spherical_direction_cache_bytes += size
     block_rows = max(1, min(_ROW_BLOCK, max(1, _DIRECTION_CACHE_BYTES // (columns * 25))))
     if entry is None:
         for row0 in range(0, rows, block_rows):

@@ -31,6 +31,7 @@ _OUTPUT_BLOCK_BYTES = 8 * 1024 * 1024
 _INFLIGHT_WORK_BYTES = 256 * 1024 * 1024
 _CHUNK_BYTES_PER_VOXEL = 384
 _CUDA_RECHECK_SLICES = 8
+_CUDA_RECHECK_SECONDS = 1.0
 
 
 def spherical_cuda_backproject_enabled():
@@ -94,7 +95,7 @@ def _try_spherical_cuda_stage(source, view, shape, bboxes, *, quiet=False):
         if not quiet:
             print(f'Spherical CUDA fallback {view.name}: runtime unavailable ({exc}); using CPU.', flush=True)
         return None
-    from .backprojection import _try_acquire_main_process_gpu_stage
+    from .backprojection import _try_acquire_main_process_gpu_stage, _cancel_main_process_spherical_retirement_request
     from .spherical_projection_cuda import SphericalCudaProjector
 
     lease = _try_acquire_main_process_gpu_stage(torch, f'Spherical source projection {view.name}')
@@ -110,6 +111,7 @@ def _try_spherical_cuda_stage(source, view, shape, bboxes, *, quiet=False):
         exc.stage_lease = lease
         raise
     except Exception as exc:
+        _cancel_main_process_spherical_retirement_request(f'Spherical source projection {view.name}', failed=True)
         _close_spherical_cuda_resources(projector, lease)
         if not quiet:
             print(f'Spherical CUDA fallback {view.name}: admission/preflight failed ({exc}); using CPU.', flush=True)
@@ -321,7 +323,10 @@ def backproject_spherical_volume_to_volume(
     The nearest radius is global, with exact midpoints assigned inward; row
     and column nearest ties use NumPy's round-to-even on the global lattice.
     """
-    from .backprojection import SinkOnlyProjectionResult, _emit_projection_block_callback
+    from .backprojection import (
+        SinkOnlyProjectionResult, _emit_projection_block_callback,
+        _cancel_main_process_spherical_retirement_request,
+    )
 
     source = np.asarray(spherical_mask_mm)
     radii, rotation, shape, bboxes = _validate_spherical_projection(
@@ -362,6 +367,7 @@ def backproject_spherical_volume_to_volume(
 
         next_z = cpu_slices = cuda_slices = 0
         recheck_at = max(1, int(_CUDA_RECHECK_SLICES))
+        recheck_time = time.monotonic() + _CUDA_RECHECK_SECONDS
         while next_z < shape[0]:
             blocks = (_ordered_spherical_cuda_blocks(stage, shape[0], packed if compact else None, first_z=next_z)
                       if stage is not None else _ordered_spherical_blocks(project, shape[0], shape[1] * shape[2], workers))
@@ -389,9 +395,11 @@ def backproject_spherical_volume_to_volume(
                     else:
                         cuda_slices += count
                     del block
-                    if (stage is None and next_z < shape[0] and next_z >= recheck_at
+                    if (stage is None and next_z < shape[0]
+                            and (next_z >= recheck_at or time.monotonic() >= recheck_time)
                             and spherical_cuda_backproject_enabled()):
                         recheck_at = next_z + max(1, int(_CUDA_RECHECK_SLICES))
+                        recheck_time = time.monotonic() + _CUDA_RECHECK_SECONDS
                         candidate = _try_spherical_cuda_stage(source, spherical_view, shape, bboxes, quiet=True)
                         if candidate is not None:
                             stage = candidate
@@ -414,11 +422,14 @@ def backproject_spherical_volume_to_volume(
                 flush()
         if stage is not None:
             for name in ('kernel_seconds', 'metadata_seconds', 'pack_seconds', 'd2h_seconds',
-                         'metadata_d2h_bytes', 'payload_d2h_bytes', 'dense_d2h_bytes', 'source_h2d_bytes'):
+                         'metadata_d2h_bytes', 'payload_d2h_bytes', 'dense_d2h_bytes', 'source_h2d_bytes',
+                         'roi_projection_voxels', 'roi_skipped_blocks', 'constructor_seconds', 'preflight_seconds'):
                 runtime_telemetry().gauge(f'projection.spherical.{name}', getattr(stage.projector, name, 0))
         metrics = '' if stage is None else ''.join(
             f', {name}={getattr(stage.projector, name, 0)}' for name in
-            ('source_h2d_bytes', 'metadata_d2h_bytes', 'payload_d2h_bytes', 'dense_d2h_bytes'))
+            ('source_h2d_bytes', 'metadata_d2h_bytes', 'payload_d2h_bytes', 'dense_d2h_bytes',
+             'roi_projection_voxels', 'roi_skipped_blocks', 'constructor_seconds', 'preflight_seconds',
+             'kernel_seconds', 'metadata_seconds', 'pack_seconds', 'd2h_seconds'))
         print(f'Spherical projection complete {spherical_view.name}: backend={backend}, '
               f'total_s={time.perf_counter() - started:.6f}, cpu_slices={cpu_slices}, '
               f'cuda_slices={cuda_slices}{metrics}', flush=True)
@@ -428,6 +439,7 @@ def backproject_spherical_volume_to_volume(
         close_memmap_array_without_flush(output)
         raise
     finally:
+        _cancel_main_process_spherical_retirement_request(f'Spherical source projection {spherical_view.name}')
         if stage is not None:
             try:
                 stage.close()

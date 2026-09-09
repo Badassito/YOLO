@@ -31,6 +31,53 @@ def inspect_seams(source: str):
 
 
 class PackageInventoryTests(unittest.TestCase):
+    def test_second_patch_cannot_skip_the_intermediate_release(self) -> None:
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        prior = inventory.reviewed_v21_contract(manifest)
+        first = inventory.reviewed_v21_patch_contract(manifest, prior)
+        second = inventory.reviewed_v21_0_2_contract(manifest, prior, first)
+        self.assertEqual(second['previous_review_sha256'], inventory.REVIEWED_V21_0_1_SHA256)
+        old_record = next(item for item in first['definitions']
+                          if item['name'] == '_MainProcessGpuStageCoordinator')
+        record = next(item for item in second['definitions']
+                      if item['name'] == '_MainProcessGpuStageCoordinator')
+        record['previous_sha256'] = old_record['previous_sha256']
+        reauthenticated = hashlib.sha256(json.dumps(
+            second, sort_keys=True, separators=(',', ':'),
+        ).encode('utf-8')).hexdigest()
+        with mock.patch.object(inventory, 'REVIEWED_V21_0_2_SHA256', reauthenticated):
+            with self.assertRaisesRegex(RuntimeError, 'v21.0.2 supersession does not match its historical pin'):
+                inventory.reviewed_v21_0_2_contract(manifest, prior, first)
+        manifest['v21_0_1_review']['release'] = '21.0.2'
+        with self.assertRaisesRegex(RuntimeError, 'v21.0.1 review digest mismatch'):
+            inventory.reviewed_v21_patch_contract(manifest, prior)
+
+    def test_second_patch_pins_current_compaction_and_bounds_definitions(self) -> None:
+        original_digest = inventory.digest
+        for target in ('_build_direct_device_compacted_payload', 'GpuFlattenedRetinaPayload', 'spherical_output_bounds'):
+            def changed_digest(node):
+                return '0' * 64 if getattr(node, 'name', None) == target else original_digest(node)
+
+            with self.subTest(target=target), mock.patch.object(inventory, 'digest', side_effect=changed_digest):
+                with self.assertRaisesRegex(RuntimeError, 'reviewed definition changed or is missing:'):
+                    verify_inventory()
+
+    def test_new_bounds_module_rejects_an_unreviewed_top_level_statement(self) -> None:
+        original_parse = ast.parse
+
+        def parse_with_extra_statement(source, filename='<unknown>', *args, **kwargs):
+            tree = original_parse(source, filename, *args, **kwargs)
+            if str(filename).replace('\\', '/').endswith('/spherical_projection_bounds.py'):
+                tree.body.append(ast.Assign(
+                    targets=[ast.Name(id='UNREVIEWED_POLICY', ctx=ast.Store())],
+                    value=ast.Constant(value=True),
+                ))
+            return tree
+
+        with mock.patch.object(inventory.ast, 'parse', side_effect=parse_with_extra_statement):
+            with self.assertRaisesRegex(RuntimeError, 'complete-module statement coverage differs: spherical_projection_bounds'):
+                verify_inventory()
+
     def test_patch_review_keeps_the_prior_release_authenticated(self) -> None:
         manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
         prior = inventory.reviewed_v21_contract(manifest)

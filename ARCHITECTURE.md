@@ -1,6 +1,6 @@
 # XTA architecture
 
-`GPT-6-Astra-Ultra_v21.0.1_SLURM.py` is the sole versioned launcher. It, the
+`GPT-6-Astra-Ultra_v21.0.2_SLURM.py` is the sole versioned launcher. It, the
 installed `xta` console script, and `python -m XTA` all dispatch
 through `XTA.cli.run()`.
 The implementation lives in the importable `XTA` package so spawned processes
@@ -141,6 +141,68 @@ exact timing cause is not established without device/RSS traces. No local
 performance claim is made. The failed command includes 145,440 additional Spherical
 frames (300,805 total), so its runtime cannot be predicted from the smaller
 cylindrical workload alone.
+
+### Spherical projection and inference overhead (v21.0.2)
+
+Job 142754 qualified v21.0.1 on the cluster: 300,805 frames, 181 NRRD outputs,
+no OOM, and 1,536.9 seconds walltime. Retained native canvases stayed within
+255.7 GiB. All 110 nonempty Spherical projections finished through compact CUDA,
+but the first four spent 282–317 seconds including CPU progress and GPU admission.
+The remaining Radial inference backlog prevented those projections from borrowing
+a GPU even when the completed-canvas window filled.
+
+When completed canvases reach 75% of the configured total dense window, a live
+Spherical projector may now request one worker GPU for retirement while other
+inference remains admissible. That worker finishes its queued inference before
+the exclusive projection lease begins; the other workers continue inference.
+Requests expire after 30 seconds and are cancelled on CPU completion. Failed
+admission imposes a ten-second reservation cooldown, and asset-retirement and
+auxiliary ownership fences remain authoritative. CPU progress checks GPU admission
+after eight published slices or one second, whichever occurs first. No GPU is
+reserved without projector demand. `YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT=0`
+restores the v21.0.1 priority policy.
+
+The Spherical CUDA projector now computes conservative source-grid bounds from
+the rotated closed cube-face cone and contributing radius interval. Axes, edge
+stationary points and cone corners give its directional extrema; supplied
+nonempty-shell metadata can further narrow the interval using nearest-shell
+midpoints. Outward rounding preserves incident faces, radius ties and restored
+voxel centers. The original scalar/CUDA categorical tests still determine every
+foreground byte. Active blocks retain full-size zero-filled output buffers but
+launch QSC only inside those bounds. Proven empty compact slabs publish ordered
+empty records without a GPU launch or crop-metadata transfer.
+
+For the 142754 geometry, all 120 trajectories without foreground metadata require
+457,443,353,472 candidate coordinate visits instead of 2,145,590,021,760 (21.32%).
+This is a geometric work count, not a measured speedup; zero filling, active-block
+crop scans, transfer and inference costs remain. The CPU scalar oracle is unchanged.
+
+Cached native directions retain the same float64 QSC arithmetic in bounded
+64-row host strips. A cache entry now assembles its final host arrays within the
+existing 256 MiB entry budget and uploads the direction and validity arrays once
+each. At 3072 square this replaces 96 small host-to-device copies and their
+intermediate device copies with two uploads. Oversized entries and host allocation
+failures retain the bounded strip path. Logs report cache misses, construction,
+uploads and fallbacks; worker results also include warm-hit counters.
+
+Generic direct inference uses the existing packed/tiled FP16 mask-union kernels
+when their established layout guard allows it. Scalar and FP32 behavior remain
+available; optional workspace OOM disables further tiled allocation probes for
+that task. `YOLO_TTA_DIRECT_TILED_PROTO_UNION=0` selects the scalar path. Logs report
+the selected kernel and any fallback per task. Interpolation, thresholding,
+full-resolution hole filling and the Spherical TensorRT-ring exclusion are
+unchanged. The ring's different proto-morphology policy is not silently applied
+to Spherical masks.
+
+Qualification includes 4,176 CPU bounds cases, an independent 27,720-direction
+cone review, 432 existing CUDA projection cases, and 162 additional CUDA ROI cases
+with dense/raw/packed parity. Real-model split-parent inference preserves all 63
+v21.0.1 NRRD masks and spatial headers. Matched FP16 real-model runs exercise 632
+tiled versus 632 scalar frames with no fallbacks and identical 63-layer outputs.
+The uncropped 4.5 GiB source-address qualification also passes dense/raw/packed
+checks after ROI pruning; all foreground lies beyond the 32-bit address boundary.
+These local GPU runs are functional checks. Cluster TensorRT timing and overall
+walltime improvements remain to be measured; the 142754 result is the baseline.
 
 ## Cylindrical view family (v20)
 
@@ -1080,7 +1142,7 @@ one-versus-four-device scheduling and final bytes are covered by deterministic s
 representative H100 execution remains a hardware qualification step:
 
 ```bash
-python -u GPT-6-Astra-Ultra_v21.0.1_SLURM.py \
+python -u GPT-6-Astra-Ultra_v21.0.2_SLURM.py \
   --mode lta \
   --input <target-video> \
   --exemplar <aligned-image-yolo-directory> \

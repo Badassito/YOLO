@@ -27,6 +27,7 @@ REVIEWED_V21_SHA256 = '47204e5024f23a6e8db72c215fd0dadf9e46a5bfa49aef50056add8ff
 # earlier release records. Every changed definition and top-level binding is
 # independently checked against this authenticated appendix.
 REVIEWED_V21_0_1_SHA256 = '63b96f6742d72dc7f79b9b7cd130eee93a6e9530249e40bf0c3f697c2389fc6a'
+REVIEWED_V21_0_2_SHA256 = 'f33ab49e331d8d175194c8d70919e7e398a399f39e1503c891b969c260d60a35'
 
 # These definitions have reviewed, intentional implementation changes.
 INTENTIONALLY_CHANGED = {
@@ -1162,14 +1163,18 @@ def reviewed_v21_contract(manifest: dict[str, object]) -> dict[str, object]:
     return review
 
 
-def reviewed_v21_patch_contract(manifest: dict[str, object], v21: dict[str, object]) -> dict[str, object]:
+def _reviewed_v21_patch_contract(
+    manifest: dict[str, object], v21: dict[str, object], *, key: str,
+    release: str, expected_digest: str, previous_digest: str,
+    earlier_patches: tuple[dict[str, object], ...] = (),
+) -> dict[str, object]:
     """Authenticate patch additions and check every available predecessor pin."""
-    review = manifest.get('v21_0_1_review', {})
+    review = manifest.get(key, {})
     encoded = json.dumps(review, sort_keys=True, separators=(',', ':')).encode('utf-8')
-    if hashlib.sha256(encoded).hexdigest() != REVIEWED_V21_0_1_SHA256:
-        raise RuntimeError('v21.0.1 review digest mismatch; require explicit review of changed contracts')
-    if review.get('release') != '21.0.1' or review.get('previous_review_sha256') != REVIEWED_V21_SHA256:
-        raise RuntimeError('v21.0.1 review has an unexpected release or predecessor identity')
+    if hashlib.sha256(encoded).hexdigest() != expected_digest:
+        raise RuntimeError(f'v{release} review digest mismatch; require explicit review of changed contracts')
+    if review.get('release') != release or review.get('previous_review_sha256') != previous_digest:
+        raise RuntimeError(f'v{release} review has an unexpected release or predecessor identity')
     historical_definitions = {
         key: record[0] for key, record in REVIEWED_V20_ADDED_DEFINITIONS.items()
     }
@@ -1187,24 +1192,48 @@ def reviewed_v21_patch_contract(manifest: dict[str, object], v21: dict[str, obje
     historical_statements = {
         (item['module'], item['label']): item['sha256'] for item in v21['statements']
     }
+    for earlier in earlier_patches:
+        historical_definitions.update({
+            (item['module'], item['name']): item['sha256'] for item in earlier['definitions']
+        })
+        historical_statements.update({
+            (item['module'], item['label']): item['sha256'] for item in earlier['statements']
+        })
     for category, identity, historical in (
         ('definitions', 'name', historical_definitions),
         ('statements', 'label', historical_statements),
     ):
         keys = [(item['module'], item[identity]) for item in review[category]]
         if len(keys) != len(set(keys)) or any(not item.get('reason') for item in review[category]):
-            raise RuntimeError(f'v21.0.1 review has duplicate or unexplained {category}')
+            raise RuntimeError(f'v{release} review has duplicate or unexplained {category}')
         for item in review[category]:
             key = (item['module'], item[identity])
             if key in historical and item.get('previous_sha256') != historical[key]:
-                raise RuntimeError(f'v21.0.1 supersession does not match its historical pin: {key[0]}.{key[1]}')
+                raise RuntimeError(f'v{release} supersession does not match its historical pin: {key[0]}.{key[1]}')
             for field in ('sha256', 'previous_sha256'):
                 value = item.get(field)
                 if field == 'previous_sha256' and value is None:
                     continue
                 if not isinstance(value, str) or len(value) != 64 or any(char not in '0123456789abcdef' for char in value):
-                    raise RuntimeError(f'v21.0.1 review has an invalid {field}: {key[0]}.{key[1]}')
+                    raise RuntimeError(f'v{release} review has an invalid {field}: {key[0]}.{key[1]}')
     return review
+
+
+def reviewed_v21_patch_contract(manifest: dict[str, object], v21: dict[str, object]) -> dict[str, object]:
+    return _reviewed_v21_patch_contract(
+        manifest, v21, key='v21_0_1_review', release='21.0.1',
+        expected_digest=REVIEWED_V21_0_1_SHA256, previous_digest=REVIEWED_V21_SHA256,
+    )
+
+
+def reviewed_v21_0_2_contract(
+    manifest: dict[str, object], v21: dict[str, object], patch: dict[str, object],
+) -> dict[str, object]:
+    return _reviewed_v21_patch_contract(
+        manifest, v21, key='v21_0_2_review', release='21.0.2',
+        expected_digest=REVIEWED_V21_0_2_SHA256, previous_digest=REVIEWED_V21_0_1_SHA256,
+        earlier_patches=(patch,),
+    )
 
 
 def main() -> None:
@@ -1217,7 +1246,10 @@ def main() -> None:
     rename_replacements = azimuthal_rename_replacements(manifest)
     v21 = reviewed_v21_contract(manifest)
     patch = reviewed_v21_patch_contract(manifest, v21)
-    patch_definitions = {(item['module'], item['name']): item for item in patch['definitions']}
+    patches = (patch, reviewed_v21_0_2_contract(manifest, v21, patch))
+    patch_definitions = {
+        (item['module'], item['name']): item for review in patches for item in review['definitions']
+    }
     v21_definitions = {(item['module'], item['name']): item for item in v21['definitions']}
     v21_seams = {
         (item['module'], item['name']): (item['definition_sha256'], item['seam_sha256'])
@@ -1225,12 +1257,14 @@ def main() -> None:
     }
 
     def patched_definition_hash(module: str, name: str, previous_hash: str) -> str:
-        record = patch_definitions.get((module, name))
-        if record is None:
-            return previous_hash
-        if record['previous_sha256'] != previous_hash:
-            raise RuntimeError(f'v21.0.1 supersession does not match its historical pin: {module}.{name}')
-        return str(record['sha256'])
+        for review in patches:
+            record = next((item for item in review['definitions']
+                           if (item['module'], item['name']) == (module, name)), None)
+            if record is not None:
+                if record['previous_sha256'] != previous_hash:
+                    raise RuntimeError(f'v{review["release"]} supersession does not match its historical pin: {module}.{name}')
+                previous_hash = str(record['sha256'])
+        return previous_hash
 
     def reviewed_definition_hash(module: str, name: str, previous_hash: str) -> str:
         record = v21_definitions.get((module, name))
@@ -1251,7 +1285,7 @@ def main() -> None:
         | {item['module'] for item in v21['definitions']}
         | {item['module'] for item in v21['statements']}
         | {item['module'] for item in v21['preserved_radial_modules']}
-        | {item['module'] for item in patch['definitions'] + patch['statements']}
+        | {item['module'] for review in patches for item in review['definitions'] + review['statements']}
     )
     for module in audited_modules:
         module_path = PACKAGE / f"{module}.py"
@@ -1278,16 +1312,20 @@ def main() -> None:
     for (module, name), record in patch_definitions.items():
         matches = [node for node in top_level[module] if getattr(node, 'name', None) == name]
         if len(matches) != 1 or digest(matches[0]) != record['sha256']:
-            raise RuntimeError(f'v21.0.1 reviewed definition changed or is missing: {module}.{name}')
-    replaced_statements = {(item['module'], item['previous_sha256']) for item in patch['statements']}
-    effective_statements = [
-        item for item in v21['statements'] if (item['module'], item['sha256']) not in replaced_statements
-    ] + patch['statements']
+            raise RuntimeError(f'v21 patch reviewed definition changed or is missing: {module}.{name}')
+    effective_statements = list(v21['statements'])
+    for review in patches:
+        replaced_statements = {(item['module'], item['previous_sha256']) for item in review['statements']}
+        effective_statements = [
+            item for item in effective_statements if (item['module'], item['sha256']) not in replaced_statements
+        ] + review['statements']
     for item in effective_statements:
         if available[item['module']][item['sha256']] != 1:
             raise RuntimeError(f'v21 reviewed statement changed or is missing: {item["module"]}.{item["label"]}')
     effective_definitions = {**v21_definitions, **patch_definitions}
-    for module in v21['complete_modules']:
+    complete_modules = set(v21['complete_modules'])
+    complete_modules.update(module for review in patches for module in review.get('complete_modules', ()))
+    for module in complete_modules:
         expected = Counter(item['sha256'] for item in list(effective_definitions.values()) + effective_statements if item['module'] == module)
         if available[module] != expected:
             raise RuntimeError(f'v21 complete-module statement coverage differs: {module}')
@@ -1486,6 +1524,14 @@ def main() -> None:
             continue
         destination = INTENTIONALLY_RELOCATED.get((module, statement_hash), module)
         expected_hash = rename_replacements.get(inventory_key, statement_hash)
+        if (destination, name) in patch_definitions:
+            expected_hash = reviewed_definition_hash(destination, name, expected_hash)
+            if available[destination][expected_hash] < 1:
+                missing.append(item)
+                continue
+            available[destination][expected_hash] -= 1
+            changed += 1
+            continue
         if available[destination][expected_hash] < 1:
             missing.append(item)
             continue

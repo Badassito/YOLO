@@ -80,6 +80,7 @@ class TtaSchedulerOperations:
     tile_dense_worker_result_warn_seconds: Callable[[], float]
     view_processing_volume_shape: Callable[..., Sequence[int]]
     workspace_anon_cap_bytes: Callable[[], int]
+    _set_main_process_gpu_spherical_retirement_pressure: Optional[Callable[[bool], object]] = None
 
 
 @dataclass(frozen=True)
@@ -1905,6 +1906,16 @@ class TtaScheduler:
                 admissible = True
                 break
         self.operations._set_main_process_gpu_pending_inference(bool(admissible))
+        publish_pressure = self.operations._set_main_process_gpu_spherical_retirement_pressure
+        if publish_pressure is not None:
+            # Only completed parents can be retired. A live Spherical projector
+            # supplies demand before the coordinator drains one worker queue.
+            retained = sum(int(value) for value in self.state.direct_union_postprocess_bytes.values())
+            limit = int(self.inputs.direct_union_total_dense_byte_limit)
+            active = bool(self.inputs.direct_union_sparse_retirement_active
+                          and retained > 0 and limit > 0 and retained * 4 >= limit * 3)
+            publish_pressure(active)
+            self.operations.runtime_telemetry().gauge('inference.spherical_retirement_pressure', active)
 
     def gpu_worker_inflight(self, worker_id: int) -> int:
         worker = int(worker_id)
@@ -2061,9 +2072,13 @@ class TtaScheduler:
             if self.state.gpu_worker_pending_task_ids:
                 raise RuntimeError('New inference was queued after GPU inference-asset release began')
             self.operations._set_main_process_gpu_pending_inference(False)
+            if self.operations._set_main_process_gpu_spherical_retirement_pressure is not None:
+                self.operations._set_main_process_gpu_spherical_retirement_pressure(False)
             return
         if not worker_ids:
             self.operations._set_main_process_gpu_pending_inference(False)
+            if self.operations._set_main_process_gpu_spherical_retirement_pressure is not None:
+                self.operations._set_main_process_gpu_spherical_retirement_pressure(False)
             return
         self.publish_gpu_worker_admissible_backlog()
         per_gpu = (

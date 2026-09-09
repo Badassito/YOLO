@@ -72,23 +72,27 @@ class SphericalCudaProjectionTests(unittest.TestCase):
         self.assertGreater(int(expected[0].sum()),0)
         root=Path(os.environ['XTA_SPHERICAL_TEST_ROOT']).resolve(strict=True)
         with tempfile.TemporaryDirectory(prefix='spherical-promote-',dir=root) as folder:
-            for packed in (False,True):
+            for packed, pressure in ((False, False), (True, False), (False, True), (True, True)):
                 coordinator=bp._MainProcessGpuStageCoordinator()
                 coordinator.configure_workers([0])
                 coordinator.set_inference_priority_active(True)
                 coordinator.set_pending_inference_backlog(True)
+                coordinator.set_spherical_retirement_pressure(pressure)
                 coordinator.begin_inference(0)
-                writer=IncrementalRawBBoxMaskStoreWriter(shape=shape,store_dir=Path(folder)/str(packed),
+                writer=IncrementalRawBBoxMaskStoreWriter(shape=shape,store_dir=Path(folder)/f'{packed}_{pressure}',
                     format_name=INTERNAL_PACKED_CVOL_FORMAT if packed else CVOL_FORMAT,desc='real promotion')
                 consume=writer.consume
                 encoded=writer.consume_encoded_block
                 cpu_starts=[]
                 gpu_starts=[]
                 def cpu(first,block):
+                    if pressure:
+                        self.assertFalse(coordinator.can_dispatch_inference(0))
                     cpu_starts.append(first)
                     consume(first,block)
                     coordinator.finish_inference(0)
-                    coordinator.set_pending_inference_backlog(False)
+                    if not pressure:
+                        coordinator.set_pending_inference_backlog(False)
                 def gpu(first,records,payload,**kwargs):
                     self.assertTrue(coordinator.snapshot()['stage_leases'])
                     gpu_starts.append(first)
@@ -105,6 +109,8 @@ class SphericalCudaProjectionTests(unittest.TestCase):
                     self.assertEqual(gpu_starts,[1])
                     self.assertTrue(coordinator.snapshot()['inference_priority_active'])
                     self.assertFalse(coordinator.snapshot()['stage_leases'])
+                    self.assertEqual(coordinator.snapshot()['pending_inference_backlog'], pressure)
+                    self.assertIsNone(coordinator.snapshot()['spherical_retirement_reserved_device'])
                     writer.finalize()
                     with contextlib.closing(RawBBoxMaskStore.open(writer.store_dir)) as store:
                         np.testing.assert_array_equal(np.stack([store.decode_slice(z) for z in range(shape[0])]),expected)
