@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple
 import numpy as np
 
 from .qsc import qsc_forward_face
+from .spherical_projection_bounds import spherical_output_bounds
 from .spherical_projection_cuda import SphericalCudaProjectionUnsafeFailure
 from .runtime import allocate_workspace_array, close_memmap_array_without_flush, runtime_telemetry
 from .workspace import _cpu_count
@@ -200,14 +201,28 @@ def _pull_spherical_chunk(source, view, radii, rotation, output_shape, z, first,
     return result
 
 
-def _project_spherical_block(source, view, radii, rotation, shape, first_z, count, bboxes=None):
-    block = np.empty((count, shape[1], shape[2]), dtype=np.uint8)
-    for local_z in range(count):
+def _project_spherical_block(source, view, radii, rotation, shape, first_z, count, bboxes=None,
+                             output_bounds=None):
+    # Keep the unbounded path as the independent full-plane reference used by
+    # CUDA qualification. Production CPU work can skip analytic Z/Y bands, but
+    # retains contiguous full-width strips: one NumPy call per cropped row
+    # would replace bounded vector work with thousands of tiny QSC calls.
+    if output_bounds is None:
+        block = np.empty((count, shape[1], shape[2]), dtype=np.uint8)
+        z0, z1, first_pixel, stop_pixel = first_z, first_z + count, 0, shape[1] * shape[2]
+    else:
+        block = np.zeros((count, shape[1], shape[2]), dtype=np.uint8)
+        z0, z1, y0, y1, x0, x1 = output_bounds.block(first_z, count)
+        if z0 == z1 or y0 == y1 or x0 == x1:
+            return block
+        first_pixel, stop_pixel = y0 * shape[2], y1 * shape[2]
+    for z in range(z0, z1):
+        local_z = z - first_z
         plane = block[local_z].reshape(-1)
-        for first in range(0, plane.size, _PULL_CHUNK_VOXELS):
-            stop = min(plane.size, first + _PULL_CHUNK_VOXELS)
+        for first in range(first_pixel, stop_pixel, _PULL_CHUNK_VOXELS):
+            stop = min(stop_pixel, first + _PULL_CHUNK_VOXELS)
             plane[first:stop] = _pull_spherical_chunk(
-                source, view, radii, rotation, shape, first_z + local_z, first, stop, bboxes,
+                source, view, radii, rotation, shape, z, first, stop, bboxes,
             )
     return block
 
@@ -332,6 +347,7 @@ def backproject_spherical_volume_to_volume(
     radii, rotation, shape, bboxes = _validate_spherical_projection(
         source, spherical_view, out_shape_tyx, known_slice_bboxes,
     )
+    cpu_bounds = spherical_output_bounds(spherical_view, shape, bboxes)
     if sink_only and projection_block_callback is None:
         raise ValueError('Spherical sink-only projection requires a block consumer')
     stage = None
@@ -363,7 +379,9 @@ def backproject_spherical_volume_to_volume(
             )
 
         def project(first, count):
-            return _project_spherical_block(source, spherical_view, radii, rotation, shape, first, count, bboxes)
+            return _project_spherical_block(
+                source, spherical_view, radii, rotation, shape, first, count, bboxes, cpu_bounds,
+            )
 
         next_z = cpu_slices = cuda_slices = 0
         recheck_at = max(1, int(_CUDA_RECHECK_SLICES))

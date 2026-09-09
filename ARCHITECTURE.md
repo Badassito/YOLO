@@ -1,6 +1,6 @@
 # XTA architecture
 
-`GPT-6-Astra-Ultra_v21.0.3_SLURM.py` is the sole versioned launcher. It, the
+`GPT-6-Astra-Ultra_v21.0.4_SLURM.py` is the sole versioned launcher. It, the
 installed `xta` console script, and `python -m XTA` all dispatch
 through `XTA.cli.run()`.
 The implementation lives in the importable `XTA` package so spawned processes
@@ -88,7 +88,9 @@ Functional CUDA checks cover native rendering, native-T restoration, direct
 backprojection over hundreds of geometry cases, compact CVOL publication, and
 uncropped source addresses beyond 4 GiB. `tools/qualify_spherical_large_address.py`
 records the latter without benchmarking. Generated v21 evidence and release
-artifacts live under `Scratch/Experiments/Spherical`, outside the repository.
+artifacts from v21.0.0 through v21.0.3 are preserved in
+`Scratch/Experiments/XTA_Experiment_Evidence_2026-09/Spherical_v21.0.3_evidence.zip`.
+Historical paths inside those reports refer to the archived `Spherical/` tree.
 
 ### Spherical memory admission and retirement (v21.0.1)
 
@@ -250,7 +252,53 @@ Validation covers actual corruption at all four GPU plane corners, complete
 3064-by-3022 output planes against the unchanged CPU oracle, both compact codecs,
 and uncropped addresses beyond 4 GiB. All 63 real-model NRRD masks and spatial
 headers match the v21.0.2 fixture exactly after the scheduling/preflight changes.
-Cluster timing of v21.0.3 remains unqualified until a new run is available.
+Cluster job 142771 subsequently qualified v21.0.3: 300,805 frames and 181 NRRD
+writes completed in 1,440.0 seconds, 62.0 seconds faster than 142765. All 120
+Spherical canvases retired, all 110 nonempty projections completed through CUDA,
+and no OOM or unsafe CUDA failure was logged. FP32 engine output bindings explain
+the correct scalar compaction selection. The unchanged retained voxel count
+supports consistency but is not independent bytewise verification of all cluster
+masks. `Scratch/Experiments/Optimization_Experiments.md` records that analysis.
+
+### Spherical CPU geometry and FP32 direct union (v21.0.4)
+
+QSC calls with a scalar face now select the signed basis components directly,
+instead of expanding nine float64 basis values per sample and multiplying by
+zero entries. Lower-rank face arrays also retain compact broadcast bases.
+The operation order of the nonzero terms and positive-zero convention are
+preserved; automatic face selection is unchanged. Native render engines retain
+at most 32 validated immutable rotation tuples, clearing them at the existing
+direction-cache retirement boundary. This avoids repeated determinant checks
+without retaining more direction arrays or increasing the 256 MiB device cache.
+
+The CPU Spherical projector now applies the same conservative analytic bounds
+already qualified for CUDA. It skips disjoint Z/Y bands and empty-shell ranges,
+while returning every requested full-size block in order. Contiguous full-width
+strips preserve the original scalar pull arithmetic; X pruning is deliberately
+left to CUDA. The unbounded CPU block and chunk functions remain independent
+references for mathematical validation. GPU promotion still settles unread CPU
+futures and resumes at the first unpublished slice.
+
+Generic direct inference now supports a packed FP32 union for matching FP32
+head/prototype tensors with 32 prototype channels and qualified raster layouts.
+It packs boxes and coefficients once, and loads a pixel's 32 prototype values
+only when a detection first covers that pixel, then reuses them in registers.
+Scalar crop predicates, channel accumulation, confidence handling and output
+precision are retained. FP16 kernels and the TensorRT ring's separate morphology
+policy are unchanged. Optional FP32 workspace is 148 bytes per anchor, about
+27.64 MiB for the observed 195,840-anchor cluster layout. Allocation failure
+retains the existing per-source scalar fallback. Diagnostics identify
+`tiled_f32`; `YOLO_TTA_DIRECT_TILED_PROTO_UNION=0` selects scalar direct union.
+
+Local measurements on the RTX 4090 Laptop host found about 1.5x faster native
+QSC direction construction with roughly 18 MiB less traced allocation per
+64-by-3072 strip. CPU projection of sampled production-sized planes was 2.55x
+faster, with exact output parity across 1.667 billion checked voxels. Heatsoaked
+768-square FP32 union tests with 32/128/512 detections improved 1.14–1.85x for
+bounded boxes and 2.40–2.57x for full-image boxes. Empty or very small sparse
+cases incur up to about seven microseconds of additional packing/launch cost.
+These are component measurements, not an H100 pipeline speedup claim. Evidence
+and reproducible commands live in `Scratch/2026-09-09-spherical-optimization`.
 
 ## Cylindrical view family (v20)
 

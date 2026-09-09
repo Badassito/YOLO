@@ -31,6 +31,32 @@ def inspect_seams(source: str):
 
 
 class PackageInventoryTests(unittest.TestCase):
+    def test_fourth_patch_authenticates_geometry_projection_and_compaction(self) -> None:
+        for target in ('qsc_inverse', '_project_spherical_block', '_resident_mask_kernels'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            record = next(item for item in manifest['v21_0_4_review']['definitions'] if item['name'] == target)
+            record['sha256'] = '0' * 64
+            with self.subTest(target=target), self.assertRaisesRegex(RuntimeError, 'v21.0.4 review digest mismatch'):
+                inventory.reviewed_v21_0_4_contract(
+                    manifest, manifest['v21_review'], manifest['v21_0_1_review'],
+                    manifest['v21_0_2_review'], manifest['v21_0_3_review'],
+                )
+
+    def test_fourth_patch_cannot_skip_the_latest_diagnostic_revision(self) -> None:
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        fourth = manifest['v21_0_4_review']
+        record = next(item for item in fourth['definitions'] if item['name'] == '_announce_direct_compaction_layout')
+        record['previous_sha256'] = '0' * 64
+        reauthenticated = hashlib.sha256(json.dumps(
+            fourth, sort_keys=True, separators=(',', ':'),
+        ).encode('utf-8')).hexdigest()
+        with mock.patch.object(inventory, 'REVIEWED_V21_0_4_SHA256', reauthenticated):
+            with self.assertRaisesRegex(RuntimeError, 'v21.0.4 supersession does not match its historical pin'):
+                inventory.reviewed_v21_0_4_contract(
+                    manifest, manifest['v21_review'], manifest['v21_0_1_review'],
+                    manifest['v21_0_2_review'], manifest['v21_0_3_review'],
+                )
+
     def test_third_patch_cannot_skip_the_latest_coordinator_revision(self) -> None:
         manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
         prior = inventory.reviewed_v21_contract(manifest)

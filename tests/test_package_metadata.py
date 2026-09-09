@@ -8,9 +8,9 @@ from XTA import cli, config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRENT_VERSION = "21.0.3"
-CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v21.0.3_SLURM.py"
-PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v21.0.2_SLURM.py"
+CURRENT_VERSION = "21.0.4"
+CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v21.0.4_SLURM.py"
+PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v21.0.3_SLURM.py"
 
 
 def _toml_section(source: str, name: str) -> str:
@@ -25,7 +25,7 @@ class PackageMetadataTests(unittest.TestCase):
     def test_runtime_version_constants_are_aligned(self) -> None:
         self.assertEqual(XTA.__version__, CURRENT_VERSION)
         self.assertEqual(config.SCRIPT_VERSION, CURRENT_VERSION)
-        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2103")
+        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2104")
         self.assertEqual(config.SCRIPT_BASENAME, CURRENT_LAUNCHER)
         self.assertEqual(cli.SCRIPT_VERSION, CURRENT_VERSION)
         self.assertEqual(cli.SCRIPT_BASENAME, CURRENT_LAUNCHER)

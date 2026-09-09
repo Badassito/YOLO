@@ -10584,5 +10584,154 @@
     "complete_modules": [
       "spherical_preflight"
     ]
+  },
+  "v21_0_4_review": {
+    "release": "21.0.4",
+    "previous_review_sha256": "9d09663dab895ff2c9da78175b5e5acbf6a6bd96adfcff66a441a2c97ea90eeb",
+    "source_git_commit": "38805a96465428dd2d9cc030d293666af0b8e714",
+    "definitions": [
+      {
+        "module": "config",
+        "previous_sha256": "3275a114f2bea438bac7200c39da7fa04fa84b238d6ba5bec9b99b91dddc607e",
+        "sha256": "ac512c393e0d2735f88e03afbef57f0847363f5023a4c8f6cd34db14823d0395",
+        "name": "build_argparser",
+        "reason": "Clarify minimum-radius units as working-volume voxels; no argument behavior change."
+      },
+      {
+        "module": "inference",
+        "previous_sha256": "1e909b9e4f7883be9a6a41e029878b45d9e50e6cbf054fd2a7ec86ab889197f1",
+        "sha256": "652c11fa166cdb7712f45be99666f46f1e12f41770f916a3f84738d6fc60abb8",
+        "name": "_announce_direct_compaction_layout",
+        "reason": "Report matching FP16/FP32 packed-layout eligibility without tensor retention or device-content reads."
+      },
+      {
+        "module": "inference",
+        "previous_sha256": "5f4299c8d648ab7a568d56fd1ef372e2e6f5e79994589c26d419c794f094cccc",
+        "sha256": "a3bc408a197da8dcef1573351d254fbb9a67a8703988e1cacaf127b41d2b531a",
+        "name": "_build_direct_device_compacted_payload",
+        "reason": "Dispatch qualified FP32 packed union with bounded optional workspace, payload-owned buffers and existing OOM fallback."
+      },
+      {
+        "module": "inference",
+        "previous_sha256": "44c9396c3fcf04bc68b4daf1299306cbf70309b9475e05a6a2dc39a7f43cecb1",
+        "sha256": "f5d32dd391acb2a3f05b7ab2b8d668e8ebb20466021d926f67dd86220d606f1d",
+        "name": "_direct_predict_stream",
+        "reason": "Count FP32 packed union separately, preserving source fallback and asynchronous ownership."
+      },
+      {
+        "module": "inference",
+        "previous_sha256": "e3f447689889c530b374c6b69001746ef4808cec42010cbaa55b15f6e7b2b7bf",
+        "sha256": "0e709fce7e81c432688f2feb3848510bd9876248a68b933bd5c14a728ce586f9",
+        "name": "_resident_mask_kernels",
+        "reason": "Pack FP32 coefficients and boxes once and cache covered pixel prototypes in registers, preserving scalar crop predicates and channel/FMA order; retain FP16/ring kernels."
+      },
+      {
+        "module": "inference",
+        "previous_sha256": null,
+        "sha256": "47541e988fd4a1f36756f8b5db42200ce82656597259a604c314875ed6887961",
+        "name": "_tiled_f32_proto_union_applicable",
+        "reason": "Admit qualified matching FP32 C32 layouts; retain scalar fallback for other layouts."
+      },
+      {
+        "module": "qsc",
+        "previous_sha256": "0db8d5701f2dbf722d72fb1b470677991b61815b57e130172d1b825dc1f3755e",
+        "sha256": "5f49836b8167346da0004770fe94fccb38f946d9827c00b8e21810834d0bfb2f",
+        "name": "qsc_forward_face",
+        "reason": "Avoid replicated face bases and zero-basis reductions using bitwise-equivalent scalar signed permutations; retain array-face broadcasting."
+      },
+      {
+        "module": "qsc",
+        "previous_sha256": "6eedf6c7fbf964be977f4d9ca031671cbb4aa9549fe6a5a551dff5e1fbfbf68b",
+        "sha256": "73917e5a521234d7ee3020f11ae0f3e0df3c134739d005f9aeedc2646f011ee7",
+        "name": "qsc_inverse",
+        "reason": "Avoid replicated face bases and zero-basis products using bitwise-equivalent scalar signed permutations with positive-zero preservation."
+      },
+      {
+        "module": "spherical_cuda",
+        "previous_sha256": "6fc4bab4921dc764e9ff6f6e2a315176434cad6d49564da926e675872c029f12",
+        "sha256": "cbf55f5fa8320ecfc205f0e4736fd16bd2baf000abb4eaf2b0f26ace0c17f92f",
+        "name": "_render_contract",
+        "reason": "Reuse bounded rotation validation while retaining per-frame source, radius, face and shape checks."
+      },
+      {
+        "module": "spherical_cuda",
+        "previous_sha256": null,
+        "sha256": "cbb228883409885732ae4ba7ba32594e8269f045f2f362d1d35918907386f8c4",
+        "name": "_validate_spherical_rotation",
+        "reason": "Cache at most 32 validated immutable rotation values per engine; reject changed/invalid values and retain no arrays."
+      },
+      {
+        "module": "spherical_cuda",
+        "previous_sha256": "f59973b7824d69c1bf4e7b8cf4c0ddc5ff98103d66faf9e219fdc8a307879599",
+        "sha256": "919ead9266ed075b950b6354ec2844f371b50caca38035b5d30597806e7370ca",
+        "name": "clear_spherical_render_cache",
+        "reason": "Retire bounded rotation validation records at the existing direction-cache owner boundary."
+      },
+      {
+        "module": "spherical_projection",
+        "previous_sha256": "719d1e5d89645b1fa68a46f39586214b9d3a9ff3956e359bdbb60389c28f1bf2",
+        "sha256": "782988dd9457d5d915396aefe7990185abfeaea3cc3c82768a0c04492f47a462",
+        "name": "_project_spherical_block",
+        "reason": "Skip conservative Z/Y bands optionally, preserving full requested zero blocks, global flattened indices and the unbounded oracle."
+      },
+      {
+        "module": "spherical_projection",
+        "previous_sha256": "b8978fedb0a1ac10a152f65a127131b366ce312a11d791d9f12257bef7efb670",
+        "sha256": "dfba80ca65ee709082f43d72d8f8355504e3ab24a1170bbbe8e23d231f0393a9",
+        "name": "backproject_spherical_volume_to_volume",
+        "reason": "Compute analytic CPU bounds once and pass them to CPU blocks without changing publication or GPU promotion."
+      }
+    ],
+    "statements": [
+      {
+        "module": "__init__",
+        "previous_sha256": "c441a56933819fc5a6f31bf8b8685f593fee45095a6d544bc657de25465b13a4",
+        "sha256": "199b4fc8d8484505b1da95b2199feeab46b228cc2b5f87103c4de7dee7b01442",
+        "label": "Assign:7",
+        "reason": "Align runtime and sole launcher identity with v21.0.4 while retaining prior releases."
+      },
+      {
+        "module": "cli",
+        "previous_sha256": "d95d6728f6265a4bd725229af48429162bee5cb2558f6e05a8f6c03de2fb7811",
+        "sha256": "528ed9b0b96a50b43cf42c47114a64d25d30f979c727f2870bf7c04038064827",
+        "label": "Assign:13",
+        "reason": "Align runtime and sole launcher identity with v21.0.4 while retaining prior releases."
+      },
+      {
+        "module": "cli",
+        "previous_sha256": "d2d303497acf02c1e86e3eda5c5fe686f9c4e3c245e955be51634cf343704976",
+        "sha256": "85f08eb249c7d5c8995cd3c112d7a7eae8dd1948cd9e96cd540d856d87be8d32",
+        "label": "Assign:14",
+        "reason": "Align runtime and sole launcher identity with v21.0.4 while retaining prior releases."
+      },
+      {
+        "module": "config",
+        "previous_sha256": "d95d6728f6265a4bd725229af48429162bee5cb2558f6e05a8f6c03de2fb7811",
+        "sha256": "528ed9b0b96a50b43cf42c47114a64d25d30f979c727f2870bf7c04038064827",
+        "label": "Assign:22",
+        "reason": "Align runtime and sole launcher identity with v21.0.4 while retaining prior releases."
+      },
+      {
+        "module": "config",
+        "previous_sha256": "6b0aa2563588ef8edb57d3b1d711ab5d6d623c48d4203ac790d02767afd4d061",
+        "sha256": "7a702e7224c8631e358a4ba932fbade9611ef18f341586d7eeef47a472ae98d0",
+        "label": "Assign:24",
+        "reason": "Align runtime and sole launcher identity with v21.0.4 while retaining prior releases."
+      },
+      {
+        "module": "spherical_cuda",
+        "previous_sha256": null,
+        "sha256": "b7cdee238d7b991f0e5a2f3d411b92c68664c66961520a082d4f9c693ba0c0ed",
+        "label": "binding__ROTATION_CACHE_ENTRIES",
+        "reason": "Bound the per-engine rotation validation cache to 32 records."
+      },
+      {
+        "module": "spherical_projection",
+        "previous_sha256": null,
+        "sha256": "8baa4aa5ce50520c890687cb78aff03b08b33fec308853cdf1178f665db0240b",
+        "label": "import_from .spherical_projection_bounds import spherical_output_bounds",
+        "reason": "Reuse qualified analytic bounds for CPU scheduling; retain scalar oracle."
+      }
+    ]
   }
 }

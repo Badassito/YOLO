@@ -2960,6 +2960,25 @@ def _tiled_f16_proto_union_applicable(
         return False
 
 
+def _tiled_f32_proto_union_applicable(
+    torch_mod: object,
+    head: object,
+    proto: object,
+) -> bool:
+    """Whether FP32 inputs match the qualified packed C32 proto-union layouts."""
+    try:
+        return bool(
+            head.dtype == torch_mod.float32
+            and proto.dtype == torch_mod.float32
+            and int(proto.shape[-3]) == 32
+            and int(proto.shape[-2]) > 0
+            and int(proto.shape[-1]) > 0
+            and int(proto.shape[-1]) % 2 == 0
+        )
+    except Exception:
+        return False
+
+
 def _resident_mask_kernels() -> Optional[object]:
     """Compile the small device compaction/proto-union kernels once with NVRTC.
 
@@ -3029,6 +3048,41 @@ def _resident_mask_kernels() -> Optional[object]:
             packed_boxes[dst * 4 + 3] =
                 (cy + 0.5f * bh) * ((float)ph / (float)ih);
             packed_confs[dst] = __half2float(head[4 * anchors + a]);
+            #pragma unroll 4
+            for (int c = 0; c < masks; ++c) {
+              packed_coeff[dst * masks + c] = head[(5 + c) * anchors + a];
+            }
+          }
+        }
+
+        // Keep FP32 coefficients in FP32. Packing computes each bbox once instead
+        // of repeating its head gathers and scale arithmetic at every proto pixel.
+        extern "C" __global__ void compact_f32_tiled(
+            const float* head, int anchors, float threshold, int* indices, int* count,
+            int bbox_h, int bbox_w, int* out_bbox,
+            int masks, int ph, int pw, int ih, int iw,
+            float* packed_coeff, float* packed_boxes, float* packed_confs) {
+          int a = blockDim.x * blockIdx.x + threadIdx.x;
+          if (a == 0 && out_bbox != nullptr) {
+            out_bbox[0] = bbox_h; out_bbox[1] = 0;
+            out_bbox[2] = bbox_w; out_bbox[3] = 0;
+          }
+          if (a < anchors && head[4 * anchors + a] >= threshold) {
+            int dst = atomicAdd(count, 1);
+            indices[dst] = a;
+            float cx = head[0 * anchors + a];
+            float cy = head[1 * anchors + a];
+            float bw = head[2 * anchors + a];
+            float bh = head[3 * anchors + a];
+            packed_boxes[dst * 4 + 0] =
+                (cx - 0.5f * bw) * ((float)pw / (float)iw);
+            packed_boxes[dst * 4 + 1] =
+                (cy - 0.5f * bh) * ((float)ph / (float)ih);
+            packed_boxes[dst * 4 + 2] =
+                (cx + 0.5f * bw) * ((float)pw / (float)iw);
+            packed_boxes[dst * 4 + 3] =
+                (cy + 0.5f * bh) * ((float)ph / (float)ih);
+            packed_confs[dst] = head[4 * anchors + a];
             #pragma unroll 4
             for (int c = 0; c < masks; ++c) {
               packed_coeff[dst * masks + c] = head[(5 + c) * anchors + a];
@@ -3198,6 +3252,53 @@ def _resident_mask_kernels() -> Optional[object]:
             max_logit[p1] = best1;
             if (conf_proto != nullptr) conf_proto[p1] = best_conf1;
           }
+        }
+
+        // Keep a pixel's prototype vector in registers after its first covered
+        // detection. Sparse boxes avoid that load entirely outside their union;
+        // overlapping boxes reuse it without changing the channel/FMA order.
+        extern "C" __global__ void union_f32_f32_tiled(
+            const float* proto, const float* packed_coeff,
+            const float* packed_boxes, const float* packed_confs,
+            const int* count, int masks, int ph, int pw,
+            float* max_logit, float* conf_proto) {
+          int ox = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+          int oy = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
+          if (ox >= pw || oy >= ph || masks != 32) return;
+          int pixels = ph * pw;
+          int p = oy * pw + ox;
+          int n = *count;
+          float best = -6.0f;
+          float best_conf = 0.0f;
+          float values[32];
+          bool loaded = false;
+          for (int d = 0; d < n; ++d) {
+            float x1 = packed_boxes[d * 4 + 0];
+            float y1 = packed_boxes[d * 4 + 1];
+            float x2 = packed_boxes[d * 4 + 2];
+            float y2 = packed_boxes[d * 4 + 3];
+            // Use the scalar rejection predicate even for nonfinite boxes.
+            if ((float)ox < x1 || (float)ox >= x2 ||
+                (float)oy < y1 || (float)oy >= y2) continue;
+            if (!loaded) {
+              #pragma unroll
+              for (int c = 0; c < 32; ++c) {
+                values[c] = proto[c * pixels + p];
+              }
+              loaded = true;
+            }
+            float logit = 0.0f;
+            #pragma unroll
+            for (int c = 0; c < 32; ++c) {
+              logit += packed_coeff[d * 32 + c] * values[c];
+            }
+            best = fmaxf(best, logit);
+            if (conf_proto != nullptr && logit > 0.0f) {
+              best_conf = fmaxf(best_conf, packed_confs[d]);
+            }
+          }
+          max_logit[p] = best;
+          if (conf_proto != nullptr) conf_proto[p] = best_conf;
         }
 
         extern "C" __global__ void proto_threshold_signed(
@@ -3378,9 +3479,9 @@ def _resident_mask_kernels() -> Optional[object]:
         }
         '''
         names = (
-            'compact_f32', 'compact_f16', 'compact_f16_tiled',
+            'compact_f32', 'compact_f16', 'compact_f16_tiled', 'compact_f32_tiled',
             'union_f32_f32', 'union_f32_f16', 'union_f16_f32', 'union_f16_f16',
-            'union_f16_f16_tiled',
+            'union_f16_f16_tiled', 'union_f32_f32_tiled',
             'proto_threshold_signed', 'proto_dilate_signed', 'proto_erode_signed',
             'upsample_quantize', 'upsample_quantize_affine',
         )
@@ -3515,10 +3616,9 @@ def _announce_direct_compaction_layout(torch_mod, head, proto, *, enabled, allow
         reasons.append('tiled_option_disabled')
     if not allow_tiled:
         reasons.append('tiled_disabled_after_workspace_failure')
-    if head.dtype != torch_mod.float16:
-        reasons.append('head_dtype_not_float16')
-    if proto.dtype != torch_mod.float16:
-        reasons.append('proto_dtype_not_float16')
+    supported_dtypes = (torch_mod.float16, getattr(torch_mod, 'float32', None))
+    if head.dtype != proto.dtype or head.dtype not in supported_dtypes:
+        reasons.append('head_proto_dtypes_not_matching_float16_or_float32')
     if proto_shape[-3] != 32:
         reasons.append('prototype_channels_not_32')
     if proto_shape[-2] <= 0 or proto_shape[-1] <= 0:
@@ -3599,16 +3699,20 @@ def _build_direct_device_compacted_payload(
         packed_refs = ()
         kernel_name = 'scalar'
         tiled_enabled = _env_flag('YOLO_TTA_DIRECT_TILED_PROTO_UNION', True)
+        tiled_tag = (
+            'f16' if _tiled_f16_proto_union_applicable(torch, head, proto)
+            else 'f32' if _tiled_f32_proto_union_applicable(torch, head, proto)
+            else None
+        )
         use_tiled = bool(
-            allow_tiled and tiled_enabled
-            and _tiled_f16_proto_union_applicable(torch, head, proto)
+            allow_tiled and tiled_enabled and tiled_tag is not None
         )
         if use_tiled:
             # Preserve every accepted detection: capacity is the bounded backend
             # anchor count, exactly as in the resident ring. Keep these owners with
             # the payload until its asynchronous producer/consumer work settles.
             try:
-                compact_coeff = torch.empty((anchors, masks), dtype=torch.float16, device=device)
+                compact_coeff = torch.empty((anchors, masks), dtype=head.dtype, device=device)
                 compact_boxes = torch.empty((anchors, 4), dtype=torch.float32, device=device)
                 compact_confs = torch.empty((anchors,), dtype=torch.float32, device=device)
             except torch.OutOfMemoryError:
@@ -3620,20 +3724,21 @@ def _build_direct_device_compacted_payload(
                                                (compact_coeff, compact_boxes, compact_confs))
                 packed_refs = (compact_coeff, compact_boxes, compact_confs, cp_coeff, cp_boxes, cp_confs)
         if use_tiled:
-            kernel_name = 'tiled_f16'
+            kernel_name = f'tiled_{tiled_tag}'
         _announce_direct_compaction_layout(
             torch, head, proto, enabled=tiled_enabled, allow_tiled=allow_tiled, kernel_name=kernel_name,
         )
         if use_tiled:
-            kernels.compact_f16_tiled(
+            tile_width = 64 if tiled_tag == 'f16' else 32
+            getattr(kernels, f'compact_{tiled_tag}_tiled')(
                 ((anchors + 255) // 256,), (256,),
                 (cp_head, np.int32(anchors), np.float32(confidence_threshold), cp_indices, cp_count,
                  np.int32(img_h), np.int32(img_w), np.uintp(0),
                  np.int32(masks), np.int32(ph), np.int32(pw), np.int32(img_h), np.int32(img_w),
                  cp_coeff, cp_boxes, cp_confs), stream=external,
             )
-            kernels.union_f16_f16_tiled(
-                ((pw + 63) // 64, (ph + 3) // 4), (32, 4),
+            getattr(kernels, f'union_{tiled_tag}_{tiled_tag}_tiled')(
+                ((pw + tile_width - 1) // tile_width, (ph + 3) // 4), (32, 4),
                 (cp_proto, cp_coeff, cp_boxes, cp_confs, cp_count,
                  np.int32(masks), np.int32(ph), np.int32(pw), cp_max_logit,
                  cp_conf_proto if cp_conf_proto is not None else np.uintp(0)), stream=external,
@@ -3715,7 +3820,7 @@ def _direct_predict_stream(
     conf_thres = float(cfg.conf)
     device_compaction_active = bool(direct_device_compaction_enabled())
     tiled_compaction_active = True
-    kernel_counts = {'tiled_f16': 0, 'scalar': 0, 'scalar_workspace_fallback': 0, 'synchronized': 0}
+    kernel_counts = {'tiled_f16': 0, 'tiled_f32': 0, 'scalar': 0, 'scalar_workspace_fallback': 0, 'synchronized': 0}
     failed_probes = 0
 
     global _DIRECT_PREDICT_ANNOUNCED, _DIRECT_DEVICE_COMPACTION_ANNOUNCED, _DIRECT_DEVICE_COMPACTION_FALLBACK_WARNED

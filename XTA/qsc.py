@@ -157,12 +157,22 @@ def qsc_forward_face(xyz, face) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     faces = _face_ids(face)
     shape = np.broadcast_shapes(vectors.shape[:-1], faces.shape)
     vectors = np.broadcast_to(vectors, shape + (3,))
-    basis = _BASES[np.broadcast_to(faces, shape)]
+    # Keep a scalar or lower-rank face basis compact. Its rows broadcast against
+    # the directions without materializing nine float64 values per sample.
+    basis = _BASES[faces]
     scale = np.max(np.abs(vectors), axis=-1)
     vectors = np.divide(vectors, scale[..., None], out=np.zeros_like(vectors), where=scale[..., None] != 0)
-    normal = np.sum(vectors * basis[..., 0, :], axis=-1)
-    right = np.sum(vectors * basis[..., 1, :], axis=-1)
-    up = np.sum(vectors * basis[..., 2, :], axis=-1)
+    if faces.ndim == 0:
+        # Each face basis is a signed permutation. Selecting its one nonzero
+        # component avoids three full vector products/reductions per point.
+        # Adding positive zero preserves the reduction's zero sign convention.
+        indices = np.argmax(np.abs(basis), axis=1)
+        normal, right, up = (vectors[..., index] * basis[row, index] + 0.
+                             for row, index in enumerate(indices))
+    else:
+        normal = np.sum(vectors * basis[..., 0, :], axis=-1)
+        right = np.sum(vectors * basis[..., 1, :], axis=-1)
+        up = np.sum(vectors * basis[..., 2, :], axis=-1)
     tolerance = 8.0 * np.finfo(np.float64).eps
     valid = ((normal > 0) & (normal + tolerance >= np.maximum(np.abs(right), np.abs(up))))
     norm = np.linalg.norm(vectors, axis=-1)
@@ -180,8 +190,9 @@ def qsc_inverse(face, u, v) -> np.ndarray:
     Face centers return their normals exactly; shared edge/corner coordinates
     retain exact component ties for deterministic subsequent ownership.
     """
-    faces, uu, vv = np.broadcast_arrays(
-        _face_ids(face),
+    face_ids = _face_ids(face)
+    _, uu, vv = np.broadcast_arrays(
+        face_ids,
         np.asarray(u, dtype=np.float64), np.asarray(v, dtype=np.float64),
     )
     if not np.all(np.isfinite(uu) & np.isfinite(vv)):
@@ -208,7 +219,17 @@ def qsc_inverse(face, u, v) -> np.ndarray:
     major = np.where(p == 1.0, normal, major)
     minor = np.where((p == 1.0) & diagonal, np.sign(ratio) * normal, minor)
     right, up = _unfold(area, major, minor)
-    basis = _BASES[faces]
+    # Face IDs frequently describe a whole patch. Gather before broadcasting so
+    # that a scalar face does not allocate a redundant (..., 3, 3) basis array.
+    basis = _BASES[face_ids]
+    if face_ids.ndim == 0:
+        # The basis has one +/-1 per column. Reordering signed components keeps
+        # the same float64 result without multiplying and summing zero entries.
+        # The original sums produce positive zero on axes and at face centers.
+        components = (normal, right, up)
+        indices = np.argmax(np.abs(basis), axis=0)
+        return np.stack(tuple(components[index] * basis[index, column]
+                              for column, index in enumerate(indices)), axis=-1) + 0.
     return (normal[..., None] * basis[..., 0, :]
             + right[..., None] * basis[..., 1, :]
             + up[..., None] * basis[..., 2, :])

@@ -19,9 +19,9 @@ GIB = 1024 ** 3
 
 NRRD_SPACE = "left-posterior-superior"
 
-SCRIPT_VERSION = '21.0.3'
+SCRIPT_VERSION = '21.0.4'
 
-SCRIPT_VERSION_COMPACT = '2103'
+SCRIPT_VERSION_COMPACT = '2104'
 
 SCRIPT_BASENAME = f'GPT-6-Astra-Ultra_v{SCRIPT_VERSION}_SLURM.py'
 
@@ -1031,7 +1031,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--radial_min_radius", default=None, type=parse_radial_min_radius,
         metavar="RADIUS|auto",
         help=(
-            "Smallest Radial shell radius in source voxels. Default auto is "
+            "Smallest Radial shell radius in working-volume voxels. Default auto is "
             "imgsz/(4*pi), giving two complete circumference wraps per patch. "
             "Sampling is dense from this radius outward; the central core is excluded"
         ),
@@ -1051,7 +1051,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--spherical_min_radius", default=None, type=parse_spherical_min_radius,
         metavar="RADIUS|auto",
         help=(
-            "Smallest Spherical shell radius in source voxels. Auto independently selects "
+            "Smallest Spherical shell radius in working-volume voxels. Auto independently selects "
             "imgsz/(4*pi), even when --radial_min_radius is explicit. Dense shells extend "
             "through (min(T,H,W)-1)/2; the central core is excluded"
         ),

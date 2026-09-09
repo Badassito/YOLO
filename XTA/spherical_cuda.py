@@ -18,6 +18,7 @@ from .qsc import qsc_inverse
 
 
 _DIRECTION_CACHE_BYTES = 256 * 1024**2
+_ROTATION_CACHE_ENTRIES = 32
 _ROW_BLOCK = 64
 _KERNELS = None
 _KERNEL_ERROR = ''
@@ -29,6 +30,9 @@ def clear_spherical_render_cache(engine):
     if cache is not None:
         cache.clear()
     engine._spherical_direction_cache_bytes = 0
+    rotations = getattr(engine, '_spherical_rotation_cache', None)
+    if rotations is not None:
+        rotations.clear()
 
 
 def _direction_cache_stats(engine):
@@ -47,6 +51,25 @@ def _direction_cache_stats(engine):
 def spherical_direction_cache_stats(engine):
     """Snapshot monotonic render counters for per-task deltas; retain no owners."""
     return dict(_direction_cache_stats(engine))
+
+
+def _validate_spherical_rotation(engine, rotation):
+    """Validate each immutable rotation value once in a bounded engine cache."""
+    cache = getattr(engine, '_spherical_rotation_cache', None)
+    if cache is None:
+        cache = engine._spherical_rotation_cache = OrderedDict()
+    if rotation in cache:
+        cache.move_to_end(rotation)
+        return
+    if len(rotation) != 9 or not np.isfinite(rotation).all():
+        raise ValueError('Spherical cube rotation must contain nine finite values')
+    matrix = np.asarray(rotation).reshape(3, 3)
+    if (not np.allclose(matrix @ matrix.T, np.eye(3), rtol=0, atol=1e-10)
+            or not math.isclose(float(np.linalg.det(matrix)), 1., abs_tol=1e-10)):
+        raise ValueError('Spherical cube rotation must be a proper rigid rotation')
+    if len(cache) >= _ROTATION_CACHE_ENTRIES:
+        cache.popitem(last=False)
+    cache[rotation] = None
 
 
 def _render_contract(engine, view, index):
@@ -71,12 +94,7 @@ def _render_contract(engine, view, index):
     if min(rows, columns, intervals) <= 0 or face not in range(6):
         raise ValueError('Invalid spherical face or native raster dimensions')
     rotation = tuple(float(value) for value in view.spherical_rotation_xyz)
-    if len(rotation) != 9 or not np.isfinite(rotation).all():
-        raise ValueError('Spherical cube rotation must contain nine finite values')
-    matrix = np.asarray(rotation).reshape(3, 3)
-    if (not np.allclose(matrix @ matrix.T, np.eye(3), rtol=0, atol=1e-10)
-            or not math.isclose(float(np.linalg.det(matrix)), 1., abs_tol=1e-10)):
-        raise ValueError('Spherical cube rotation must be a proper rigid rotation')
+    _validate_spherical_rotation(engine, rotation)
     key = (str(volume.device), face, intervals, rows, columns,
            int(view.spherical_u_origin), int(view.spherical_v_origin), rotation)
     return radius, shape, key
