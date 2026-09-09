@@ -9942,5 +9942,154 @@
         "reason": "Keep Radial source reconstruction and scalar CUDA/Torch native arithmetic unchanged."
       }
     ]
+  },
+  "v21_0_1_review": {
+    "release": "21.0.1",
+    "previous_review_sha256": "47204e5024f23a6e8db72c215fd0dadf9e46a5bfa49aef50056add8ffbfc15e9",
+    "source_git_commit": "ef604986cc7c5de18fd4aa691eabf1e43471b8d4",
+    "definitions": [
+      {
+        "module": "backprojection",
+        "name": "_MainProcessGpuStageCoordinator",
+        "previous_sha256": "23fa56e1fd2a097ca0c63f851e67aafb964dcfa5a8baa01bc578b13e5b2f78de",
+        "sha256": "c8052c7f9f31bd9215b9630afe3fb1b12c29cc94e69a67f00ddf19cb249b8f23",
+        "reason": "Allow completed Spherical views to retire on idle GPUs only without admissible inference, preserving exclusive leases and terminal asset fences under overlap overrides."
+      },
+      {
+        "module": "backprojection",
+        "name": "_resident_trt_pipeline_suspend_for_radial",
+        "previous_sha256": "fb076a9d5e579a9900ee47e7fbe50e126fb1c28b55ac12e7f2869c1cb196d03f",
+        "sha256": "311e1d619c30aec66f1b98ba2119e623896bbbcd11f8e391af4518ed70b443be",
+        "reason": "Preserve an idle persistent TensorRT executor across Spherical task boundaries with the existing Radial suspension ownership checks."
+      },
+      {
+        "module": "pipeline",
+        "name": "_main_impl",
+        "previous_sha256": "9ed788bfe6feb89d505b8a6a64346b8d7c6206f222e91172fe437a4337e98918",
+        "sha256": "da0b607476484cb15d1be1930d08b3f219e26b8f8a702d20658938e19057b683",
+        "reason": "Route Spherical full-frame workers through reserved shared direct unions, retain native-memory credits through parent retirement, and include Spherical layers in publication planning."
+      },
+      {
+        "module": "publication_memory",
+        "name": "native_fullframe_dense_reserve",
+        "previous_sha256": null,
+        "sha256": "a83206ebe2cd6311f44c4554f6523a2982dd6615d58ff586a4c004d3e04640c7",
+        "reason": "Reserve every admitted native inference and postprocess slot, including confidence buffers and largest-view lower bounds, before planning retained publication memory."
+      },
+      {
+        "module": "publication_memory",
+        "name": "plan_native_publication_memory",
+        "previous_sha256": "3fc6e04c0fee91391d33b66d6f0f5f500894044d93740899513f7938a0c98420",
+        "sha256": "e59900d48f65d296a65ca35f01e8c5187f1bb2f8b166a4682b503c94b2c77e7f",
+        "reason": "Budget Radial and Spherical publication retention after bounded native work reserves, keeping oversized layers eligible for disk spill."
+      },
+      {
+        "module": "publication_memory",
+        "name": "retained_payload_plan",
+        "previous_sha256": "7a06a971b4815a9fbc9777cae369dc78d724206725e677297ece64bd8cd76555",
+        "sha256": "d244c93e477ce015af2cb12c4f38070a05709e0f983794ba06892f4de3a1c03e",
+        "reason": "Calculate rounded output payload capacity with integer arithmetic."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "_ordered_spherical_cuda_blocks",
+        "previous_sha256": "75f6bbfb2fb57bffab55006927247360537c011d651eba84eb993ae9cfdd446a",
+        "sha256": "444f504ab44e95040113b62d905ef6240b2f106aeb9ea36d6cd4e56b91abeda7",
+        "reason": "Resume bounded ordered GPU projection from the first unpublished source Z without replaying committed blocks."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "_try_spherical_cuda_stage",
+        "previous_sha256": "725ce30c7f5ffe2551ca70b4a28442fda4d6451abe60e23b5b5031c5caf4441f",
+        "sha256": "21feddd354306f7df76be218d99c9fb81874b7a3bdfe5a8e51bef14a870ce48d",
+        "reason": "Support quiet nonblocking promotion probes while retaining admission cleanup and fatal unsettled-stream ownership."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "backproject_spherical_volume_to_volume",
+        "previous_sha256": "52e1fdedd62b26517ad7e5363bbcd5d857fb4e9306e678b256916aa60c06f68b",
+        "sha256": "3513250f15b2b0797de628789b40b830f0940df3c1d963a5088e1fef2c8a058d",
+        "reason": "Continue bounded CPU projection until an idle GPU admits retirement; join unpublished CPU work, preserve exactly-once ordered output, and report mixed-backend progress."
+      }
+    ],
+    "statements": [
+      {
+        "module": "__init__",
+        "label": "Assign:7",
+        "previous_sha256": "6967ec169622a2d64957630f0daf9fbc0c0f19cabdf097701158fa36ab993d06",
+        "sha256": "6a742b02802340395260e500dbcb023d4c0fd5d0294e942b10e7d5415899428b",
+        "reason": "Align the runtime version and sole launcher identity with release 21.0.1."
+      },
+      {
+        "module": "cli",
+        "label": "Assign:13",
+        "previous_sha256": "35a03198ee25c2fd53194c47165c1285c47d7fbef1c1aa62b03948f45f860222",
+        "sha256": "f9527c686eb7f0c60b225ab4a65d393427038969588ae58bd5dbcf6bbc082c02",
+        "reason": "Align the runtime version and sole launcher identity with release 21.0.1."
+      },
+      {
+        "module": "cli",
+        "label": "Assign:14",
+        "previous_sha256": "d7fe778154e60cdd2e64317983b823f1cf631c3b7a4a44ceba1d9b29da9729a4",
+        "sha256": "21d1b283da4eb18f61218f62c0e831f969a828c3d25b2a0d7e11d8844fb4d638",
+        "reason": "Align the runtime version and sole launcher identity with release 21.0.1."
+      },
+      {
+        "module": "config",
+        "label": "Assign:22",
+        "previous_sha256": "35a03198ee25c2fd53194c47165c1285c47d7fbef1c1aa62b03948f45f860222",
+        "sha256": "f9527c686eb7f0c60b225ab4a65d393427038969588ae58bd5dbcf6bbc082c02",
+        "reason": "Align the runtime version and sole launcher identity with release 21.0.1."
+      },
+      {
+        "module": "config",
+        "label": "Assign:24",
+        "previous_sha256": "473def822a1c4770205ac74330539ff65652bb5b798f1b03d596c8fdef6ff3ed",
+        "sha256": "9fd1e0602d48b99dd061d3ce83e475c4fad778fe9515d073d067cb39c01d64b7",
+        "reason": "Align the runtime version and sole launcher identity with release 21.0.1."
+      },
+      {
+        "module": "pipeline",
+        "label": "import_.finalization",
+        "previous_sha256": "b4a6fa2064da19c3fa21f98c5154a9b85a9c2fb2d1b5b95277d933e1ecd90f90",
+        "sha256": "7518fa144ef830a457f676515f344d48a5d2134e3efcfa2b58c1a437702a9999",
+        "reason": "Import the bounded native-work reservation used by publication planning."
+      },
+      {
+        "module": "pipeline",
+        "label": "import_.publication_memory",
+        "previous_sha256": "8f65b674888082e720cf3110bf9d94eea7eb328ebfd386d9e75cfd3e62719046",
+        "sha256": "ae8f53ae1abe7607deac326d9995453aa3be8d19e72097655717f3063ad71160",
+        "reason": "Import the bounded native-work reservation used by publication planning."
+      },
+      {
+        "module": "pipeline",
+        "label": "import_.topology",
+        "previous_sha256": "1298a83305b11e658d1e1bba7d35e9ce328a541cf38cf46e8de068fcf681bd93",
+        "sha256": "781b0a6e657a278d78a68b4e22654eef8ce483823593ccfe88950a883c59867e",
+        "reason": "Import the bounded native-work reservation used by publication planning."
+      },
+      {
+        "module": "publication_memory",
+        "label": "import_.runtime",
+        "previous_sha256": "ca3868d13250e3a607361c8e87ed0e91f22ef1a8c6002e17f9c2b89425c13b00",
+        "sha256": "15a1b927bf399f9dbb2cfc6455e151f086f4e315ba0d9efa3c1807b1f48b462d",
+        "reason": "Support integer ceiling arithmetic and deferred-result identity in native-memory reservation planning."
+      },
+      {
+        "module": "publication_memory",
+        "label": "import_math",
+        "previous_sha256": null,
+        "sha256": "f329650e2c61a07a1bab85b32296a6d93760e313e108904819fa27d09cf3954d",
+        "reason": "Support integer ceiling arithmetic and deferred-result identity in native-memory reservation planning."
+      },
+      {
+        "module": "spherical_projection",
+        "label": "binding__CUDA_RECHECK_SLICES",
+        "previous_sha256": null,
+        "sha256": "56f83697b3d62b5527d6e88dab7a4bd8d479e096e8601dd1def0352b9672d967",
+        "reason": "Bound quiet GPU-admission retries to eight additional published CPU slices."
+      }
+    ]
   }
 }

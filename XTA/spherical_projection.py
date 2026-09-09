@@ -30,6 +30,7 @@ _PULL_CHUNK_VOXELS = 128 * 1024
 _OUTPUT_BLOCK_BYTES = 8 * 1024 * 1024
 _INFLIGHT_WORK_BYTES = 256 * 1024 * 1024
 _CHUNK_BYTES_PER_VOXEL = 384
+_CUDA_RECHECK_SLICES = 8
 
 
 def spherical_cuda_backproject_enabled():
@@ -78,24 +79,28 @@ class _SphericalCudaStage:
             self.lease = None
 
 
-def _try_spherical_cuda_stage(source, view, shape, bboxes):
+def _try_spherical_cuda_stage(source, view, shape, bboxes, *, quiet=False):
     if not spherical_cuda_backproject_enabled():
-        print(f'Spherical CUDA disabled {view.name}: using bounded CPU projection.', flush=True)
+        if not quiet:
+            print(f'Spherical CUDA disabled {view.name}: using bounded CPU projection.', flush=True)
         return None
     try:
         import torch
         if not torch.cuda.is_available():
-            print(f'Spherical CUDA fallback {view.name}: CUDA unavailable; using CPU.', flush=True)
+            if not quiet:
+                print(f'Spherical CUDA fallback {view.name}: CUDA unavailable; using CPU.', flush=True)
             return None
     except Exception as exc:
-        print(f'Spherical CUDA fallback {view.name}: runtime unavailable ({exc}); using CPU.', flush=True)
+        if not quiet:
+            print(f'Spherical CUDA fallback {view.name}: runtime unavailable ({exc}); using CPU.', flush=True)
         return None
     from .backprojection import _try_acquire_main_process_gpu_stage
     from .spherical_projection_cuda import SphericalCudaProjector
 
     lease = _try_acquire_main_process_gpu_stage(torch, f'Spherical source projection {view.name}')
     if lease is None:
-        print(f'Spherical CUDA fallback {view.name}: eligible devices are busy or retiring; using CPU.', flush=True)
+        if not quiet:
+            print(f'Spherical CUDA fallback {view.name}: eligible devices are busy or retiring; using CPU.', flush=True)
         return None
     projector = None
     try:
@@ -106,22 +111,25 @@ def _try_spherical_cuda_stage(source, view, shape, bboxes):
         raise
     except Exception as exc:
         _close_spherical_cuda_resources(projector, lease)
-        print(f'Spherical CUDA fallback {view.name}: admission/preflight failed ({exc}); using CPU.', flush=True)
+        if not quiet:
+            print(f'Spherical CUDA fallback {view.name}: admission/preflight failed ({exc}); using CPU.', flush=True)
         return None
     except BaseException:
         _close_spherical_cuda_resources(projector, lease)
         raise
 
 
-def _ordered_spherical_cuda_blocks(stage, depth, packed=None):
+def _ordered_spherical_cuda_blocks(stage, depth, packed=None, *, first_z=0):
     """Overlap one bounded device producer with the preceding host consumer."""
     size = max(1, int(stage.max_block_depth))
     project = stage.project if packed is None else lambda z, n: stage.project_encoded(z, n, packed=packed)
-    starts = iter(range(0, depth, size))
+    starts = iter(range(int(first_z), depth, size))
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix='spherical-cuda-project') as pool:
         future = None
         try:
-            first = next(starts)
+            first = next(starts, None)
+            if first is None:
+                return
             future = pool.submit(project, first, min(size, depth - first))
             for following in starts:
                 block = future.result()
@@ -331,8 +339,9 @@ def backproject_spherical_volume_to_volume(
         if stage is not None:
             block_depth, actual_workers = stage.max_block_depth, 1
         encoded_format = getattr(projection_block_callback, 'encoded_slice_format', None)
-        compact = bool(stage is not None and sink_only and encoded_format in ('raw_u8', 'packbits_little')
-                       and callable(getattr(projection_block_callback, 'consume_encoded_block', None)))
+        compact_supported = bool(sink_only and encoded_format in ('raw_u8', 'packbits_little')
+                                 and callable(getattr(projection_block_callback, 'consume_encoded_block', None)))
+        compact = bool(stage is not None and compact_supported)
         packed = encoded_format == 'packbits_little'
         backend = 'cpu_numpy_bounded' if stage is None else ('cuda_direct_qsc_compact' if compact else 'cuda_direct_qsc')
         runtime_telemetry().gauge('projection.spherical.backend', backend)
@@ -351,24 +360,54 @@ def backproject_spherical_volume_to_volume(
         def project(first, count):
             return _project_spherical_block(source, spherical_view, radii, rotation, shape, first, count, bboxes)
 
-        blocks = (_ordered_spherical_cuda_blocks(stage, shape[0], packed if compact else None) if stage is not None
-                  else _ordered_spherical_blocks(project, shape[0], shape[1] * shape[2], workers))
-        try:
-            for z, block in blocks:
-                if output is not None:
-                    output[z:z + len(block)] = block
-                if compact:
-                    if (block.first_z != z or bool(block.packed) != packed
-                            or len(block.records) != min(stage.max_block_depth, shape[0] - z)):
-                        raise RuntimeError('Spherical CUDA encoded block identity/format/count differs from its request')
-                    projection_block_callback.consume_encoded_block(z, block.records, block.payload, packed=packed)
-                else:
-                    _emit_projection_block_callback(
-                        projection_block_callback, z, block, desc=desc, required=bool(sink_only),
-                    )
-                del block
-        finally:
-            blocks.close()
+        next_z = cpu_slices = cuda_slices = 0
+        recheck_at = max(1, int(_CUDA_RECHECK_SLICES))
+        while next_z < shape[0]:
+            blocks = (_ordered_spherical_cuda_blocks(stage, shape[0], packed if compact else None, first_z=next_z)
+                      if stage is not None else _ordered_spherical_blocks(project, shape[0], shape[1] * shape[2], workers))
+            try:
+                for z, block in blocks:
+                    if z != next_z:
+                        raise RuntimeError('Spherical projection duplicated or skipped an output slice')
+                    count = len(block.records) if compact else len(block)
+                    if not compact and (count <= 0 or z + count > shape[0]):
+                        raise RuntimeError('Spherical projection returned an invalid output block size')
+                    if output is not None:
+                        output[z:z + count] = block
+                    if compact:
+                        if (block.first_z != z or bool(block.packed) != packed
+                                or count != min(stage.max_block_depth, shape[0] - z)):
+                            raise RuntimeError('Spherical CUDA encoded block identity/format/count differs from its request')
+                        projection_block_callback.consume_encoded_block(z, block.records, block.payload, packed=packed)
+                    else:
+                        _emit_projection_block_callback(
+                            projection_block_callback, z, block, desc=desc, required=bool(sink_only),
+                        )
+                    next_z += count
+                    if stage is None:
+                        cpu_slices += count
+                    else:
+                        cuda_slices += count
+                    del block
+                    if (stage is None and next_z < shape[0] and next_z >= recheck_at
+                            and spherical_cuda_backproject_enabled()):
+                        recheck_at = next_z + max(1, int(_CUDA_RECHECK_SLICES))
+                        candidate = _try_spherical_cuda_stage(source, spherical_view, shape, bboxes, quiet=True)
+                        if candidate is not None:
+                            stage = candidate
+                            compact = compact_supported
+                            backend = 'cuda_direct_qsc_compact' if compact else 'cuda_direct_qsc'
+                            runtime_telemetry().gauge('projection.spherical.backend', backend)
+                            runtime_telemetry().gauge('projection.spherical.workers', 1)
+                            runtime_telemetry().gauge('projection.spherical.block_depth', stage.max_block_depth)
+                            print(f'Spherical projection promoted {spherical_view.name}: '
+                                  f'CPU completed z=[0,{next_z}); continuing on cuda:{stage.device_index} '
+                                  f'with backend={backend}', flush=True)
+                            break
+            finally:
+                # Before switching backends, settle all unconsumed CPU futures.
+                # Their output was never published; GPU resumes at next_z only.
+                blocks.close()
         if output is not None:
             flush = getattr(output, 'flush', None)
             if callable(flush):
@@ -381,7 +420,8 @@ def backproject_spherical_volume_to_volume(
             f', {name}={getattr(stage.projector, name, 0)}' for name in
             ('source_h2d_bytes', 'metadata_d2h_bytes', 'payload_d2h_bytes', 'dense_d2h_bytes'))
         print(f'Spherical projection complete {spherical_view.name}: backend={backend}, '
-              f'total_s={time.perf_counter() - started:.6f}{metrics}', flush=True)
+              f'total_s={time.perf_counter() - started:.6f}, cpu_slices={cpu_slices}, '
+              f'cuda_slices={cuda_slices}{metrics}', flush=True)
         return output if output is not None else SinkOnlyProjectionResult(shape)
     except BaseException:
         failed = True

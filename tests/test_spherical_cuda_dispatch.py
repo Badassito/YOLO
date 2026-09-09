@@ -139,6 +139,7 @@ class SphericalCudaDispatchTests(unittest.TestCase):
                 mock.patch.object(backprojection, 'v1613_d1_backprojection_overlap_enabled', return_value=True):
             coordinator = backprojection._MainProcessGpuStageCoordinator()
             coordinator.configure_workers([0, 1])
+            coordinator.set_pending_inference_backlog(True)
             torch = SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 2, mem_get_info=mock.Mock()))
             self.assertIsNone(coordinator.try_acquire_stage(torch, 'Spherical source projection layer'))
             torch.cuda.mem_get_info.assert_not_called()

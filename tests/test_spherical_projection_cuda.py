@@ -62,6 +62,56 @@ class SphericalCudaResourceTests(unittest.TestCase):
 @unittest.skipUnless(os.environ.get('XTA_TEST_SPHERICAL_CUDA') == '1', 'requires explicit available-GPU qualification')
 class SphericalCudaProjectionTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('XTA_SPHERICAL_TEST_ROOT'), 'requires a task Scratch output directory')
+    def test_real_retirement_promotes_unpublished_slices_before_global_drain(self):
+        from XTA import spherical_projection as sp, backprojection as bp
+        from XTA.interpolation import IncrementalRawBBoxMaskStoreWriter, RawBBoxMaskStore, CVOL_FORMAT, INTERNAL_PACKED_CVOL_FORMAT
+        shape=(9,11,13)
+        view=next(v for v in views(shape,15,.2) if v.spherical_face==5)
+        data=np.ones((view.num_slices,15,15),np.uint8)
+        expected=oracle(data,view,shape)
+        self.assertGreater(int(expected[0].sum()),0)
+        root=Path(os.environ['XTA_SPHERICAL_TEST_ROOT']).resolve(strict=True)
+        with tempfile.TemporaryDirectory(prefix='spherical-promote-',dir=root) as folder:
+            for packed in (False,True):
+                coordinator=bp._MainProcessGpuStageCoordinator()
+                coordinator.configure_workers([0])
+                coordinator.set_inference_priority_active(True)
+                coordinator.set_pending_inference_backlog(True)
+                coordinator.begin_inference(0)
+                writer=IncrementalRawBBoxMaskStoreWriter(shape=shape,store_dir=Path(folder)/str(packed),
+                    format_name=INTERNAL_PACKED_CVOL_FORMAT if packed else CVOL_FORMAT,desc='real promotion')
+                consume=writer.consume
+                encoded=writer.consume_encoded_block
+                cpu_starts=[]
+                gpu_starts=[]
+                def cpu(first,block):
+                    cpu_starts.append(first)
+                    consume(first,block)
+                    coordinator.finish_inference(0)
+                    coordinator.set_pending_inference_backlog(False)
+                def gpu(first,records,payload,**kwargs):
+                    self.assertTrue(coordinator.snapshot()['stage_leases'])
+                    gpu_starts.append(first)
+                    encoded(first,records,payload,**kwargs)
+                try:
+                    with mock.patch.object(bp,'_MAIN_PROCESS_GPU_STAGE_COORDINATOR',coordinator), \
+                            mock.patch.object(sp,'_OUTPUT_BLOCK_BYTES',shape[1]*shape[2]), \
+                            mock.patch.object(sp,'_CUDA_RECHECK_SLICES',1), \
+                            mock.patch.object(writer,'consume',side_effect=cpu), \
+                            mock.patch.object(writer,'consume_encoded_block',side_effect=gpu):
+                        sp.backproject_spherical_volume_to_volume(data,view,Path(folder)/'unused.dat','real promotion',
+                            workers=2,sink_only=True,projection_block_callback=writer)
+                    self.assertEqual(cpu_starts,[0])
+                    self.assertEqual(gpu_starts,[1])
+                    self.assertTrue(coordinator.snapshot()['inference_priority_active'])
+                    self.assertFalse(coordinator.snapshot()['stage_leases'])
+                    writer.finalize()
+                    with contextlib.closing(RawBBoxMaskStore.open(writer.store_dir)) as store:
+                        np.testing.assert_array_equal(np.stack([store.decode_slice(z) for z in range(shape[0])]),expected)
+                finally:
+                    writer.discard()
+
+    @unittest.skipUnless(os.environ.get('XTA_SPHERICAL_TEST_ROOT'), 'requires a task Scratch output directory')
     def test_real_compact_dispatch_into_existing_cvol_writer(self):
         from XTA import spherical_projection as sp
         from XTA.interpolation import (IncrementalRawBBoxMaskStoreWriter, RawBBoxMaskStore,

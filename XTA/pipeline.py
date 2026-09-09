@@ -38,7 +38,9 @@ from typing import (
 import numpy as np
 from ._deps import _numba, cv2
 from .cylindrical_owner import RADIAL_OWNER_CONTRACT, radial_owner_eligible, radial_runtime_provenance
-from .publication_memory import plan_native_publication_memory, publication_output_reserve
+from .publication_memory import (
+    native_fullframe_dense_reserve, plan_native_publication_memory, publication_output_reserve,
+)
 
 # Explicit lower-layer dependencies keep imports one-way.
 from .config import (
@@ -1498,8 +1500,9 @@ def _main_impl() -> None:
         d1_pipeline_active=bool(v1613_d1_owner_active),
     )
     if v1613_d1_owner_active:
-        # D1 supersedes the 25-39 GiB host direct-union workspace entirely.
-        gpu_worker_direct_union_active = False
+        # Keep native shared-union capability for views that cannot use D1 (including
+        # Spherical). Per-task routing selects eligible D1 owners first. Disabling
+        # this capability globally sent native fallbacks into unadmitted file unions.
         print(
             'v16.1.8 fast bundle active: hardware-linear Azimuthal texture sampling, B1 sparse '
             'slice metadata, D3 resident-proto closing, C1 runtime-sized leases, C2 '
@@ -1507,7 +1510,7 @@ def _main_impl() -> None:
             'project -> infer -> proto-close -> immediate owner-GPU backprojection -> '
             'source-space sparse cvol publication. Commands with interpolation and/or tiles '
             'retain an exact packed view-native shadow and materialize it only in the asynchronous '
-            'parent postprocess stage; the scheduler never owns a dense inference result. '
+            'parent postprocess stage. Native fallback views use bounded shared unions. '
             'YOLO_TTA_V1613_FAST_BUNDLE=0 restores the compatibility paths.'
         )
         if not legacy_d1_model_eligible:
@@ -1528,9 +1531,8 @@ def _main_impl() -> None:
             'v16.1.8 fast bundle not eligible for this command; compatibility paths retained: '
             + '; '.join(v1613_bundle_reasons)
         )
-    # D1 may disable dense GPU unions after the initial backend resolution. Recompute the
-    # common process-worker requirement so GPU-only D1 runs stay owner-only while hybrid
-    # runs can allocate a shareable direct union only for a view actually claimed by OpenVINO.
+    # D1 eligibility is per task. Preserve the user's shared-union setting for native
+    # fallbacks, together with the mandatory OpenVINO shared result boundary.
     worker_direct_union_active = bool(
         gpu_worker_direct_union_active or cpu_worker_process_active
     )
@@ -5053,11 +5055,19 @@ def _main_impl() -> None:
                     )
                 next_task_id += 1
         scheduler_state.gpu_worker_total_tasks = int(next_task_id)
+        native_dense_reserve_bytes = native_fullframe_dense_reserve(
+            gpu_worker_tasks_by_id.values(),
+            total_dense_limit=int(direct_union_total_dense_byte_limit),
+            min_conf=float(args.min_conf), dense_tiling=bool(dense_tiling_active),
+            nrrd_layers=bool(nrrd_layers_needed),
+            bounded_retirement=bool(direct_union_sparse_retirement_active),
+        )
         plan_native_publication_memory(
             gpu_worker_tasks_by_id.values(), keep_temp=bool(keep_temp_artifacts),
             worker_count=int(gpu_device_count),
             publication_pending=d1_publication_max_pending_per_worker(),
             unpack_bytes=d1_unpack_target_mib() * 1024 * 1024,
+            native_dense_reserve_bytes=int(native_dense_reserve_bytes),
             output_reserve_bytes=publication_output_reserve(
                 nrrd_layer_sink(), nrrd_member_gzip_window_bytes(), nrrd_gzip_chunk_bytes()),
         )

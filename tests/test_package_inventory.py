@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import json
 import tempfile
 import textwrap
@@ -9,6 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from tools import verify_package_inventory as inventory
 from tools.verify_package_inventory import (
     INTENTIONALLY_CHANGED_BINDINGS,
     LOCAL_IMPORT_SEAM_MARKER,
@@ -29,6 +31,62 @@ def inspect_seams(source: str):
 
 
 class PackageInventoryTests(unittest.TestCase):
+    def test_patch_review_keeps_the_prior_release_authenticated(self) -> None:
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        prior = inventory.reviewed_v21_contract(manifest)
+        patch = inventory.reviewed_v21_patch_contract(manifest, prior)
+        self.assertEqual(prior['release'], '21.0.0')
+        self.assertEqual(patch['release'], '21.0.1')
+        self.assertEqual(patch['previous_review_sha256'], inventory.REVIEWED_V21_SHA256)
+        manifest['v21_review']['definitions'][0]['sha256'] = '0' * 64
+        with self.assertRaisesRegex(RuntimeError, 'v21 review digest mismatch'):
+            inventory.reviewed_v21_contract(manifest)
+
+    def test_patch_admission_and_memory_contracts_cannot_change_without_review(self) -> None:
+        for module, name in (
+            ('backprojection', '_MainProcessGpuStageCoordinator'),
+            ('publication_memory', 'native_fullframe_dense_reserve'),
+        ):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            record = next(item for item in manifest['v21_0_1_review']['definitions']
+                          if (item['module'], item['name']) == (module, name))
+            record['sha256'] = '0' * 64
+            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, 'v21.0.1 review digest mismatch'):
+                inventory.reviewed_v21_patch_contract(manifest, manifest['v21_review'])
+
+    def test_patch_supersessions_chain_from_both_v21_and_v20_pins(self) -> None:
+        for module, name in (
+            ('pipeline', '_main_impl'),
+            ('publication_memory', 'plan_native_publication_memory'),
+        ):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            patch = manifest['v21_0_1_review']
+            record = next(item for item in patch['definitions']
+                          if (item['module'], item['name']) == (module, name))
+            record['previous_sha256'] = '0' * 64
+            reauthenticated = hashlib.sha256(json.dumps(
+                patch, sort_keys=True, separators=(',', ':'),
+            ).encode('utf-8')).hexdigest()
+            with self.subTest(name=name), mock.patch.object(inventory, 'REVIEWED_V21_0_1_SHA256', reauthenticated):
+                with self.assertRaisesRegex(RuntimeError, f'supersession does not match its historical pin: {module}.{name}'):
+                    inventory.reviewed_v21_patch_contract(manifest, manifest['v21_review'])
+
+    def test_patch_checks_current_added_definitions_and_retry_policy(self) -> None:
+        original_digest = inventory.digest
+        for target, expected_error in (
+            ('native_fullframe_dense_reserve', 'reviewed definition changed or is missing: publication_memory.native_fullframe_dense_reserve'),
+            ('_CUDA_RECHECK_SLICES', 'reviewed statement changed or is missing: spherical_projection.binding__CUDA_RECHECK_SLICES'),
+        ):
+            def changed_digest(node):
+                names = [getattr(node, 'name', None)]
+                if isinstance(node, ast.Assign):
+                    names.extend(getattr(item, 'id', None) for item in node.targets)
+                return '0' * 64 if target in names else original_digest(node)
+
+            with self.subTest(target=target), mock.patch.object(inventory, 'digest', side_effect=changed_digest):
+                with self.assertRaisesRegex(RuntimeError, expected_error):
+                    verify_inventory()
+
     def test_numba_compile_policy_is_pinned_outside_function_bodies(self) -> None:
         key = ('cylindrical_projection', 'numba_compile_policy')
         _expected_hash, reason = REVIEWED_V20_ADDED_STATEMENTS[key]

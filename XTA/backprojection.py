@@ -559,6 +559,12 @@ class _MainProcessGpuStageCoordinator:
         if self._inference_asset_retirement_pending and int(device_index) in self._worker_devices:
             return True
         purpose_l = str(purpose).strip().lower()
+        # A completed spherical parent holds native-memory credits until its
+        # source projection finishes. When no central inference is admissible,
+        # let that retirement use an idle GPU even in a mixed D1 run. The acquire
+        # methods still fence queued/running inference and other device owners.
+        if self._is_spherical_retirement(purpose_l):
+            return bool(self._pending_inference_backlog and int(device_index) in self._worker_devices)
         # In the non-D1 fast-bundle fallback, a completed view may borrow an idle
         # worker GPU for backprojection while other devices still infer. Terminal
         # asset retirement above takes precedence over that overlap permission.
@@ -573,6 +579,10 @@ class _MainProcessGpuStageCoordinator:
             and not main_process_gpu_stage_inference_overlap_enabled()
             and int(device_index) in self._worker_devices
         )
+
+    @staticmethod
+    def _is_spherical_retirement(purpose: str) -> bool:
+        return str(purpose).strip().lower().startswith('spherical source projection ')
 
     def set_wake_callback(self, callback: Optional[Callable[[], None]]) -> None:
         with self._lock:
@@ -589,17 +599,20 @@ class _MainProcessGpuStageCoordinator:
             self._wake_callback = None
 
     def can_dispatch_inference(self, device_index: int) -> bool:
-        if main_process_gpu_stage_inference_overlap_enabled():
-            return True
         with self._lock:
-            return int(device_index) not in self._stage_leases
+            owner = self._stage_leases.get(int(device_index))
+            return owner is None or bool(
+                main_process_gpu_stage_inference_overlap_enabled()
+                and not self._is_spherical_retirement(owner)
+            )
 
     def begin_inference(self, device_index: int) -> bool:
         device = int(device_index)
         with self._lock:
-            if (
+            owner = self._stage_leases.get(device)
+            if owner is not None and (
                 not main_process_gpu_stage_inference_overlap_enabled()
-                and device in self._stage_leases
+                or self._is_spherical_retirement(owner)
             ):
                 return False
             self._inference_inflight[device] += 1
@@ -633,7 +646,7 @@ class _MainProcessGpuStageCoordinator:
                 return None
             if self._priority_blocks_stage_locked(device, purpose):
                 return None
-            if not overlap and int(self._inference_inflight.get(device, 0)) > 0:
+            if (not overlap or self._is_spherical_retirement(purpose)) and int(self._inference_inflight.get(device, 0)) > 0:
                 return None
             aux_pool = gpu_worker_aux_interpolation_pool()
             if aux_pool is not None and not bool(aux_pool.revoke_worker(device)):
@@ -662,7 +675,8 @@ class _MainProcessGpuStageCoordinator:
                 idx for idx in candidates
                 if idx not in self._stage_leases
                 and not self._priority_blocks_stage_locked(idx, purpose)
-                and (overlap or int(self._inference_inflight.get(idx, 0)) == 0)
+                and ((overlap and not self._is_spherical_retirement(purpose))
+                     or int(self._inference_inflight.get(idx, 0)) == 0)
             ]
             if not available:
                 return None
@@ -1975,10 +1989,10 @@ def _resident_trt_pipeline_decline(backend: Optional[object]) -> None:
         _resident_trt_pipeline_invalidate(backend)
 
 def _resident_trt_pipeline_suspend_for_radial(backend: Optional[object], source: object) -> bool:
-    """Soft bypass only for a Radial source sharing an idle ring's source/model."""
+    """Soft bypass Radial/Spherical sources sharing an idle ring's source/model."""
     if (
         not isinstance(source, (GpuRenderedYoloSource, GpuTileRenderedYoloSource))
-        or getattr(getattr(source, 'view', None), 'family', '') != 'radial'
+        or getattr(getattr(source, 'view', None), 'family', '') not in ('radial', 'spherical')
         or not resident_trt_pipeline_persistence_enabled()
     ):
         return False

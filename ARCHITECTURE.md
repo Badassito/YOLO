@@ -1,6 +1,6 @@
 # XTA architecture
 
-`GPT-6-Astra-Ultra_v21.0.0_SLURM.py` is the sole versioned launcher. It, the
+`GPT-6-Astra-Ultra_v21.0.1_SLURM.py` is the sole versioned launcher. It, the
 installed `xta` console script, and `python -m XTA` all dispatch
 through `XTA.cli.run()`.
 The implementation lives in the importable `XTA` package so spawned processes
@@ -76,8 +76,8 @@ direct float64 QSC geometry on CUDA, followed by the established compact
 raw/packbits publication contract. The bounded CPU reference remains available
 with `YOLO_TTA_GPU_SPHERICAL_BACKPROJECT=0`, or when device admission is unavailable.
 The native renderer has a resident Torch fallback and can be opted out with
-`YOLO_TTA_GPU_SPHERICAL_NATIVE_KERNEL=0`. Inference priority and source ownership
-rules are unchanged. Spherical views do not enter legacy D1/Radial owner kernels.
+`YOLO_TTA_GPU_SPHERICAL_NATIVE_KERNEL=0`. Spherical views do not enter legacy
+D1/Radial owner kernels; completed-view CUDA admission is described below.
 
 The shared LTA planner and low-level renderers record spherical geometry, while
 LTA production execution retains its existing single-Transverse restriction and
@@ -89,6 +89,58 @@ backprojection over hundreds of geometry cases, compact CVOL publication, and
 uncropped source addresses beyond 4 GiB. `tools/qualify_spherical_large_address.py`
 records the latter without benchmarking. Generated v21 evidence and release
 artifacts live under `Scratch/Experiments/Spherical`, outside the repository.
+
+### Spherical memory admission and retirement (v21.0.1)
+
+Cluster job 142751 ended in a SLURM host-memory `oom_kill`. All 120 Spherical
+parents had opened native `(1212,3072,3072)` uint8 accumulators before any
+Spherical view completed: 1,278.3 GiB of committed canvas capacity against
+975.1 GiB of initial headroom. Lazy zero-page allocation made repeated free-RAM
+checks miss the outstanding commitments. Enabling D1 had globally disabled
+shared unions, while Spherical correctly remained ineligible for D1. Its
+file-result fallback bypassed the existing parent admission limits, and scheduling
+by remaining work spread chunks across all equal-sized parents.
+
+The D1 capability no longer disables shared unions for other families. Eligible
+tasks still choose D1 first; Spherical uses disjoint shared slice writes and the
+existing inference/postprocess view and byte credits. Active parents finish before
+new ones are admitted, reducing QSC direction-cache churn as well as retained
+memory. The scheduler no longer reads and OR-merges Spherical task result files.
+Native parent capacity is also reserved before granting retained Radial publication
+RAM. Explicit file-result optout rejects aggregate native canvases above the
+configured dense limit with an actionable diagnostic.
+
+These limits bound native parent canvases, not total process RSS. Transient render,
+projection and output allocations still need headroom. Existing user overrides,
+single-oversized-parent admission and retained-debug mode retain their exceptions.
+For the normal four-worker command, a production-shaped 120-parent scheduler test
+verifies at most four active inference parents and at most 256 GiB across inference
+and postprocess canvases, including waiting for postprocess retirement.
+
+A completed Spherical projection may acquire an idle worker GPU before global
+inference drain when the scheduler has no admissible inference backlog. Admission
+still fences queued/running inference, asset retirement and other device owners.
+The lease stays exclusive even under the generic stage-overlap override. CPU
+projection continues while admission is unavailable and checks again after bounded
+published progress; on promotion it joins unused CPU work and resumes CUDA at the
+first unpublished source slice. An admitted projection finishes to release host
+memory rather than being preempted and uploading its source again. Logs record the
+promotion and CPU/CUDA slice totals. Unsafe CUDA cleanup retains ownership and
+fails the run instead of replaying published slices.
+
+Spherical generic inference also preserves a compatible idle TensorRT ring across
+family transitions, using the same guarded suspension as Radial. This does not
+enable Spherical fused TensorRT rendering.
+
+Local functional checks exercised actual CUDA rendering and CPU-to-CUDA retirement,
+plus real `.pt` inference with split Spherical parents. All 63 resulting NRRD masks
+and spatial headers match the v21.0.0 fixture exactly. TensorRT suspension has
+protocol tests; this host has no TensorRT installation. The cluster's synchronized
+GPU sawtooth is consistent with shared scheduling stalls and cache churn, but its
+exact timing cause is not established without device/RSS traces. No local
+performance claim is made. The failed command includes 145,440 additional Spherical
+frames (300,805 total), so its runtime cannot be predicted from the smaller
+cylindrical workload alone.
 
 ## Cylindrical view family (v20)
 
@@ -1028,7 +1080,7 @@ one-versus-four-device scheduling and final bytes are covered by deterministic s
 representative H100 execution remains a hardware qualification step:
 
 ```bash
-python -u GPT-6-Astra-Ultra_v21.0.0_SLURM.py \
+python -u GPT-6-Astra-Ultra_v21.0.1_SLURM.py \
   --mode lta \
   --input <target-video> \
   --exemplar <aligned-image-yolo-directory> \

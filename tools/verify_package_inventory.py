@@ -23,6 +23,11 @@ IMMUTABLE_INVENTORY_STATEMENTS_SHA256 = '0c32fe9dcf8531e246e996cd276a010659f5564
 # release review may replace their effective current-definition digests.
 REVIEWED_V21_SHA256 = '47204e5024f23a6e8db72c215fd0dadf9e46a5bfa49aef50056add8ffbfc15e9'
 
+# The patch review supersedes effective v21/v20 digests without rewriting any
+# earlier release records. Every changed definition and top-level binding is
+# independently checked against this authenticated appendix.
+REVIEWED_V21_0_1_SHA256 = '63b96f6742d72dc7f79b9b7cd130eee93a6e9530249e40bf0c3f697c2389fc6a'
+
 # These definitions have reviewed, intentional implementation changes.
 INTENTIONALLY_CHANGED = {
     ("assembly", "materialize_interpolation_component_nrrd_view_layer"),
@@ -1157,6 +1162,51 @@ def reviewed_v21_contract(manifest: dict[str, object]) -> dict[str, object]:
     return review
 
 
+def reviewed_v21_patch_contract(manifest: dict[str, object], v21: dict[str, object]) -> dict[str, object]:
+    """Authenticate patch additions and check every available predecessor pin."""
+    review = manifest.get('v21_0_1_review', {})
+    encoded = json.dumps(review, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    if hashlib.sha256(encoded).hexdigest() != REVIEWED_V21_0_1_SHA256:
+        raise RuntimeError('v21.0.1 review digest mismatch; require explicit review of changed contracts')
+    if review.get('release') != '21.0.1' or review.get('previous_review_sha256') != REVIEWED_V21_SHA256:
+        raise RuntimeError('v21.0.1 review has an unexpected release or predecessor identity')
+    historical_definitions = {
+        key: record[0] for key, record in REVIEWED_V20_ADDED_DEFINITIONS.items()
+    }
+    historical_definitions.update({
+        (module, name): replacement_hash
+        for (module, _baseline), (name, replacement_hash, _reason)
+        in REVIEWED_V20_STATEMENT_REPLACEMENTS.items()
+    })
+    historical_definitions.update({
+        key: record[0] for key, record in REVIEWED_LOCAL_IMPORT_SEAMS.items()
+    })
+    historical_definitions.update({
+        (item['module'], item['name']): item['sha256'] for item in v21['definitions']
+    })
+    historical_statements = {
+        (item['module'], item['label']): item['sha256'] for item in v21['statements']
+    }
+    for category, identity, historical in (
+        ('definitions', 'name', historical_definitions),
+        ('statements', 'label', historical_statements),
+    ):
+        keys = [(item['module'], item[identity]) for item in review[category]]
+        if len(keys) != len(set(keys)) or any(not item.get('reason') for item in review[category]):
+            raise RuntimeError(f'v21.0.1 review has duplicate or unexplained {category}')
+        for item in review[category]:
+            key = (item['module'], item[identity])
+            if key in historical and item.get('previous_sha256') != historical[key]:
+                raise RuntimeError(f'v21.0.1 supersession does not match its historical pin: {key[0]}.{key[1]}')
+            for field in ('sha256', 'previous_sha256'):
+                value = item.get(field)
+                if field == 'previous_sha256' and value is None:
+                    continue
+                if not isinstance(value, str) or len(value) != 64 or any(char not in '0123456789abcdef' for char in value):
+                    raise RuntimeError(f'v21.0.1 review has an invalid {field}: {key[0]}.{key[1]}')
+    return review
+
+
 def main() -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     baseline_digest = hashlib.sha256(json.dumps(
@@ -1166,19 +1216,29 @@ def main() -> None:
         raise RuntimeError('immutable inventory digest mismatch; retain historical statement records and add explicit reviews')
     rename_replacements = azimuthal_rename_replacements(manifest)
     v21 = reviewed_v21_contract(manifest)
+    patch = reviewed_v21_patch_contract(manifest, v21)
+    patch_definitions = {(item['module'], item['name']): item for item in patch['definitions']}
     v21_definitions = {(item['module'], item['name']): item for item in v21['definitions']}
     v21_seams = {
         (item['module'], item['name']): (item['definition_sha256'], item['seam_sha256'])
         for item in v21['local_import_seams']
     }
 
-    def reviewed_definition_hash(module: str, name: str, previous_hash: str) -> str:
-        record = v21_definitions.get((module, name))
+    def patched_definition_hash(module: str, name: str, previous_hash: str) -> str:
+        record = patch_definitions.get((module, name))
         if record is None:
             return previous_hash
         if record['previous_sha256'] != previous_hash:
-            raise RuntimeError(f'v21 supersession does not match its historical pin: {module}.{name}')
+            raise RuntimeError(f'v21.0.1 supersession does not match its historical pin: {module}.{name}')
         return str(record['sha256'])
+
+    def reviewed_definition_hash(module: str, name: str, previous_hash: str) -> str:
+        record = v21_definitions.get((module, name))
+        if record is None:
+            return patched_definition_hash(module, name, previous_hash)
+        if record['previous_sha256'] != previous_hash:
+            raise RuntimeError(f'v21 supersession does not match its historical pin: {module}.{name}')
+        return patched_definition_hash(module, name, str(record['sha256']))
 
     available: dict[str, Counter[str]] = {}
     trees: dict[str, ast.Module] = {}
@@ -1191,6 +1251,7 @@ def main() -> None:
         | {item['module'] for item in v21['definitions']}
         | {item['module'] for item in v21['statements']}
         | {item['module'] for item in v21['preserved_radial_modules']}
+        | {item['module'] for item in patch['definitions'] + patch['statements']}
     )
     for module in audited_modules:
         module_path = PACKAGE / f"{module}.py"
@@ -1212,13 +1273,22 @@ def main() -> None:
 
     for (module, name), record in v21_definitions.items():
         matches = [node for node in top_level[module] if getattr(node, 'name', None) == name]
-        if len(matches) != 1 or digest(matches[0]) != record['sha256']:
+        if len(matches) != 1 or digest(matches[0]) != patched_definition_hash(module, name, record['sha256']):
             raise RuntimeError(f'v21 reviewed definition changed or is missing: {module}.{name}')
-    for item in v21['statements']:
+    for (module, name), record in patch_definitions.items():
+        matches = [node for node in top_level[module] if getattr(node, 'name', None) == name]
+        if len(matches) != 1 or digest(matches[0]) != record['sha256']:
+            raise RuntimeError(f'v21.0.1 reviewed definition changed or is missing: {module}.{name}')
+    replaced_statements = {(item['module'], item['previous_sha256']) for item in patch['statements']}
+    effective_statements = [
+        item for item in v21['statements'] if (item['module'], item['sha256']) not in replaced_statements
+    ] + patch['statements']
+    for item in effective_statements:
         if available[item['module']][item['sha256']] != 1:
             raise RuntimeError(f'v21 reviewed statement changed or is missing: {item["module"]}.{item["label"]}')
+    effective_definitions = {**v21_definitions, **patch_definitions}
     for module in v21['complete_modules']:
-        expected = Counter(item['sha256'] for item in v21['definitions'] + v21['statements'] if item['module'] == module)
+        expected = Counter(item['sha256'] for item in list(effective_definitions.values()) + effective_statements if item['module'] == module)
         if available[module] != expected:
             raise RuntimeError(f'v21 complete-module statement coverage differs: {module}')
     for item in v21['preserved_radial_modules']:

@@ -1,4 +1,4 @@
-"""Borrowed TensorRT context handoff across generic Radial tasks, without CUDA."""
+"""Borrowed TensorRT context handoff across generic shell tasks, without CUDA."""
 from __future__ import annotations
 
 from contextlib import ExitStack, nullcontext
@@ -32,6 +32,8 @@ class Context:
 
 
 class RingInterleaveTests(unittest.TestCase):
+    generic_family = 'radial'
+
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
@@ -84,25 +86,25 @@ class RingInterleaveTests(unittest.TestCase):
             'in_use': False, 'last_used': 0,
             'render_engine': self.render_engine, 'render_volume_key': self.render_engine._volume_key,
         }
-        self.radial = self.source('radial')
+        self.generic_source = self.source(self.generic_family)
 
     def source(self, family):
         source = object.__new__(cuda_backend.GpuRenderedYoloSource)
         source.view = SimpleNamespace(family=family)
         source.engine = self.render_engine
-        source.resident_ring_supported = family != 'radial'
+        source.resident_ring_supported = family not in ('radial', 'spherical')
         source.prepare_direct_ring = mock.Mock(side_effect=lambda **_: self.executor.slots)
         source._direct_ring = None
         return source
 
     def bypass(self, source=None):
         return b._try_resident_trt_ring_accumulate(
-            SimpleNamespace(model=self.backend), self.radial if source is None else source, SimpleNamespace(),
+            SimpleNamespace(model=self.backend), self.generic_source if source is None else source, SimpleNamespace(),
             num_frames=2, out_size=8, native_h=8, native_w=8,
             M_out_to_native=np.eye(2, 3, dtype=np.float32), device_union=object(),
         )
 
-    def test_radial_restores_backend_then_next_eligible_source_hits_retained_ring(self):
+    def test_generic_shell_restores_backend_then_next_eligible_source_hits_retained_ring(self):
         ex = self.executor
         graphs = [(slot.infer_graph, slot.render_graph) for slot in ex.slots]
         self.assertIsNone(self.bypass())
@@ -213,16 +215,52 @@ class RingInterleaveTests(unittest.TestCase):
         self.executor.close()
         self.assertEqual(self.context.addresses, {'images': 101, 'head': 102, 'proto': 303})
 
-    def test_nonradial_decline_and_disabled_persistence_keep_existing_teardown(self):
+    def test_other_unsupported_family_keeps_existing_teardown(self):
         source = self.source('azimuthal')
         source.resident_ring_supported = False
         self.assertIsNone(self.bypass(source))
         self.assertTrue(self.executor._closed)
 
-    def test_disabled_persistence_does_not_soft_retain_radial_cache(self):
+    def test_disabled_persistence_does_not_soft_retain_shell_cache(self):
         with mock.patch.object(b, 'resident_trt_pipeline_persistence_enabled', return_value=False):
             self.assertIsNone(self.bypass())
         self.assertTrue(self.executor._closed)
+
+
+class SphericalRingInterleaveTests(RingInterleaveTests):
+    """Run the same context lifetime and failure guards for Spherical bypasses."""
+
+    generic_family = 'spherical'
+
+    def test_cartesian_spherical_cartesian_retains_contexts_and_restores_bindings(self):
+        cartesian = self.source('orthogonal')
+        before, first_hit = b._resident_trt_pipeline_acquire(
+            self.backend, cartesian, **self.arguments,
+        )
+        self.assertTrue(first_hit)
+        b._resident_trt_pipeline_release(self.backend, before, cartesian)
+        self.assertIsNone(self.bypass())
+        self.generic_source.prepare_direct_ring.assert_not_called()
+        self.assertTrue(before._generic_suspended)
+        self.assertEqual(self.context.addresses, {'images': 101, 'head': 102, 'proto': 103})
+
+        # Generic spherical inference may replace both output tensors and bindings.
+        self.backend.bindings['head'].data.pointer = 202
+        self.backend.bindings['proto'].data.pointer = 303
+        self.context.addresses.update(images=999, head=202, proto=303)
+        after, second_hit = b._resident_trt_pipeline_acquire(
+            self.backend, cartesian, **self.arguments,
+        )
+        self.assertTrue(second_hit)
+        self.assertIs(after, before)
+        self.assertFalse(after._generic_suspended)
+        self.assertEqual(self.context.addresses, after._borrowed_ring_addresses)
+        self.assertEqual(after._restore_tensor_addresses, {'images': 101, 'head': 202, 'proto': 303})
+        after._recapture_borrowed_inference_graph.assert_called_once()
+        self.engine.create_execution_context.assert_not_called()
+        b._resident_trt_pipeline_release(self.backend, after, cartesian)
+        after.close()
+        self.assertEqual(self.context.addresses, {'images': 101, 'head': 202, 'proto': 303})
 
 
 if __name__ == '__main__':
