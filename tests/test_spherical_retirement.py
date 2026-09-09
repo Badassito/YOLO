@@ -134,12 +134,12 @@ class SphericalProjectionPromotionTests(unittest.TestCase):
         readers=0
         lock=threading.Lock()
         original=sp._project_spherical_block
-        def cpu(*args):
+        def cpu(*args, **kwargs):
             nonlocal readers
             with lock:readers+=1
             try:
                 time.sleep(.02)
-                return original(*args)
+                return original(*args, **kwargs)
             finally:
                 with lock:readers-=1
         stage=self.stage()

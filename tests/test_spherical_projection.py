@@ -205,7 +205,7 @@ class SphericalProjectionTests(unittest.TestCase):
         lock = threading.Lock()
         barrier = threading.Barrier(3)
 
-        def project(source, view, radii, rotation, shape, first, count, boxes, bounds=None):
+        def project(source, view, radii, rotation, shape, first, count, boxes, bounds=None, cancel_event=None, cpu_pull=None):
             with lock:
                 live[0] += 1
                 live[1] = max(live[1], live[0])

@@ -8,9 +8,12 @@ contribute independently to the caller's ordinary OR union.
 from __future__ import annotations
 
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
+from dataclasses import dataclass
 import math
+import operator
 import os
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional, Tuple
@@ -18,8 +21,10 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple
 import numpy as np
 
 from .qsc import qsc_forward_face
+from .geometry_quality import spherical_cpu_compiled_requested
 from .spherical_projection_bounds import spherical_output_bounds
 from .spherical_projection_cuda import SphericalCudaProjectionUnsafeFailure
+from .cylindrical_cuda_projection import RadialEncodedBlock, RadialEncodedSlice, _MAX_ENCODED_SLICES
 from .runtime import allocate_workspace_array, close_memmap_array_without_flush, runtime_telemetry
 from .workspace import _cpu_count
 
@@ -31,8 +36,22 @@ _PULL_CHUNK_VOXELS = 128 * 1024
 _OUTPUT_BLOCK_BYTES = 8 * 1024 * 1024
 _INFLIGHT_WORK_BYTES = 256 * 1024 * 1024
 _CHUNK_BYTES_PER_VOXEL = 384
+_COMPILED_CHUNK_BYTES_PER_VOXEL = 8
+_CPU_ENCODED_SLICE_BYTES = 1024
 _CUDA_RECHECK_SLICES = 8
 _CUDA_RECHECK_SECONDS = 1.0
+
+
+def spherical_cpu_compact_enabled():
+    return os.environ.get('YOLO_TTA_CPU_SPHERICAL_COMPACT', '1').strip().lower() not in (
+        '', '0', 'false', 'no', 'off',
+    )
+
+
+@dataclass(frozen=True)
+class SphericalCpuEncodedBlock(RadialEncodedBlock):
+    pull_voxels: int = 0
+    scan_voxels: int = 0
 
 
 def spherical_cuda_backproject_enabled():
@@ -202,42 +221,147 @@ def _pull_spherical_chunk(source, view, radii, rotation, output_shape, z, first,
 
 
 def _project_spherical_block(source, view, radii, rotation, shape, first_z, count, bboxes=None,
-                             output_bounds=None):
+                             output_bounds=None, cancel_event=None, cpu_pull=None):
     # Keep the unbounded path as the independent full-plane reference used by
     # CUDA qualification. Production CPU work can skip analytic Z/Y bands, but
     # retains contiguous full-width strips: one NumPy call per cropped row
     # would replace bounded vector work with thousands of tiny QSC calls.
+    if cancel_event is not None and cancel_event.is_set():
+        raise CancelledError('Spherical CPU block retired before publication')
     if output_bounds is None:
         block = np.empty((count, shape[1], shape[2]), dtype=np.uint8)
         z0, z1, first_pixel, stop_pixel = first_z, first_z + count, 0, shape[1] * shape[2]
+        pull = _pull_spherical_chunk
     else:
         block = np.zeros((count, shape[1], shape[2]), dtype=np.uint8)
         z0, z1, y0, y1, x0, x1 = output_bounds.block(first_z, count)
         if z0 == z1 or y0 == y1 or x0 == x1:
             return block
         first_pixel, stop_pixel = y0 * shape[2], y1 * shape[2]
+        pull = _pull_spherical_chunk if cpu_pull is None else cpu_pull
     for z in range(z0, z1):
         local_z = z - first_z
         plane = block[local_z].reshape(-1)
         for first in range(first_pixel, stop_pixel, _PULL_CHUNK_VOXELS):
+            if cancel_event is not None and cancel_event.is_set():
+                raise CancelledError('Spherical CPU block retired before publication')
             stop = min(stop_pixel, first + _PULL_CHUNK_VOXELS)
-            plane[first:stop] = _pull_spherical_chunk(
+            plane[first:stop] = pull(
                 source, view, radii, rotation, shape, z, first, stop, bboxes,
             )
     return block
 
 
-def _spherical_block_schedule(depth, plane_bytes, workers):
+def _select_spherical_cpu_pull(source, view, radii, rotation, shape, bboxes):
+    """Opt into compiled bounded CPU pulls without changing the NumPy oracle."""
+    if not spherical_cpu_compiled_requested() or source.dtype not in (np.uint8, np.bool_):
+        return None
+    try:
+        from .spherical_projection_cpu import prepare_spherical_chunk_numba, SphericalCpuProjectionUnavailable
+    except (ImportError, OSError) as exc:
+        print(f'Spherical compiled CPU unavailable {view.name}: {exc}; using NumPy.', flush=True)
+        return None
+    try:
+        return prepare_spherical_chunk_numba(source, view, radii, rotation, shape, bboxes)
+    except SphericalCpuProjectionUnavailable as exc:
+        print(f'Spherical compiled CPU unavailable {view.name}: {exc}; using NumPy.', flush=True)
+        return None
+
+
+def _project_spherical_encoded_block(source, view, radii, rotation, shape, first_z, count,
+                                     bboxes=None, output_bounds=None, cancel_event=None,
+                                     cpu_pull=None, *, packed=False):
+    """Produce exact tight crops on the bounded CPU worker, before publication.
+
+    The conservative bounds never replace the categorical pull's final tests.
+    NumPy keeps large contiguous full-width strips; the compiled pull also skips
+    X outside the bounds. Only the bounded X/Y crop is scanned by the encoder.
+    """
+    def check_cancelled():
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError('Spherical CPU block retired before publication')
+
+    check_cancelled()
+    if output_bounds is None:
+        output_bounds = spherical_output_bounds(view, shape, bboxes)
+    z0, z1, y0, y1, x0, x1 = output_bounds.block(first_z, count)
+    records, payloads = [], []
+    offset = pull_voxels = scan_voxels = 0
+    pull = _pull_spherical_chunk if cpu_pull is None else cpu_pull
+    rectangle_pull = getattr(cpu_pull, 'rectangle', None)
+    for z in range(first_z, first_z + count):
+        check_cancelled()
+        if not (z0 <= z < z1) or y0 == y1 or x0 == x1:
+            records.append(RadialEncodedSlice(z, 0, 0, 0, 0, 0, offset, 0))
+            continue
+        rectangular = callable(rectangle_pull)
+        plane = np.empty((y1 - y0, x1 - x0 if rectangular else shape[2]), dtype=np.uint8)
+        flat = plane.reshape(-1)
+        base, end = (0, flat.size) if rectangular else (y0 * shape[2], y1 * shape[2])
+        for first in range(base, end, _PULL_CHUNK_VOXELS):
+            check_cancelled()
+            stop = min(end, first + _PULL_CHUNK_VOXELS)
+            if rectangular:
+                flat[first - base:stop - base] = rectangle_pull(
+                    source, view, radii, rotation, shape, z, first, stop, bboxes,
+                    bounds_yx=(y0, y1, x0, x1))
+            else:
+                flat[first - base:stop - base] = pull(
+                    source, view, radii, rotation, shape, z, first, stop, bboxes)
+        pull_voxels += end - base
+        region = plane if rectangular else plane[:, x0:x1]
+        scan_voxels += region.size
+        check_cancelled()
+        rows = np.flatnonzero(np.any(region, axis=1))
+        if not rows.size:
+            records.append(RadialEncodedSlice(z, 0, 0, 0, 0, 0, offset, 0))
+            del plane, flat, region
+            continue
+        ry0, ry1 = int(rows[0]), int(rows[-1]) + 1
+        columns = np.flatnonzero(np.any(region[ry0:ry1], axis=0))
+        rx0, rx1 = int(columns[0]), int(columns[-1]) + 1
+        crop = region[ry0:ry1, rx0:rx1]
+        foreground = int(np.count_nonzero(crop))
+        data = (np.packbits(crop, axis=1, bitorder='little').reshape(-1) if packed
+                else np.array(crop, dtype=np.uint8, order='C', copy=True).reshape(-1))
+        records.append(RadialEncodedSlice(z, y0 + ry0, y0 + ry1, x0 + rx0, x0 + rx1,
+                                          foreground, offset, int(data.size)))
+        payloads.append(data)
+        offset += int(data.size)
+        del plane, flat, region, crop
+    check_cancelled()
+    payload = (np.concatenate(payloads) if len(payloads) > 1 else payloads[0]
+               if payloads else np.empty(0, dtype=np.uint8))
+    return SphericalCpuEncodedBlock(first_z, tuple(records), payload, bool(packed),
+                                    pull_voxels, scan_voxels)
+
+
+def _spherical_block_schedule(depth, plane_bytes, workers, *, compact=False, compiled=False):
     block_depth = max(1, min(depth, _OUTPUT_BLOCK_BYTES // max(1, plane_bytes)))
-    chunk_bytes = min(plane_bytes, _PULL_CHUNK_VOXELS) * _CHUNK_BYTES_PER_VOXEL
+    legacy_chunk_bytes = min(plane_bytes, _PULL_CHUNK_VOXELS) * _CHUNK_BYTES_PER_VOXEL
+    legacy_worker_bytes = plane_bytes * block_depth + legacy_chunk_bytes
+    legacy_worker_count = max(1, min(int(workers), _cpu_count(), math.ceil(depth / block_depth),
+                                     max(1, _INFLIGHT_WORK_BYTES // max(1, legacy_worker_bytes))))
+    if compact:
+        block_depth = min(block_depth, _MAX_ENCODED_SLICES)
+    chunk_bytes = min(plane_bytes, _PULL_CHUNK_VOXELS) * (
+        _COMPILED_CHUNK_BYTES_PER_VOXEL if compact and compiled else _CHUNK_BYTES_PER_VOXEL)
     worker_bytes = plane_bytes * block_depth + chunk_bytes
-    worker_count = max(1, min(int(workers), _cpu_count(), math.ceil(depth / block_depth),
+    if compact:
+        # A block can transiently retain individual crops, their concatenation,
+        # one bounded projection plane, and its small Python wire records.
+        worker_bytes += plane_bytes * (block_depth + 1) + block_depth * _CPU_ENCODED_SLICE_BYTES
+    # Compiled scalar pulls retain no coordinate arrays. Use their actual bounded
+    # strip workspace without increasing concurrency beyond the legacy schedule.
+    worker_count = max(1, min(legacy_worker_count, math.ceil(depth / block_depth),
                               max(1, _INFLIGHT_WORK_BYTES // max(1, worker_bytes))))
     return block_depth, worker_count
 
 
-def _ordered_spherical_blocks(project, depth, plane_bytes, workers):
-    block_depth, worker_count = _spherical_block_schedule(depth, plane_bytes, workers)
+def _ordered_spherical_blocks(project, depth, plane_bytes, workers, *, cancel_event=None,
+                               compact=False, compiled=False):
+    block_depth, worker_count = _spherical_block_schedule(
+        depth, plane_bytes, workers, compact=compact, compiled=compiled)
     starts = iter(range(0, depth, block_depth))
     if worker_count == 1:
         for first in starts:
@@ -257,6 +381,8 @@ def _ordered_spherical_blocks(project, depth, plane_bytes, workers):
                 yield z, future.result()
                 del future
         finally:
+            if cancel_event is not None:
+                cancel_event.set()
             for _, future in pending:
                 future.cancel()
             # Executor shutdown joins running readers before the caller may
@@ -340,6 +466,7 @@ def backproject_spherical_volume_to_volume(
     """
     from .backprojection import (
         SinkOnlyProjectionResult, _emit_projection_block_callback,
+        _abort_projection_block_callback,
         _cancel_main_process_spherical_retirement_request,
     )
 
@@ -353,23 +480,55 @@ def backproject_spherical_volume_to_volume(
     stage = None
     output = None
     failed = False
+    callback_aborted = False
     started = time.perf_counter()
+    cpu_cancel = threading.Event()
+    metrics_lock = threading.Lock()
+    cpu_worker_s = 0.0
+    cpu_cancelled_blocks = 0
+    cpu_result_wait_s = cpu_publish_s = gpu_result_wait_s = gpu_publish_s = 0.0
+    admission_probe_s = cpu_reader_drain_s = 0.0
+    admission_attempts = 0
+    cpu_compact_slices = cpu_empty_slices = cpu_payload_bytes = 0
+    cpu_compact_pull_voxels = cpu_compact_scan_voxels = 0
+
+    def try_stage(*, quiet=False):
+        nonlocal admission_attempts, admission_probe_s
+        admission_attempts += 1
+        probe_started = time.perf_counter()
+        try:
+            return _try_spherical_cuda_stage(source, spherical_view, shape, bboxes, quiet=quiet)
+        finally:
+            admission_probe_s += time.perf_counter() - probe_started
+
     try:
-        stage = _try_spherical_cuda_stage(source, spherical_view, shape, bboxes)
-        block_depth, actual_workers = _spherical_block_schedule(shape[0], shape[1] * shape[2], workers)
-        if stage is not None:
-            block_depth, actual_workers = stage.max_block_depth, 1
+        stage = try_stage()
+        cpu_setup_started = time.perf_counter()
+        cpu_pull = (_select_spherical_cpu_pull(source, spherical_view, radii, rotation, shape, bboxes)
+                    if stage is None else None)
+        cpu_setup_seconds = time.perf_counter() - cpu_setup_started
+        cpu_backend = ('unused' if stage is not None else
+                       ('numba_f64_bounded' if cpu_pull is not None else 'numpy_bounded'))
         encoded_format = getattr(projection_block_callback, 'encoded_slice_format', None)
         compact_supported = bool(sink_only and encoded_format in ('raw_u8', 'packbits_little')
                                  and callable(getattr(projection_block_callback, 'consume_encoded_block', None)))
-        compact = bool(stage is not None and compact_supported)
+        cpu_compact = bool(compact_supported and spherical_cpu_compact_enabled())
+        cpu_rectangular = bool(cpu_compact and callable(getattr(cpu_pull, 'rectangle', None)))
+        compact = bool(compact_supported and (stage is not None or cpu_compact))
         packed = encoded_format == 'packbits_little'
-        backend = 'cpu_numpy_bounded' if stage is None else ('cuda_direct_qsc_compact' if compact else 'cuda_direct_qsc')
+        block_depth, actual_workers = _spherical_block_schedule(
+            shape[0], shape[1] * shape[2], workers, compact=cpu_compact, compiled=cpu_rectangular)
+        if stage is not None:
+            block_depth, actual_workers = stage.max_block_depth, 1
+        backend = f'cpu_{cpu_backend}' if stage is None else ('cuda_direct_qsc_compact' if compact else 'cuda_direct_qsc')
         runtime_telemetry().gauge('projection.spherical.backend', backend)
+        runtime_telemetry().gauge('projection.spherical.cpu_backend', cpu_backend)
+        runtime_telemetry().gauge('projection.spherical.cpu_setup_seconds', cpu_setup_seconds)
         runtime_telemetry().gauge('projection.spherical.workers', actual_workers)
         runtime_telemetry().gauge('projection.spherical.block_depth', block_depth)
         print(f'Spherical projection start {spherical_view.name}: backend={backend}, '
               f'workers={actual_workers}, block_z={block_depth}, source={source.shape}, output={shape}'
+              f', cpu_compact_enabled={int(cpu_compact)}'
               + (f', device=cuda:{stage.device_index}, payload={encoded_format if compact else "dense"}'
                  if stage is not None else ''), flush=True)
         if not sink_only:
@@ -379,34 +538,93 @@ def backproject_spherical_volume_to_volume(
             )
 
         def project(first, count):
-            return _project_spherical_block(
-                source, spherical_view, radii, rotation, shape, first, count, bboxes, cpu_bounds,
-            )
+            nonlocal cpu_worker_s, cpu_cancelled_blocks
+            work_started = time.perf_counter()
+            cancelled = False
+            try:
+                project_cpu = _project_spherical_encoded_block if cpu_compact else _project_spherical_block
+                return project_cpu(
+                    source, spherical_view, radii, rotation, shape, first, count,
+                    bboxes, cpu_bounds, cancel_event=cpu_cancel, cpu_pull=cpu_pull,
+                    **({'packed': packed} if cpu_compact else {}),
+                )
+            except CancelledError:
+                cancelled = True
+                raise
+            finally:
+                elapsed = time.perf_counter() - work_started
+                with metrics_lock:
+                    cpu_worker_s += elapsed
+                    cpu_cancelled_blocks += int(cancelled)
 
         next_z = cpu_slices = cuda_slices = 0
         recheck_at = max(1, int(_CUDA_RECHECK_SLICES))
         recheck_time = time.monotonic() + _CUDA_RECHECK_SECONDS
         while next_z < shape[0]:
+            cpu_blocks = stage is None
             blocks = (_ordered_spherical_cuda_blocks(stage, shape[0], packed if compact else None, first_z=next_z)
-                      if stage is not None else _ordered_spherical_blocks(project, shape[0], shape[1] * shape[2], workers))
+                      if stage is not None else _ordered_spherical_blocks(
+                          project, shape[0], shape[1] * shape[2], workers,
+                          cancel_event=cpu_cancel, compact=cpu_compact, compiled=cpu_rectangular))
             try:
-                for z, block in blocks:
+                while True:
+                    wait_started = time.perf_counter()
+                    try:
+                        z, block = next(blocks)
+                    except StopIteration:
+                        break
+                    if cpu_blocks:
+                        cpu_result_wait_s += time.perf_counter() - wait_started
+                    else:
+                        gpu_result_wait_s += time.perf_counter() - wait_started
                     if z != next_z:
                         raise RuntimeError('Spherical projection duplicated or skipped an output slice')
                     count = len(block.records) if compact else len(block)
                     if not compact and (count <= 0 or z + count > shape[0]):
                         raise RuntimeError('Spherical projection returned an invalid output block size')
+                    publish_started = time.perf_counter()
                     if output is not None:
                         output[z:z + count] = block
                     if compact:
+                        expected_depth = block_depth if cpu_blocks else stage.max_block_depth
                         if (block.first_z != z or bool(block.packed) != packed
-                                or count != min(stage.max_block_depth, shape[0] - z)):
-                            raise RuntimeError('Spherical CUDA encoded block identity/format/count differs from its request')
-                        projection_block_callback.consume_encoded_block(z, block.records, block.payload, packed=packed)
+                                or count != min(expected_depth, shape[0] - z)):
+                            raise RuntimeError('Spherical encoded block identity/format/count differs from its request')
+                        empty_consumer = getattr(projection_block_callback, 'consume_empty_range', None)
+                        if cpu_blocks and block.payload.size == 0 and callable(empty_consumer):
+                            try:
+                                canonical = (block.payload.dtype == np.uint8 and block.payload.ndim == 1
+                                    and block.payload.flags.c_contiguous
+                                    and all(operator.index(record.z) == z + index
+                                        and all(operator.index(getattr(record, field)) == 0
+                                            for field in ('y0', 'y1', 'x0', 'x1', 'foreground', 'offset', 'size'))
+                                        for index, record in enumerate(block.records)))
+                            except (AttributeError, TypeError, ValueError, OverflowError):
+                                canonical = False
+                            if not canonical:
+                                raise RuntimeError('Spherical CPU empty block metadata is not canonical')
+                            empty_consumer(z, count)
+                        else:
+                            projection_block_callback.consume_encoded_block(
+                                z, block.records, block.payload, packed=packed)
+                        if cpu_blocks:
+                            cpu_compact_slices += count
+                            cpu_empty_slices += sum(record.foreground == 0 for record in block.records)
+                            cpu_payload_bytes += int(block.payload.size)
+                            cpu_compact_pull_voxels += block.pull_voxels
+                            cpu_compact_scan_voxels += block.scan_voxels
                     else:
-                        _emit_projection_block_callback(
-                            projection_block_callback, z, block, desc=desc, required=bool(sink_only),
-                        )
+                        try:
+                            _emit_projection_block_callback(
+                                projection_block_callback, z, block, desc=desc, required=bool(sink_only),
+                            )
+                        except Exception:
+                            callback_aborted = True  # The compatibility helper already aborted it.
+                            raise
+                    if cpu_blocks:
+                        cpu_publish_s += time.perf_counter() - publish_started
+                    else:
+                        gpu_publish_s += time.perf_counter() - publish_started
                     next_z += count
                     if stage is None:
                         cpu_slices += count
@@ -418,7 +636,7 @@ def backproject_spherical_volume_to_volume(
                             and spherical_cuda_backproject_enabled()):
                         recheck_at = next_z + max(1, int(_CUDA_RECHECK_SLICES))
                         recheck_time = time.monotonic() + _CUDA_RECHECK_SECONDS
-                        candidate = _try_spherical_cuda_stage(source, spherical_view, shape, bboxes, quiet=True)
+                        candidate = try_stage(quiet=True)
                         if candidate is not None:
                             stage = candidate
                             compact = compact_supported
@@ -433,7 +651,14 @@ def backproject_spherical_volume_to_volume(
             finally:
                 # Before switching backends, settle all unconsumed CPU futures.
                 # Their output was never published; GPU resumes at next_z only.
+                # Cooperative cancellation bounds each running reader's remaining
+                # work to its current pull chunk; joining still owns source lifetime.
+                drain_started = time.perf_counter()
+                if cpu_blocks:
+                    cpu_cancel.set()
                 blocks.close()
+                if cpu_blocks:
+                    cpu_reader_drain_s += time.perf_counter() - drain_started
         if output is not None:
             flush = getattr(output, 'flush', None)
             if callable(flush):
@@ -452,10 +677,21 @@ def backproject_spherical_volume_to_volume(
              'kernel_seconds', 'metadata_seconds', 'pack_seconds', 'd2h_seconds'))
         print(f'Spherical projection complete {spherical_view.name}: backend={backend}, '
               f'total_s={time.perf_counter() - started:.6f}, cpu_slices={cpu_slices}, '
-              f'cuda_slices={cuda_slices}{metrics}', flush=True)
+              f'cuda_slices={cuda_slices}, admission_attempts={admission_attempts}, '
+              f'admission_probe_s={admission_probe_s:.6f}, cpu_worker_s={cpu_worker_s:.6f}, '
+              f'cpu_result_wait_s={cpu_result_wait_s:.6f}, cpu_publish_s={cpu_publish_s:.6f}, '
+              f'cpu_reader_drain_s={cpu_reader_drain_s:.6f}, cpu_cancelled_blocks={cpu_cancelled_blocks}, '
+              f'gpu_result_wait_s={gpu_result_wait_s:.6f}, gpu_publish_s={gpu_publish_s:.6f}'
+              f', cpu_backend={cpu_backend}, cpu_setup_seconds={cpu_setup_seconds:.6f}'
+              f', cpu_compact_slices={cpu_compact_slices}, cpu_empty_slices={cpu_empty_slices}'
+              f', cpu_payload_bytes={cpu_payload_bytes}, cpu_compact_pull_voxels={cpu_compact_pull_voxels}'
+              f', cpu_compact_scan_voxels={cpu_compact_scan_voxels}'
+              f'{metrics}', flush=True)
         return output if output is not None else SinkOnlyProjectionResult(shape)
-    except BaseException:
+    except BaseException as exc:
         failed = True
+        if sink_only and not callback_aborted:
+            _abort_projection_block_callback(projection_block_callback, exc)
         close_memmap_array_without_flush(output)
         raise
     finally:

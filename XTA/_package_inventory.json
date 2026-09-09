@@ -10733,5 +10733,609 @@
         "reason": "Reuse qualified analytic bounds for CPU scheduling; retain scalar oracle."
       }
     ]
+  },
+  "v21_0_5_review": {
+    "release": "21.0.5",
+    "previous_review_sha256": "8c8875883d5568194c7a709023ae50061b2a7b6c8a04f5fd48bc3fc5bd24cec7",
+    "source_git_commit": "9b9fbfc34c2e65764e5987d6c6a6f16b706f1fdd",
+    "source_snapshot": {
+      "branch": "codex/v21-spherical-optimization",
+      "version": "21.0.7",
+      "commit": "31c95fd7c90133403dc953ae24e03aeab6c6aec9",
+      "included_commits": [
+        "cd4a28b42acf53615f3e746349872e1231788934",
+        "69acdddb314cc9ed171928f6842dd1fe9fe254df",
+        "31c95fd7c90133403dc953ae24e03aeab6c6aec9"
+      ]
+    },
+    "definitions": [
+      {
+        "module": "backprojection",
+        "previous_sha256": "af7bf0811ceb304def0bc83adcfa585db9d496526291aa91226c248bb65ebf0e",
+        "sha256": "470e9cb6ba41ee4bc214102cf37eb006d0e5449d9eaaf746dac7e0a09d59f4bc",
+        "name": "_MainProcessGpuStageCoordinator",
+        "reason": "Serve pressure demand FIFO, hand one drained GPU to one successor with a two-second claim window and two-retirement cap; preserve inference, ownership, expiry and failure fences. Allow continuously refreshed Spherical CPU demand to request one bounded retirement turn after30seconds below pressure, preserving FIFO, expiry, exclusive fences, two-turn fairness, optouts and diagnostic reasons."
+      },
+      {
+        "module": "pipeline",
+        "previous_sha256": null,
+        "sha256": "8341d44bfd33a75ab4e2338dc44b45c05bc9d0e49ebd3860d7298e930d4d42fc",
+        "name": "_execution_runtime_provenance",
+        "reason": "Record nonlinear geometry/scheduler source hashes, parent-load state and locality option without initializing accelerator runtimes. Record opt-in quality requests and nonlinear implementation source hashes, including nested sampling policy modules. Record compact/age-retirement requests, complete native sampler source provenance and separate age/pressure grant counters without changing model-frame planning."
+      },
+      {
+        "module": "pipeline",
+        "previous_sha256": "7bc946e55a60f7f1a426cc86aee3e854554ce6ef8d0310698c51f4ea859b0c5a",
+        "sha256": "505dc4eded234caa7588ca015d7ba4e2df6fa0c6cb876b14ac29b7500f0dfa05",
+        "name": "_main_impl",
+        "reason": "Report pressure handoffs/expirations and extended execution provenance without changing numerical pipeline work. Record compact/age-retirement requests, complete native sampler source provenance and separate age/pressure grant counters without changing model-frame planning."
+      },
+      {
+        "module": "spherical_projection",
+        "previous_sha256": "08756a4588c8b9eac1406c45c8adfc26e24280a9d01db1a8d1b73f3da8007d4d",
+        "sha256": "2c44beed1705d61276244eb990e98d88c3e427f0257a2663f79e03c85c9303fd",
+        "name": "_ordered_spherical_blocks",
+        "reason": "Signal discarded prefetch cancellation before mandatory reader joins while retaining exception and source ownership. Publish exact CPU empty ranges and tight raw/packbits crops off-thread, with conservative ROI pulls, bounded records/payload, transactional sink failure and exactly-once CPU-to-CUDA promotion."
+      },
+      {
+        "module": "spherical_projection",
+        "previous_sha256": "782988dd9457d5d915396aefe7990185abfeaea3cc3c82768a0c04492f47a462",
+        "sha256": "1eda1d593331510ec6ec83421086551486d9b443147c49f79144ee0fe0de80db",
+        "name": "_project_spherical_block",
+        "reason": "Cancel abandoned CPU blocks before allocation or at bounded pull-chunk boundaries; preserve the default complete scalar reference. Select the optional fused FP64 CPU pull only after failed initial CUDA admission and before publication, preserving the NumPy oracle, budgets and cancellation."
+      },
+      {
+        "module": "spherical_projection",
+        "previous_sha256": "dfba80ca65ee709082f43d72d8f8355504e3ab24a1170bbbe8e23d231f0393a9",
+        "sha256": "51537f01ae8d2a4a731415b4e3a26f9381f29eb64a2bdfff37ec2c46a9abf42f",
+        "name": "backproject_spherical_volume_to_volume",
+        "reason": "Cancel unpublished CPU prefetch before GPU consumption, retain joins and expose distinct CPU-work/wait/publication/admission/drain timings. Select the optional fused FP64 CPU pull only after failed initial CUDA admission and before publication, preserving the NumPy oracle, budgets and cancellation. Publish exact CPU empty ranges and tight raw/packbits crops off-thread, with conservative ROI pulls, bounded records/payload, transactional sink failure and exactly-once CPU-to-CUDA promotion."
+      },
+      {
+        "module": "tta_scheduler",
+        "previous_sha256": "12fbfb21b6671b140c3c2ff752949bef3fbb77b41718e9adfe296d7d4aa8aff8",
+        "sha256": "fc1e41b27063e2ef9746d045ec27a9a8d42d8c47e1768a54efed853d9be2f240",
+        "name": "TtaScheduler",
+        "reason": "Prefer cache-local or distinct admitted Spherical parents, retain stealing and final-lease priority, and use75percent/62.5percent pressure hysteresis inside existing budgets."
+      },
+      {
+        "module": "tta_scheduler",
+        "previous_sha256": "82cfb7c4e87720bcf4e9118aa920ed86f710d876fd9ab65588e0d277664c1891",
+        "sha256": "6cfcc4bd5ecc4711c05328ae506c656ae07017657cd793ce65620b630daacc01",
+        "name": "TtaSchedulerState",
+        "reason": "Retain bounded per-worker parent hints and pressure hysteresis state without additional arrays or admission leases."
+      },
+      {
+        "module": "cuda_backend",
+        "previous_sha256": "a442c02aebdd4a2f40d310d838f89d7e522cd828ff1af4166d5275f26703aa39",
+        "sha256": "0fd9e4fdde04e7d0d0417ae93e48973503432faed97b106bf2fab937a978b8da",
+        "name": "_GpuWorkerRenderEngine",
+        "reason": "Add exact Radial column geometry reuse with bounded stream-owned scratch/output, active-row bundle guard and explicit override; partition native Spherical frame caches by effective sampler mode."
+      },
+      {
+        "module": "cuda_backend",
+        "previous_sha256": "d452ff9b1a55bb4ce7d57da2830fb3c6570601e71b7b018bd992e23113e2e5bd",
+        "sha256": "6a6389855ad65068068f1afce9d3eb305d3415fa3a32554993219d9a075e2880",
+        "name": "_radial_native_kernels",
+        "reason": "Add exact Radial column geometry reuse with bounded stream-owned scratch/output, active-row bundle guard and explicit override; partition native Spherical frame caches by effective sampler mode."
+      },
+      {
+        "module": "cuda_backend",
+        "previous_sha256": null,
+        "sha256": "24af2674b1acd3a46bcc14f6673f6a9b5689cdb20e63c4f0fd8ee2897b46ccf8",
+        "name": "radial_column_geometry_enabled",
+        "reason": "Add exact Radial column geometry reuse with bounded stream-owned scratch/output, active-row bundle guard and explicit override; partition native Spherical frame caches by effective sampler mode."
+      },
+      {
+        "module": "cuda_backend",
+        "previous_sha256": null,
+        "sha256": "e334c7092eefdcdcd0e8c2b7e319598cca23d2c42eb1e93be3576f4ffe119893",
+        "name": "radial_column_geometry_for_shape",
+        "reason": "Add exact Radial column geometry reuse with bounded stream-owned scratch/output, active-row bundle guard and explicit override; partition native Spherical frame caches by effective sampler mode."
+      },
+      {
+        "module": "geometry_quality",
+        "previous_sha256": null,
+        "sha256": "95599a686f34f9f9bbd626e2d3c682eaa8ea02af2fbdaff8ae0d8b6d4e64a334",
+        "name": "_flag",
+        "reason": "Dependency-light opt-in bundle and per-feature overrides; qualify FP32 source axes at4096 and distinguish requests from actual dispatch."
+      },
+      {
+        "module": "geometry_quality",
+        "previous_sha256": null,
+        "sha256": "84c85e7481692fac0c77d9cda5cd99531d5f7014953f148bfe0dd11ae1368fcc",
+        "name": "fast_geometry_enabled",
+        "reason": "Dependency-light opt-in bundle and per-feature overrides; qualify FP32 source axes at4096 and distinguish requests from actual dispatch."
+      },
+      {
+        "module": "geometry_quality",
+        "previous_sha256": null,
+        "sha256": "7de785f1b60e13eb1bce63a7523a4f139be6b33c97c4ff3f120c69544294608a",
+        "name": "geometry_quality_request_record",
+        "reason": "Dependency-light opt-in bundle and per-feature overrides; qualify FP32 source axes at4096 and distinguish requests from actual dispatch."
+      },
+      {
+        "module": "geometry_quality",
+        "previous_sha256": null,
+        "sha256": "b50a131fbfe08108357a928fc55eaa1fbc4ff9687c5ced1dcf4ceb980654d465",
+        "name": "radial_columns_requested",
+        "reason": "Dependency-light opt-in bundle and per-feature overrides; qualify FP32 source axes at4096 and distinguish requests from actual dispatch."
+      },
+      {
+        "module": "geometry_quality",
+        "previous_sha256": null,
+        "sha256": "4de5d32e706294a9fed8d0db7520b6b69255afb89c3a1ab5ac68f89830bdf1c1",
+        "name": "spherical_cpu_compiled_requested",
+        "reason": "Dependency-light opt-in bundle and per-feature overrides; qualify FP32 source axes at4096 and distinguish requests from actual dispatch."
+      },
+      {
+        "module": "geometry_quality",
+        "previous_sha256": null,
+        "sha256": "439c564d5b227824aaf736eda88963d6f13b6db3d0f973ce78cc00da2281d591",
+        "name": "spherical_fp32_requested",
+        "reason": "Dependency-light opt-in bundle and per-feature overrides; qualify FP32 source axes at4096 and distinguish requests from actual dispatch."
+      },
+      {
+        "module": "geometry_quality",
+        "previous_sha256": null,
+        "sha256": "1ffa58a9f66e4f24356f15256ac0ec59937aa236b28d1d41455a136193d7762c",
+        "name": "spherical_fp32_shape_eligible",
+        "reason": "Dependency-light opt-in bundle and per-feature overrides; qualify FP32 source axes at4096 and distinguish requests from actual dispatch."
+      },
+      {
+        "module": "spherical_cuda",
+        "previous_sha256": "ea761c414e435e9fa94d4c70e9f36c64b43247b87cd6a43c83356cf52506c7d2",
+        "sha256": "9bc7c3af7b7992ad57dd5aea839ddd856c2d90d7b0ea2616c1ad45055df9717d",
+        "name": "_build_cached_directions",
+        "reason": "Add guarded FP32 virtual-gray8 sampling with distinct typed LRU entries, actual-byte budget, stream ownership, reference fallback and explicit intensity-policy binding."
+      },
+      {
+        "module": "spherical_cuda",
+        "previous_sha256": "e36921c0b0ccafdf8e36e334bb6d092fadd3aaabd2caefd72804e3cb88c939d6",
+        "sha256": "9b047ed9a1e0d69b812dcd28695e8d1ec6902fedec4f31c3efda0ce2b81ab1bf",
+        "name": "_build_direction_block",
+        "reason": "Add guarded FP32 virtual-gray8 sampling with distinct typed LRU entries, actual-byte budget, stream ownership, reference fallback and explicit intensity-policy binding."
+      },
+      {
+        "module": "spherical_cuda",
+        "previous_sha256": "0f2327857d71b60024116405228e03314372a6992633da62be0113efa3b195d8",
+        "sha256": "64435c4d802f6fa75501bd08c2879c16eebf5f298fdb0a433a1fdf7d7cd4773b",
+        "name": "_direction_blocks",
+        "reason": "Add guarded FP32 virtual-gray8 sampling with distinct typed LRU entries, actual-byte budget, stream ownership, reference fallback and explicit intensity-policy binding."
+      },
+      {
+        "module": "spherical_cuda",
+        "previous_sha256": "dc395c1af12bb140969d045d97df8a92f03e1dc07a47163c250daf341e195ca0",
+        "sha256": "5fc7275e8893244b68dba86495b79701ab037db4665eac83a41a881a80084050",
+        "name": "_direction_cache_stats",
+        "reason": "Add guarded FP32 virtual-gray8 sampling with distinct typed LRU entries, actual-byte budget, stream ownership, reference fallback and explicit intensity-policy binding."
+      },
+      {
+        "module": "spherical_cuda",
+        "previous_sha256": null,
+        "sha256": "e76fc5cafbe58bb7a84d4b0fcb0dd7bbb6faebe0dba5827170d74723f429854c",
+        "name": "_render_spherical_fp32_cuda",
+        "reason": "Add guarded FP32 virtual-gray8 sampling with distinct typed LRU entries, actual-byte budget, stream ownership, reference fallback and explicit intensity-policy binding."
+      },
+      {
+        "module": "spherical_cuda",
+        "previous_sha256": "bc2398f4d0ddd1f01a9d7949730c198e49fce10854a8f1c26fb09994191c7c2f",
+        "sha256": "dd39b5a604b25baaa391044ff138aa469284229f1ab4e3ab4ab81c5a0e7663f7",
+        "name": "_render_spherical_native_cuda",
+        "reason": "Add guarded FP32 virtual-gray8 sampling with distinct typed LRU entries, actual-byte budget, stream ownership, reference fallback and explicit intensity-policy binding."
+      },
+      {
+        "module": "spherical_cuda",
+        "previous_sha256": null,
+        "sha256": "ac4d58e2a676f6f0fcd6ad45388d7a85f278a210c68e438efe7c9902f9cdf223",
+        "name": "_spherical_fp32_eligible",
+        "reason": "Add guarded FP32 virtual-gray8 sampling with distinct typed LRU entries, actual-byte budget, stream ownership, reference fallback and explicit intensity-policy binding."
+      },
+      {
+        "module": "spherical_cuda",
+        "previous_sha256": null,
+        "sha256": "b67acdbe25aacc4ea51dcc2576cb7cbc2de9b152e5c31a587bfa7fafcaf0adff",
+        "name": "_spherical_fp32_kernels",
+        "reason": "Add guarded FP32 virtual-gray8 sampling with distinct typed LRU entries, actual-byte budget, stream ownership, reference fallback and explicit intensity-policy binding."
+      },
+      {
+        "module": "spherical_cuda",
+        "previous_sha256": "26012e4ce00cbc5389d63d14be8897cd5b0a0bd718956de6fbe370cf6cd75435",
+        "sha256": "5f3c8803495f55822a523e2a1751ef1f5b297ccc380fddd722ca3b98bbef843a",
+        "name": "_upload_direction_arrays",
+        "reason": "Add guarded FP32 virtual-gray8 sampling with distinct typed LRU entries, actual-byte budget, stream ownership, reference fallback and explicit intensity-policy binding."
+      },
+      {
+        "module": "spherical_cuda",
+        "previous_sha256": "b75823dd78d39b51eadd18a651393db71413f9295d3146a769cff9b921372872",
+        "sha256": "37cd84bce1e6fc06ac3d0a9fdc9d41ffe200784b559fac7a75aba1e7bac4e48d",
+        "name": "render_spherical_native_resident",
+        "reason": "Add guarded FP32 virtual-gray8 sampling with distinct typed LRU entries, actual-byte budget, stream ownership, reference fallback and explicit intensity-policy binding."
+      },
+      {
+        "module": "spherical_projection",
+        "previous_sha256": null,
+        "sha256": "4e98a2939589c9d6cbbc37022874c78c9db0732ea0b8c5afd9f43b91401c251c",
+        "name": "_select_spherical_cpu_pull",
+        "reason": "Select the optional fused FP64 CPU pull only after failed initial CUDA admission and before publication, preserving the NumPy oracle, budgets and cancellation."
+      },
+      {
+        "module": "spherical_projection_cpu",
+        "previous_sha256": null,
+        "sha256": "d863442c29b14d59086893404626beebce895eecdaf87dcfa2b1c0053a52b38a",
+        "name": "SphericalCpuProjectionUnavailable",
+        "reason": "Fused scalar FP64 categorical pull without fastmath or source copies; guard optional dispatcher/compilation setup and retain checked metadata plus propagated numerical failures."
+      },
+      {
+        "module": "spherical_projection_cpu",
+        "previous_sha256": null,
+        "sha256": "6c99655ee8d65614c1730e9ca9b2bb4d8b2b499cda100c8f3fc8f0868b5453de",
+        "name": "_pull_spherical_f64",
+        "reason": "Fused scalar FP64 categorical pull without fastmath or source copies; guard optional dispatcher/compilation setup and retain checked metadata plus propagated numerical failures. Extend the same FP64 categorical pull to bounded rectangles with global voxel centers, unchanged scalar arithmetic and validation before compiled indexing."
+      },
+      {
+        "module": "spherical_projection_cpu",
+        "previous_sha256": null,
+        "sha256": "9d98a92a8e4b6d22ba60971f35cb48aa8a5f7be27b3debb2b0a8fd757d39eed2",
+        "name": "_spherical_cpu_kernel_arguments",
+        "reason": "Fused scalar FP64 categorical pull without fastmath or source copies; guard optional dispatcher/compilation setup and retain checked metadata plus propagated numerical failures. Extend the same FP64 categorical pull to bounded rectangles with global voxel centers, unchanged scalar arithmetic and validation before compiled indexing."
+      },
+      {
+        "module": "spherical_projection_cpu",
+        "previous_sha256": null,
+        "sha256": "cc7ba785b2becf37751903be2511b76e44eb21d231384ddee1057b2e6df0c71e",
+        "name": "prepare_spherical_chunk_numba",
+        "reason": "Fused scalar FP64 categorical pull without fastmath or source copies; guard optional dispatcher/compilation setup and retain checked metadata plus propagated numerical failures."
+      },
+      {
+        "module": "spherical_projection_cpu",
+        "previous_sha256": null,
+        "sha256": "6d5c007f3c64dcab2e632f8d65cadb0441ec31f0f741580608c9ee1cd487ff18",
+        "name": "pull_spherical_chunk_numba",
+        "reason": "Fused scalar FP64 categorical pull without fastmath or source copies; guard optional dispatcher/compilation setup and retain checked metadata plus propagated numerical failures."
+      },
+      {
+        "module": "unification/sampling",
+        "previous_sha256": null,
+        "sha256": "789e3b43bb87e744f42a4cc81d6829bcb792beb34f9a4b9668fe1aa3bf3b564e",
+        "name": "_forward_sampling_policy",
+        "reason": "Preserve strict policy21 and categorical semantics; add opt-in policy22 with a dedicated Spherical FP32 backend, scoped tolerance, requested capability metadata and spawn identity."
+      },
+      {
+        "module": "unification/sampling",
+        "previous_sha256": "77607959debb6eb253a416a3c05d0008f31516e21e4c241236d4a6f308d140ca",
+        "sha256": "6eedd6d9ba6bfe3b03c3082846466b60a7ae2f617e51492aca0a89f4937e4fe1",
+        "name": "forward_sampling_execution_record",
+        "reason": "Preserve strict policy21 and categorical semantics; add opt-in policy22 with a dedicated Spherical FP32 backend, scoped tolerance, requested capability metadata and spawn identity."
+      },
+      {
+        "module": "unification/sampling",
+        "previous_sha256": "5b4e96c3a55fb38f585ed840088f2b33dafa13b61b9a987a7cc26d2cc61fc6b7",
+        "sha256": "0deb646a1cd1efedebc7701cbed9fe53ff9165bd3a561c0ed34ae899c407c477",
+        "name": "forward_sampling_policy",
+        "reason": "Preserve strict policy21 and categorical semantics; add opt-in policy22 with a dedicated Spherical FP32 backend, scoped tolerance, requested capability metadata and spawn identity."
+      },
+      {
+        "module": "unification/sampling",
+        "previous_sha256": "ebd39032c8b10b41ac1ec0eb1b2a88764fbb3e9c85a5612ce42ad6b8ce74d2a5",
+        "sha256": "c58b301adfabeba5a5217bfc7291ef375dbe29cc1becc7af0cf6315e4b46707e",
+        "name": "raster_plan_spawn_spec",
+        "reason": "Preserve strict policy21 and categorical semantics; add opt-in policy22 with a dedicated Spherical FP32 backend, scoped tolerance, requested capability metadata and spawn identity."
+      },
+      {
+        "module": "spherical_projection",
+        "previous_sha256": null,
+        "sha256": "2e6f2e9a9d0235126992bfca9b5554e6e149141844de5432a3f5ec1dc29fe1d5",
+        "name": "SphericalCpuEncodedBlock",
+        "reason": "Publish exact CPU empty ranges and tight raw/packbits crops off-thread, with conservative ROI pulls, bounded records/payload, transactional sink failure and exactly-once CPU-to-CUDA promotion."
+      },
+      {
+        "module": "spherical_projection",
+        "previous_sha256": null,
+        "sha256": "825af3274bffa513fab8df72763104cab5f78970fdd823cbdb1ffb4c87fc69d2",
+        "name": "_project_spherical_encoded_block",
+        "reason": "Publish exact CPU empty ranges and tight raw/packbits crops off-thread, with conservative ROI pulls, bounded records/payload, transactional sink failure and exactly-once CPU-to-CUDA promotion."
+      },
+      {
+        "module": "spherical_projection",
+        "previous_sha256": "2f9497321d2b476ff0c239a4ec78567bd3caa46aa14177cc0155a3b88a773a88",
+        "sha256": "bfda35f5ccf98dd15830424bb3068517671fb1a3de6f90a7eee8a3cc7321a140",
+        "name": "_spherical_block_schedule",
+        "reason": "Publish exact CPU empty ranges and tight raw/packbits crops off-thread, with conservative ROI pulls, bounded records/payload, transactional sink failure and exactly-once CPU-to-CUDA promotion."
+      },
+      {
+        "module": "spherical_projection",
+        "previous_sha256": null,
+        "sha256": "4754d1b5eaa22c75e2e6225c781806dc8666172e3f71c240006f2dd25f4a607c",
+        "name": "spherical_cpu_compact_enabled",
+        "reason": "Publish exact CPU empty ranges and tight raw/packbits crops off-thread, with conservative ROI pulls, bounded records/payload, transactional sink failure and exactly-once CPU-to-CUDA promotion."
+      },
+      {
+        "module": "spherical_projection_cpu",
+        "previous_sha256": null,
+        "sha256": "897881582363d5783d0636482cca86771caf5c0b2825b8945d4489075610a9cd",
+        "name": "pull_spherical_rectangle_numba",
+        "reason": "Extend the same FP64 categorical pull to bounded rectangles with global voxel centers, unchanged scalar arithmetic and validation before compiled indexing."
+      }
+    ],
+    "statements": [
+      {
+        "module": "__init__",
+        "previous_sha256": "199b4fc8d8484505b1da95b2199feeab46b228cc2b5f87103c4de7dee7b01442",
+        "sha256": "7eba64c4b8a3fd0eff15c02328812e662d37093cf74bb812b74dc6fb6b3ac2d5",
+        "label": "Assign:7",
+        "reason": "Align runtime and sole launcher identity with main v21.0.5."
+      },
+      {
+        "module": "cli",
+        "previous_sha256": "528ed9b0b96a50b43cf42c47114a64d25d30f979c727f2870bf7c04038064827",
+        "sha256": "bd08087f942721985540145bef5fcba7fa33d78116a3bd9477ca8db4ca05787c",
+        "label": "Assign:13",
+        "reason": "Align runtime and sole launcher identity with main v21.0.5."
+      },
+      {
+        "module": "cli",
+        "previous_sha256": "85f08eb249c7d5c8995cd3c112d7a7eae8dd1948cd9e96cd540d856d87be8d32",
+        "sha256": "b5c2320eac17a113e5d9798c8a67c6e55ab0a5d003f8634ab156bdf8b70ced98",
+        "label": "Assign:14",
+        "reason": "Align runtime and sole launcher identity with main v21.0.5."
+      },
+      {
+        "module": "config",
+        "previous_sha256": "528ed9b0b96a50b43cf42c47114a64d25d30f979c727f2870bf7c04038064827",
+        "sha256": "bd08087f942721985540145bef5fcba7fa33d78116a3bd9477ca8db4ca05787c",
+        "label": "Assign:22",
+        "reason": "Align runtime and sole launcher identity with main v21.0.5."
+      },
+      {
+        "module": "config",
+        "previous_sha256": "7a702e7224c8631e358a4ba932fbade9611ef18f341586d7eeef47a472ae98d0",
+        "sha256": "eeeba4ab677ceb1c1c6d8cbcfe77e89fdab8cf2dc076e4596a3e21d843e1c6aa",
+        "label": "Assign:24",
+        "reason": "Align runtime and sole launcher identity with main v21.0.5."
+      },
+      {
+        "module": "spherical_projection",
+        "previous_sha256": "f58f2ea673fa2a5627654ed695deb2cb35329421a039e6485db604bafb90b572",
+        "sha256": "70701512fe385becb76d568aafa1b6d5055416323e15deff79dc7a1f500e91d3",
+        "label": "ImportFrom:11",
+        "reason": "Use per-projection cancellation events and explicit abandoned-future cancellation without weakening mandatory reader joins."
+      },
+      {
+        "module": "spherical_projection",
+        "previous_sha256": null,
+        "sha256": "80f21c52b46d18d972ae93db225486a900db10799e9bdba98d07dbcc819ff502",
+        "label": "import_threading",
+        "reason": "Use per-projection cancellation events and explicit abandoned-future cancellation without weakening mandatory reader joins."
+      },
+      {
+        "module": "cuda_backend",
+        "previous_sha256": null,
+        "sha256": "4478221487f2829cdc031b9e9e9732b9e6dab5581a3e706f344c7fd2bcbdf699",
+        "label": "importfrom_.geometry_quality",
+        "reason": "Add exact Radial column geometry reuse with bounded stream-owned scratch/output, active-row bundle guard and explicit override; partition native Spherical frame caches by effective sampler mode."
+      },
+      {
+        "module": "geometry_quality",
+        "previous_sha256": null,
+        "sha256": "c60063984c1f6e2413bedfb284c69e2d00dc939331edfa1e55250ec7ee71e24f",
+        "label": "binding_SPHERICAL_FP32_BACKEND",
+        "reason": "Dependency-light opt-in bundle and per-feature overrides; qualify FP32 source axes at4096 and distinguish requests from actual dispatch."
+      },
+      {
+        "module": "geometry_quality",
+        "previous_sha256": null,
+        "sha256": "e35bb65dcb24b555641d13615533d034e7ecc3fbfef8fb8698dab38a91b1aa91",
+        "label": "binding_SPHERICAL_FP32_MAX_AXIS",
+        "reason": "Dependency-light opt-in bundle and per-feature overrides; qualify FP32 source axes at4096 and distinguish requests from actual dispatch."
+      },
+      {
+        "module": "geometry_quality",
+        "previous_sha256": null,
+        "sha256": "80bfaaf271c53c26a889423e035cdc9b1ebef8227ac441a829568db516864009",
+        "label": "docstring_module",
+        "reason": "Dependency-light opt-in bundle and per-feature overrides; qualify FP32 source axes at4096 and distinguish requests from actual dispatch."
+      },
+      {
+        "module": "geometry_quality",
+        "previous_sha256": null,
+        "sha256": "60e489325a19bee8be6a450945dd253634f01297b803d2869e489219288b5372",
+        "label": "import_operator",
+        "reason": "Dependency-light opt-in bundle and per-feature overrides; qualify FP32 source axes at4096 and distinguish requests from actual dispatch."
+      },
+      {
+        "module": "geometry_quality",
+        "previous_sha256": null,
+        "sha256": "ac3a74d6dd975a8e8fe4b7f85fce794793a9355595b850e3926964913948d386",
+        "label": "import_os",
+        "reason": "Dependency-light opt-in bundle and per-feature overrides; qualify FP32 source axes at4096 and distinguish requests from actual dispatch."
+      },
+      {
+        "module": "geometry_quality",
+        "previous_sha256": null,
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "label": "importfrom___future__",
+        "reason": "Dependency-light opt-in bundle and per-feature overrides; qualify FP32 source axes at4096 and distinguish requests from actual dispatch."
+      },
+      {
+        "module": "spherical_cuda",
+        "previous_sha256": null,
+        "sha256": "455768e12d1632a7b907c7ad274a22390ce026a74165a8effd59eca1af6fccc0",
+        "label": "binding__FP32_KERNELS",
+        "reason": "Add guarded FP32 virtual-gray8 sampling with distinct typed LRU entries, actual-byte budget, stream ownership, reference fallback and explicit intensity-policy binding."
+      },
+      {
+        "module": "spherical_cuda",
+        "previous_sha256": null,
+        "sha256": "e37c6bdb249d199954cffbb242aaffca332b9700cd6025dc0e7c6f436e77dbf3",
+        "label": "binding__FP32_KERNEL_ERROR",
+        "reason": "Add guarded FP32 virtual-gray8 sampling with distinct typed LRU entries, actual-byte budget, stream ownership, reference fallback and explicit intensity-policy binding."
+      },
+      {
+        "module": "spherical_cuda",
+        "previous_sha256": null,
+        "sha256": "db6ed20c030ec15fc1ed1ee0f23951a0cfedcae9d21bb18e4b88fa3d50029008",
+        "label": "importfrom_.geometry_quality",
+        "reason": "Add guarded FP32 virtual-gray8 sampling with distinct typed LRU entries, actual-byte budget, stream ownership, reference fallback and explicit intensity-policy binding."
+      },
+      {
+        "module": "spherical_projection",
+        "previous_sha256": null,
+        "sha256": "8cae185e0005fc2a9d67faecdcc4873d23efe59b5981e58895b612fdd853ae4e",
+        "label": "importfrom_.geometry_quality",
+        "reason": "Select the optional fused FP64 CPU pull only after failed initial CUDA admission and before publication, preserving the NumPy oracle, budgets and cancellation."
+      },
+      {
+        "module": "spherical_projection_cpu",
+        "previous_sha256": null,
+        "sha256": "63020afc675eee8a36e437c13a59a4b57c6a23a77655ef87114867bd4a20ada3",
+        "label": "If_115",
+        "reason": "Fused scalar FP64 categorical pull without fastmath or source copies; guard optional dispatcher/compilation setup and retain checked metadata plus propagated numerical failures."
+      },
+      {
+        "module": "spherical_projection_cpu",
+        "previous_sha256": null,
+        "sha256": "52eb79cbd0a634c7cd54af7f304b33a6263489bd2cfc1f9a805f9daeb2045995",
+        "label": "binding__EMPTY_BOXES",
+        "reason": "Fused scalar FP64 categorical pull without fastmath or source copies; guard optional dispatcher/compilation setup and retain checked metadata plus propagated numerical failures."
+      },
+      {
+        "module": "spherical_projection_cpu",
+        "previous_sha256": null,
+        "sha256": "62dfc204b213a46d14451a67a59b2d9ac8d1625a929df9f22a601b16be349147",
+        "label": "binding__compiled_pull_spherical_f64",
+        "reason": "Fused scalar FP64 categorical pull without fastmath or source copies; guard optional dispatcher/compilation setup and retain checked metadata plus propagated numerical failures."
+      },
+      {
+        "module": "spherical_projection_cpu",
+        "previous_sha256": null,
+        "sha256": "c2ac2fee3ddb3649c691ab29da24c51cca922f57e65586eeacb81b759994965b",
+        "label": "binding__dispatcher_unavailable_reason",
+        "reason": "Fused scalar FP64 categorical pull without fastmath or source copies; guard optional dispatcher/compilation setup and retain checked metadata plus propagated numerical failures."
+      },
+      {
+        "module": "spherical_projection_cpu",
+        "previous_sha256": null,
+        "sha256": "47cb038ff26f58f0c19637645fce093fb8b3aaef61dc6d8609e884b87930af6f",
+        "label": "docstring_module",
+        "reason": "Fused scalar FP64 categorical pull without fastmath or source copies; guard optional dispatcher/compilation setup and retain checked metadata plus propagated numerical failures."
+      },
+      {
+        "module": "spherical_projection_cpu",
+        "previous_sha256": null,
+        "sha256": "f329650e2c61a07a1bab85b32296a6d93760e313e108904819fa27d09cf3954d",
+        "label": "import_math",
+        "reason": "Fused scalar FP64 categorical pull without fastmath or source copies; guard optional dispatcher/compilation setup and retain checked metadata plus propagated numerical failures."
+      },
+      {
+        "module": "spherical_projection_cpu",
+        "previous_sha256": null,
+        "sha256": "271fc31378e1108a9784c29c3c4768de571ce080301b4ad9721ba767fcf5842b",
+        "label": "import_numpy",
+        "reason": "Fused scalar FP64 categorical pull without fastmath or source copies; guard optional dispatcher/compilation setup and retain checked metadata plus propagated numerical failures."
+      },
+      {
+        "module": "spherical_projection_cpu",
+        "previous_sha256": null,
+        "sha256": "ec957ba350d00186ba6a0ec155661fb1ea750d7e4930799143e17797d4007285",
+        "label": "importfrom_._deps",
+        "reason": "Fused scalar FP64 categorical pull without fastmath or source copies; guard optional dispatcher/compilation setup and retain checked metadata plus propagated numerical failures."
+      },
+      {
+        "module": "spherical_projection_cpu",
+        "previous_sha256": null,
+        "sha256": "890bede517510aea64e32258c9530f0172f5a6ea2fcbcb247fdadc40c714e8bf",
+        "label": "importfrom___future__",
+        "reason": "Fused scalar FP64 categorical pull without fastmath or source copies; guard optional dispatcher/compilation setup and retain checked metadata plus propagated numerical failures."
+      },
+      {
+        "module": "spherical_sampling_cuda",
+        "previous_sha256": null,
+        "sha256": "c179c339fc3a21518a31489dacdc1a08125249c57513e384017b87fd75db7d8a",
+        "label": "binding_SPHERICAL_FP32_SOURCE",
+        "reason": "FP32 coordinates and FMA sample the same virtual gray8 cube; retain zero borders, integer addresses and final gray8 rounding, with no native-T fusion."
+      },
+      {
+        "module": "spherical_sampling_cuda",
+        "previous_sha256": null,
+        "sha256": "4efa3ec7711fa6c9102bcb6b233e1cb57238fb23891b15bf2870fc2e6b4cb312",
+        "label": "docstring_module",
+        "reason": "FP32 coordinates and FMA sample the same virtual gray8 cube; retain zero borders, integer addresses and final gray8 rounding, with no native-T fusion."
+      },
+      {
+        "module": "unification/sampling",
+        "previous_sha256": null,
+        "sha256": "6adfe986c7f4b64952d9af42da3e6500036a9a960c25453495e0b9b36396e6d6",
+        "label": "importfrom_..geometry_quality",
+        "reason": "Preserve strict policy21 and categorical semantics; add opt-in policy22 with a dedicated Spherical FP32 backend, scoped tolerance, requested capability metadata and spawn identity."
+      },
+      {
+        "module": "spherical_projection",
+        "previous_sha256": null,
+        "sha256": "f0581641d73fd14df07acbd6a4148cf567f46d60c6bcf4e84deb29e481372fd6",
+        "label": "binding__COMPILED_CHUNK_BYTES_PER_VOXEL",
+        "reason": "Publish exact CPU empty ranges and tight raw/packbits crops off-thread, with conservative ROI pulls, bounded records/payload, transactional sink failure and exactly-once CPU-to-CUDA promotion."
+      },
+      {
+        "module": "spherical_projection",
+        "previous_sha256": null,
+        "sha256": "b5af3522331d9f49ffbf537849ad8152290e89a405cc7670b4e722d4a69558b3",
+        "label": "binding__CPU_ENCODED_SLICE_BYTES",
+        "reason": "Publish exact CPU empty ranges and tight raw/packbits crops off-thread, with conservative ROI pulls, bounded records/payload, transactional sink failure and exactly-once CPU-to-CUDA promotion."
+      },
+      {
+        "module": "spherical_projection",
+        "previous_sha256": null,
+        "sha256": "60e489325a19bee8be6a450945dd253634f01297b803d2869e489219288b5372",
+        "label": "import_operator",
+        "reason": "Publish exact CPU empty ranges and tight raw/packbits crops off-thread, with conservative ROI pulls, bounded records/payload, transactional sink failure and exactly-once CPU-to-CUDA promotion."
+      },
+      {
+        "module": "spherical_projection",
+        "previous_sha256": null,
+        "sha256": "4fd8a365392e6e42a3e45ae85023029da9f0694a88434016cd540ba66a4c3606",
+        "label": "importfrom_.cylindrical_cuda_projection",
+        "reason": "Publish exact CPU empty ranges and tight raw/packbits crops off-thread, with conservative ROI pulls, bounded records/payload, transactional sink failure and exactly-once CPU-to-CUDA promotion."
+      },
+      {
+        "module": "spherical_projection",
+        "previous_sha256": null,
+        "sha256": "321ed2ed3afceb74be547c9905ed4c676e453b1a68fe7cb2d3e214caeac2624d",
+        "label": "importfrom_dataclasses",
+        "reason": "Publish exact CPU empty ranges and tight raw/packbits crops off-thread, with conservative ROI pulls, bounded records/payload, transactional sink failure and exactly-once CPU-to-CUDA promotion."
+      },
+      {
+        "module": "spherical_projection_cpu",
+        "previous_sha256": null,
+        "sha256": "2ebf41200482f46c9489962d041262c3be7f9e51009c4ca50500b3284ce5ce73",
+        "label": "binding_pull_spherical_chunk_numba.rectangle",
+        "reason": "Extend the same FP64 categorical pull to bounded rectangles with global voxel centers, unchanged scalar arithmetic and validation before compiled indexing."
+      }
+    ],
+    "local_import_seam_updates": [
+      {
+        "module": "cuda_backend",
+        "name": "_GpuWorkerRenderEngine",
+        "previous_definition_sha256": "a442c02aebdd4a2f40d310d838f89d7e522cd828ff1af4166d5275f26703aa39",
+        "previous_seam_sha256": "61456a7e052e01fdd6a7d69b765fc39465506c03094833384038bede77b79d72",
+        "definition_sha256": "0fd9e4fdde04e7d0d0417ae93e48973503432faed97b106bf2fab937a978b8da",
+        "seam_sha256": "61456a7e052e01fdd6a7d69b765fc39465506c03094833384038bede77b79d72",
+        "reason": "Reviewed added geometry dispatch/cache bodies move the existing lazy-import offsets; every relative import and lexical scope remains identical to development v21.0.5."
+      }
+    ],
+    "preserved_radial_definition_updates": [
+      {
+        "module": "cuda_backend",
+        "qualified_name": "_GpuWorkerRenderEngine._render_radial_native_resident_cuda",
+        "previous_sha256": "b8d9f6fdd49e97d990415143f0a752e5f8dfa83c372b4e10a76509e2e39ec335",
+        "sha256": "8816e890786c503ea9c3ae7382c7321816e6f6f8a00997da7d1f3ee4074c3387",
+        "reason": "Explicitly review exact column hoisting and render-stream ownership in the preserved native Radial method; scalar and hoisted outputs were byte-identical in120million tested pixels."
+      }
+    ],
+    "complete_modules": [
+      "geometry_quality",
+      "spherical_projection_cpu",
+      "spherical_sampling_cuda"
+    ]
   }
 }

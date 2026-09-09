@@ -72,7 +72,9 @@ class SphericalCudaProjectionTests(unittest.TestCase):
         self.assertGreater(int(expected[0].sum()),0)
         root=Path(os.environ['XTA_SPHERICAL_TEST_ROOT']).resolve(strict=True)
         with tempfile.TemporaryDirectory(prefix='spherical-promote-',dir=root) as folder:
-            for packed, pressure in ((False, False), (True, False), (False, True), (True, True)):
+            for packed, pressure, compact_cpu in (
+                    (packed, pressure, compact) for packed in (False, True)
+                    for pressure in (False, True) for compact in (False, True)):
                 coordinator=bp._MainProcessGpuStageCoordinator()
                 coordinator.configure_workers([0])
                 coordinator.set_inference_priority_active(True)
@@ -94,6 +96,16 @@ class SphericalCudaProjectionTests(unittest.TestCase):
                     if not pressure:
                         coordinator.set_pending_inference_backlog(False)
                 def gpu(first,records,payload,**kwargs):
+                    if compact_cpu and first == 0:
+                        if pressure:
+                            self.assertFalse(coordinator.can_dispatch_inference(0))
+                        self.assertFalse(coordinator.snapshot()['stage_leases'])
+                        cpu_starts.append(first)
+                        encoded(first,records,payload,**kwargs)
+                        coordinator.finish_inference(0)
+                        if not pressure:
+                            coordinator.set_pending_inference_backlog(False)
+                        return
                     self.assertTrue(coordinator.snapshot()['stage_leases'])
                     gpu_starts.append(first)
                     encoded(first,records,payload,**kwargs)
@@ -101,6 +113,7 @@ class SphericalCudaProjectionTests(unittest.TestCase):
                     with mock.patch.object(bp,'_MAIN_PROCESS_GPU_STAGE_COORDINATOR',coordinator), \
                             mock.patch.object(sp,'_OUTPUT_BLOCK_BYTES',shape[1]*shape[2]), \
                             mock.patch.object(sp,'_CUDA_RECHECK_SLICES',1), \
+                            mock.patch.dict(os.environ, {'YOLO_TTA_CPU_SPHERICAL_COMPACT': str(int(compact_cpu))}), \
                             mock.patch.object(writer,'consume',side_effect=cpu), \
                             mock.patch.object(writer,'consume_encoded_block',side_effect=gpu):
                         sp.backproject_spherical_volume_to_volume(data,view,Path(folder)/'unused.dat','real promotion',

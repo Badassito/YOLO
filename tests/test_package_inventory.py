@@ -31,6 +31,67 @@ def inspect_seams(source: str):
 
 
 class PackageInventoryTests(unittest.TestCase):
+    def test_release_authenticates_compact_projection_and_age_admission(self) -> None:
+        for target in ('_MainProcessGpuStageCoordinator', '_project_spherical_encoded_block',
+                       '_pull_spherical_f64'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            review = manifest['v21_0_5_review']
+            record = next(item for item in review['definitions'] if item['name'] == target)
+            record['sha256'] = '0' * 64
+            with self.subTest(target=target), self.assertRaisesRegex(RuntimeError, 'v21.0.5 review digest mismatch'):
+                inventory.reviewed_v21_0_5_contract(
+                    manifest, manifest['v21_review'], *(manifest[f'v21_0_{i}_review'] for i in range(1, 5)))
+
+    def test_release_checks_current_compiled_kernel(self) -> None:
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = manifest['v21_0_5_review']
+        record = next(item for item in review['definitions'] if item['name'] == '_pull_spherical_f64')
+        self.assertIsNone(record['previous_sha256'])
+        original_digest = inventory.digest
+
+        def altered_kernel(node):
+            return '0' * 64 if getattr(node, 'name', None) == '_pull_spherical_f64' else original_digest(node)
+
+        with mock.patch.object(inventory, 'digest', side_effect=altered_kernel), self.assertRaisesRegex(
+                RuntimeError, 'v21 patch reviewed definition changed or is missing: spherical_projection_cpu._pull_spherical_f64'):
+            verify_inventory()
+
+    def test_release_authenticates_fast_geometry_and_preserved_radial_update(self) -> None:
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = manifest['v21_0_5_review']
+        update = review['preserved_radial_definition_updates'][0]
+        update['sha256'] = '0' * 64
+        with self.assertRaisesRegex(RuntimeError, 'v21.0.5 review digest mismatch'):
+            inventory.reviewed_v21_0_5_contract(
+                    manifest, manifest['v21_review'], *(manifest[f'v21_0_{i}_review'] for i in range(1, 5)))
+
+    def test_preserved_radial_update_requires_the_exact_predecessor(self) -> None:
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        patches = [manifest[f'v21_0_{i}_review'] for i in range(1, 6)]
+        patches[-1]['preserved_radial_definition_updates'][0]['previous_sha256'] = '0' * 64
+        with self.assertRaisesRegex(RuntimeError, 'preserved predecessor'):
+            inventory.reviewed_radial_definition_hashes(manifest['v21_review'], patches)
+
+    def test_release_authenticates_scheduling_and_cancelled_reader_lifetime(self) -> None:
+        for target in ('TtaScheduler', '_MainProcessGpuStageCoordinator', '_ordered_spherical_blocks'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            record = next(item for item in manifest['v21_0_5_review']['definitions'] if item['name'] == target)
+            record['sha256'] = '0' * 64
+            with self.subTest(target=target), self.assertRaisesRegex(RuntimeError, 'v21.0.5 review digest mismatch'):
+                inventory.reviewed_v21_0_5_contract(
+                    manifest, manifest['v21_review'], *(manifest[f'v21_0_{i}_review'] for i in range(1, 5)))
+
+    def test_release_cannot_skip_the_latest_retirement_coordinator(self) -> None:
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        fifth = manifest['v21_0_5_review']
+        record = next(item for item in fifth['definitions'] if item['name'] == '_MainProcessGpuStageCoordinator')
+        record['previous_sha256'] = '0' * 64
+        reauthenticated = hashlib.sha256(json.dumps(fifth, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        with mock.patch.object(inventory, 'REVIEWED_V21_0_5_SHA256', reauthenticated):
+            with self.assertRaisesRegex(RuntimeError, 'v21.0.5 supersession does not match its historical pin'):
+                inventory.reviewed_v21_0_5_contract(
+                    manifest, manifest['v21_review'], *(manifest[f'v21_0_{i}_review'] for i in range(1, 5)))
+
     def test_fourth_patch_authenticates_geometry_projection_and_compaction(self) -> None:
         for target in ('qsc_inverse', '_project_spherical_block', '_resident_mask_kernels'):
             manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
@@ -142,7 +203,8 @@ class PackageInventoryTests(unittest.TestCase):
                 ))
             return tree
 
-        for module in ('spherical_projection_bounds', 'spherical_preflight'):
+        for module in ('spherical_projection_bounds', 'spherical_preflight',
+                       'geometry_quality', 'spherical_projection_cpu', 'spherical_sampling_cuda'):
             with self.subTest(module=module), mock.patch.object(inventory.ast, 'parse', side_effect=parse_with_extra_statement):
                 with self.assertRaisesRegex(RuntimeError, f'complete-module statement coverage differs: {module}'):
                     verify_inventory()
@@ -214,7 +276,16 @@ class PackageInventoryTests(unittest.TestCase):
         key = ('cuda_backend', '_radial_native_kernels')
         _expected_hash, reason = REVIEWED_V20_ADDED_DEFINITIONS[key]
         with mock.patch.dict(REVIEWED_V20_ADDED_DEFINITIONS, {key: ('0' * 64, reason)}):
-            with self.assertRaisesRegex(RuntimeError, 'reviewed added definition changed or is missing: cuda_backend._radial_native_kernels'):
+            with self.assertRaisesRegex(RuntimeError, 'v21.0.5 supersession does not match its historical pin: cuda_backend._radial_native_kernels'):
+                verify_inventory()
+
+        original_digest = inventory.digest
+
+        def changed_kernel(node):
+            return '0' * 64 if getattr(node, 'name', None) == key[1] else original_digest(node)
+
+        with mock.patch.object(inventory, 'digest', side_effect=changed_kernel):
+            with self.assertRaisesRegex(RuntimeError, 'v20 reviewed added definition changed or is missing: cuda_backend._radial_native_kernels'):
                 verify_inventory()
 
     def test_azimuthal_rename_pins_exact_ast_without_accepting_shell_names_or_changed_math(self) -> None:

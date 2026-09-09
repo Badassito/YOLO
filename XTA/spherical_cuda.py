@@ -15,6 +15,7 @@ import time
 import numpy as np
 
 from .qsc import qsc_inverse
+from .geometry_quality import spherical_fp32_requested, spherical_fp32_shape_eligible
 
 
 _DIRECTION_CACHE_BYTES = 256 * 1024**2
@@ -22,6 +23,8 @@ _ROTATION_CACHE_ENTRIES = 32
 _ROW_BLOCK = 64
 _KERNELS = None
 _KERNEL_ERROR = ''
+_FP32_KERNELS = None
+_FP32_KERNEL_ERROR = ''
 
 
 def clear_spherical_render_cache(engine):
@@ -41,6 +44,7 @@ def _direction_cache_stats(engine):
         stats = engine._spherical_direction_cache_stats = {
             'cache_hits': 0, 'cache_misses': 0, 'cache_evictions': 0,
             'cache_host_fallbacks': 0,
+            'cache_device_fallbacks': 0,
             'host_build_blocks': 0, 'host_build_seconds': 0.0,
             'upload_calls': 0, 'upload_seconds': 0.0,
             'h2d_copies': 0, 'h2d_bytes': 0,
@@ -119,7 +123,8 @@ def _upload_direction_arrays(engine, host_directions, host_valid):
     on_cuda = str(engine.device).startswith('cuda')
     results = []
     try:
-        for host, dtype in ((host_directions, engine.torch.float64), (host_valid, engine.torch.bool)):
+        ray_dtype = engine.torch.float32 if host_directions.dtype == np.float32 else engine.torch.float64
+        for host, dtype in ((host_directions, ray_dtype), (host_valid, engine.torch.bool)):
             # Blocking transfers complete before the temporary host owners leave
             # scope. The caller's active render stream remains authoritative.
             results.append(engine.torch.as_tensor(host, dtype=dtype, device=engine.device))
@@ -132,20 +137,21 @@ def _upload_direction_arrays(engine, host_directions, host_valid):
     return tuple(results)
 
 
-def _build_direction_block(engine, key, row0, row1):
+def _build_direction_block(engine, key, row0, row1, dtype=np.float64):
     started = time.perf_counter()
     host_directions, host_valid = _build_host_direction_block(key, row0, row1)
+    host_directions = host_directions.astype(dtype, copy=False)
     stats = _direction_cache_stats(engine)
     stats['host_build_blocks'] += 1
     stats['host_build_seconds'] += time.perf_counter() - started
     return _upload_direction_arrays(engine, host_directions, host_valid)
 
 
-def _build_cached_directions(engine, key):
+def _build_cached_directions(engine, key, dtype=np.float64):
     """Build at most one cache-budget host entry, then transfer its two arrays."""
     rows, columns = key[3:5]
     started = time.perf_counter()
-    host_directions = np.empty((rows, columns, 3), dtype=np.float64)
+    host_directions = np.empty((rows, columns, 3), dtype=dtype)
     host_valid = np.empty((rows, columns), dtype=np.bool_)
     stats = _direction_cache_stats(engine)
     for row0 in range(0, rows, _ROW_BLOCK):
@@ -159,21 +165,26 @@ def _build_cached_directions(engine, key):
     return _upload_direction_arrays(engine, host_directions, host_valid)
 
 
-def _direction_blocks(engine, key):
+def _direction_blocks(engine, key, dtype=np.float64):
     """Reuse a whole patch when it fits; otherwise build bounded uncached strips."""
     rows, columns = key[3:5]
+    dtype = np.dtype(dtype)
+    if dtype not in (np.dtype(np.float32), np.dtype(np.float64)):
+        raise ValueError('Spherical direction plans support only float32 or float64')
+    pixel_bytes = 3 * dtype.itemsize + 1
+    cache_key = key + (dtype.str,)
     cache = getattr(engine, '_spherical_direction_cache', None)
     if cache is None:
         cache = engine._spherical_direction_cache = OrderedDict()
         engine._spherical_direction_cache_bytes = 0
-    entry = cache.get(key)
+    entry = cache.get(cache_key)
     stats = _direction_cache_stats(engine)
     if entry is not None:
         stats['cache_hits'] += 1
-        cache.move_to_end(key)
+        cache.move_to_end(cache_key)
     else:
         stats['cache_misses'] += 1
-        size = rows * columns * (3 * 8 + 1)
+        size = rows * columns * pixel_bytes
         if size <= _DIRECTION_CACHE_BYTES:
             while cache and engine._spherical_direction_cache_bytes + size > _DIRECTION_CACHE_BYTES:
                 _, (_, _, old_size) = cache.popitem(last=False)
@@ -182,20 +193,21 @@ def _direction_blocks(engine, key):
             # Keep QSC temporaries strip-bounded. Only the final direction and
             # validity arrays occupy a full, cache-budget-limited host entry.
             try:
-                directions, valid = _build_cached_directions(engine, key)
-            except MemoryError:
-                # Host staging is an optimization. Preserve the original
-                # bounded-strip route if its larger final host entry cannot fit.
-                stats['cache_host_fallbacks'] += 1
+                directions, valid = _build_cached_directions(engine, key, dtype=dtype)
+            except (MemoryError, engine.torch.OutOfMemoryError) as exc:
+                # Either staging arena can fail independently. Never publish
+                # partial entries; retain the bounded-strip sampler on OOM.
+                stats['cache_host_fallbacks' if isinstance(exc, MemoryError)
+                      else 'cache_device_fallbacks'] += 1
             else:
                 entry = (directions, valid, size)
-                cache[key] = entry
+                cache[cache_key] = entry
                 engine._spherical_direction_cache_bytes += size
-    block_rows = max(1, min(_ROW_BLOCK, max(1, _DIRECTION_CACHE_BYTES // (columns * 25))))
+    block_rows = max(1, min(_ROW_BLOCK, max(1, _DIRECTION_CACHE_BYTES // (columns * pixel_bytes))))
     if entry is None:
         for row0 in range(0, rows, block_rows):
             row1 = min(rows, row0 + block_rows)
-            directions, valid = _build_direction_block(engine, key, row0, row1)
+            directions, valid = _build_direction_block(engine, key, row0, row1, dtype=dtype)
             yield row0, directions, valid
     else:
         # CUDA can consume the cached plan in one launch. The reference sampler
@@ -338,6 +350,12 @@ def _render_spherical_native_cuda(engine, view, index):
     output_ref = kernels.cp.asarray(output)
     stream = _cupy_external_stream(kernels.cp, engine._stream)
     for row0, directions, valid in _direction_blocks(engine, key):
+        # Typed cache entries can be evicted while this reference kernel is
+        # queued on the render stream. Track those CuPy reads explicitly even
+        # when the plans/output were allocated on another Torch stream.
+        for tensor in (directions, valid, output):
+            if bool(tensor.is_cuda):
+                tensor.record_stream(engine._stream)
         count = int(valid.numel())
         kernels.kernel(
             ((count + 255) // 256,), (256,),
@@ -348,16 +366,89 @@ def _render_spherical_native_cuda(engine, view, index):
     return output
 
 
+def _spherical_fp32_kernels():
+    global _FP32_KERNELS, _FP32_KERNEL_ERROR
+    if _FP32_KERNELS is not None:
+        return _FP32_KERNELS
+    if _FP32_KERNEL_ERROR:
+        raise RuntimeError(_FP32_KERNEL_ERROR)
+    try:
+        import cupy as cp
+        from .spherical_sampling_cuda import SPHERICAL_FP32_SOURCE
+        module = cp.RawModule(code=SPHERICAL_FP32_SOURCE, options=('--std=c++11', '--fmad=true'))
+        _FP32_KERNELS = SimpleNamespace(cp=cp, module=module,
+                                       kernel=module.get_function('spherical_virtual_fp32'))
+        return _FP32_KERNELS
+    except Exception as exc:
+        _FP32_KERNEL_ERROR = f'Spherical FP32 kernel unavailable: {type(exc).__name__}: {exc}'
+        raise RuntimeError(_FP32_KERNEL_ERROR) from exc
+
+
+def _spherical_fp32_eligible(engine):
+    volume = engine._volume_gpu
+    return spherical_fp32_shape_eligible((int(volume.shape[0]), int(engine._logical_t),
+                                         int(volume.shape[1]), int(volume.shape[2])))
+
+
+def _render_spherical_fp32_cuda(engine, view, index):
+    """Sample the same virtual gray8 cube using FP32 coordinates and FMA."""
+    from .geometry import _cupy_external_stream
+    from .geometry_quality import SPHERICAL_FP32_BACKEND
+    from .unification.contracts import DataRole
+    from .unification.sampling import require_forward_sampling
+    radius, shape, key = _render_contract(engine, view, index)
+    if not _spherical_fp32_eligible(engine):
+        raise ValueError('Spherical FP32 sampling requires source axes in [1,4096]')
+    require_forward_sampling(SPHERICAL_FP32_BACKEND, DataRole.INTENSITY)
+    kernels = _spherical_fp32_kernels()
+    output = engine.torch.empty((int(view.src_h), int(view.src_w)), dtype=engine.torch.float32, device=engine.device)
+    source_ref = engine._fused_cupy_volume(kernels)
+    output_ref = kernels.cp.asarray(output)
+    stream = _cupy_external_stream(kernels.cp, engine._stream)
+    for row0, directions, valid in _direction_blocks(engine, key, dtype=np.float32):
+        # Cache entries may be evicted before queued CuPy readers finish, and
+        # callers can allocate on a different Torch stream than the renderer.
+        for tensor in (directions, valid, output):
+            if bool(tensor.is_cuda):
+                tensor.record_stream(engine._stream)
+        count = int(valid.numel())
+        kernels.kernel(
+            ((count + 255) // 256,), (256,),
+            (source_ref, kernels.cp.asarray(directions), kernels.cp.asarray(valid), output_ref,
+             np.int32(engine._volume_gpu.shape[0]), np.int32(shape[0]), np.int32(shape[1]), np.int32(shape[2]),
+             np.uint64(count), np.uint64(row0 * int(view.src_w)), np.float32(radius)), stream=stream,
+        )
+    return output
+
+
 def render_spherical_native_resident(engine, view, index):
     """Render one radius into float32 gray8 on the engine's active render stream."""
     volume = engine._volume_gpu
     if not bool(getattr(volume, 'is_cuda', False)):
+        engine._spherical_sampler_mode = 'reference_torch'
         return _render_spherical_native_torch(engine, view, index)
     enabled = os.environ.get('YOLO_TTA_GPU_SPHERICAL_NATIVE_KERNEL', '1').strip().lower() not in ('', '0', 'false', 'off', 'no')
     disabled = bool(getattr(engine, '_spherical_native_kernel_disabled', False))
+    if (enabled and not disabled and spherical_fp32_requested()
+            and not bool(getattr(engine, '_spherical_fp32_disabled', False))):
+        if _spherical_fp32_eligible(engine):
+            try:
+                output = _render_spherical_fp32_cuda(engine, view, index)
+                engine._spherical_sampler_mode = 'fp32_virtual_cube'
+                if not bool(getattr(engine, '_spherical_fp32_announced', False)):
+                    engine._spherical_fp32_announced = True
+                    print('Spherical FP32 CUDA sampler active: FP32 directions/FMA with virtual-cube gray8 rounding retained.', flush=True)
+                return output
+            except Exception as exc:
+                engine._spherical_fp32_disabled = True
+                print(f'Warning: Spherical FP32 sampler unavailable ({type(exc).__name__}: {exc}); using the FP64 reference sampler.', flush=True)
+        elif not bool(getattr(engine, '_spherical_fp32_shape_warned', False)):
+            engine._spherical_fp32_shape_warned = True
+            print('Spherical FP32 sampler outside its qualified source-axis range [1,4096]; using the FP64 reference sampler.', flush=True)
     if enabled and not disabled:
         try:
             output = _render_spherical_native_cuda(engine, view, index)
+            engine._spherical_sampler_mode = 'reference_fp64'
             if not bool(getattr(engine, '_spherical_native_kernel_announced', False)):
                 engine._spherical_native_kernel_announced = True
                 print('Spherical native CUDA renderer active: cached QSC directions and one source-sampling launch per patch.', flush=True)
@@ -370,4 +461,5 @@ def render_spherical_native_resident(engine, view, index):
     if not bool(getattr(engine, '_spherical_native_fallback_warned', False)):
         engine._spherical_native_fallback_warned = True
         print(f'Warning: Spherical native CUDA kernel unavailable ({reason}); using the resident Torch reference renderer.', flush=True)
+    engine._spherical_sampler_mode = 'reference_torch'
     return _render_spherical_native_torch(engine, view, index)

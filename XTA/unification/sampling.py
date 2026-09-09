@@ -10,6 +10,12 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Any, Mapping, Sequence
 
+from ..geometry_quality import (
+    SPHERICAL_FP32_BACKEND,
+    SPHERICAL_FP32_MAX_AXIS,
+    geometry_quality_request_record,
+    spherical_fp32_requested,
+)
 from .contracts import (
     BackendSamplingImplementation,
     ChannelLayout,
@@ -23,13 +29,18 @@ from .contracts import (
 )
 
 
-@lru_cache(maxsize=1)
 def forward_sampling_policy() -> ForwardSamplingPolicy:
-    """Return the single policy object used by v18 built-in geometry."""
+    """Resolve the requested mode; retain one immutable policy per mode."""
+    return _forward_sampling_policy(spherical_fp32_requested())
+
+
+@lru_cache(maxsize=2)
+def _forward_sampling_policy(spherical_fp32: bool) -> ForwardSamplingPolicy:
+    """The strict canonical record stays byte-for-byte equivalent to v21."""
 
     return ForwardSamplingPolicy(
         policy_id="xta.forward_sampling",
-        policy_version=21,
+        policy_version=22 if spherical_fp32 else 21,
         coordinate_convention=(
             "gray8_t_y_x_frame_index; destination-pixel-center to source; "
             "azimuthal [0,180) index wrap with odd-crossing radius-axis mirror; "
@@ -98,7 +109,18 @@ def forward_sampling_policy() -> ForwardSamplingPolicy:
                 absolute_tolerance=1.0,
                 relative_tolerance=0.0,
             ),
-        ),
+        ) + ((BackendSamplingImplementation(
+            backend=SPHERICAL_FP32_BACKEND,
+            implementation=(
+                "XTA.spherical_cuda native intensity renderer; fp32 FMA coordinates; "
+                f"virtual-gray8 T reconstruction retained; max_axis={SPHERICAL_FP32_MAX_AXIS}; "
+                "other families and unavailable/oversized shapes use registered cuda fallback"
+            ),
+            roles=(DataRole.INTENSITY,),
+            exact=False,
+            absolute_tolerance=2.0,
+            relative_tolerance=0.0,
+        ),) if spherical_fp32 else ()),
     )
 
 
@@ -136,11 +158,27 @@ def forward_sampling_execution_record(
                 "relative_tolerance": float(implementation.relative_tolerance),
             }
         )
-    return {
+    record = {
         "policy": policy.canonical_record(),
         "policy_digest": policy.digest,
         "selected_implementations": selected,
+        "geometry_quality_requests": geometry_quality_request_record(),
     }
+    if spherical_fp32_requested() and ('cuda', DataRole.INTENSITY.value) in seen:
+        implementation = policy.implementation_for(SPHERICAL_FP32_BACKEND, DataRole.INTENSITY)
+        record['conditional_implementations'] = [{
+            'backend': implementation.backend,
+            'data_role': DataRole.INTENSITY.value,
+            'family': 'spherical',
+            'implementation': implementation.implementation,
+            'absolute_tolerance': implementation.absolute_tolerance,
+            'relative_tolerance': implementation.relative_tolerance,
+            'requires': f'resident CUDA uint8 source; every source axis <= {SPHERICAL_FP32_MAX_AXIS}; successful kernel dispatch',
+            'fallback_backend': 'cuda',
+            'fallback_absolute_tolerance': 1.0,
+            'requested_not_actual_dispatch': True,
+        }]
+    return record
 
 
 def build_forward_raster_plan(
@@ -222,6 +260,7 @@ def raster_plan_spawn_spec(plan: RasterPlan) -> dict[str, Any]:
         "plan_digest": str(plan.digest),
         "sampling_policy_digest": str(plan.sampling_policy.digest),
         "plan": plan.canonical_record(),
+        "geometry_quality_requests": geometry_quality_request_record(),
     }
 
 

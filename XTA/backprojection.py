@@ -499,8 +499,16 @@ class _MainProcessGpuStageCoordinator:
         self._inference_asset_retirement_pending = False
         self._pending_inference_backlog = False
         self._spherical_retirement_pressure = False
-        self._spherical_retirement_requests: Dict[str, float] = {}
+        # expiry, compatible workers, first continuously live request time
+        self._spherical_retirement_requests: Dict[str, Tuple[float, Tuple[int, ...], float]] = {}
         self._spherical_retirement_device: Optional[int] = None
+        self._spherical_retirement_handoff_device: Optional[int] = None
+        self._spherical_retirement_handoff_deadline = 0.0
+        self._spherical_retirement_burst_counts: Counter[int] = Counter()
+        self._spherical_retirement_handoffs = 0
+        self._spherical_retirement_aged_acquisitions = 0
+        self._spherical_retirement_pressure_acquisitions = 0
+        self._spherical_retirement_handoff_expirations = 0
         self._spherical_retirement_cursor = 0
         self._spherical_retirement_retry_after = 0.0
         self._wake_callback: Optional[Callable[[], None]] = None
@@ -514,6 +522,13 @@ class _MainProcessGpuStageCoordinator:
             self._spherical_retirement_pressure = False
             self._spherical_retirement_requests.clear()
             self._spherical_retirement_device = None
+            self._spherical_retirement_handoff_device = None
+            self._spherical_retirement_handoff_deadline = 0.0
+            self._spherical_retirement_burst_counts.clear()
+            self._spherical_retirement_handoffs = 0
+            self._spherical_retirement_aged_acquisitions = 0
+            self._spherical_retirement_pressure_acquisitions = 0
+            self._spherical_retirement_handoff_expirations = 0
             self._spherical_retirement_cursor = 0
             self._spherical_retirement_retry_after = 0.0
             self._inference_asset_retirement_pending = False
@@ -535,13 +550,14 @@ class _MainProcessGpuStageCoordinator:
                 pass
 
     def set_spherical_retirement_pressure(self, active: bool) -> None:
-        """Permit one demanded retirement turn when completed canvases fill RAM."""
+        """Permit bounded demanded retirement bursts while completed canvases fill RAM."""
         with self._lock:
             changed = self._spherical_retirement_pressure != bool(active)
             self._spherical_retirement_pressure = bool(active)
-            if not active:
-                self._spherical_retirement_requests.clear()
-                self._spherical_retirement_device = None
+            # Relief removes immediate pressure admission, but must not erase
+            # a continuously polling CPU reader's starvation age. The ordinary
+            # expiry/cancellation rules still remove readers that stop waiting.
+            self._reserved_spherical_device_locked()
             callback = self._wake_callback if changed else None
         if callback is not None:
             try:
@@ -552,39 +568,110 @@ class _MainProcessGpuStageCoordinator:
     def _reserved_spherical_device_locked(self) -> Optional[int]:
         now = time.monotonic()
         self._spherical_retirement_requests = {
-            purpose: expiry for purpose, expiry in self._spherical_retirement_requests.items()
-            if expiry > now
+            purpose: request for purpose, request in self._spherical_retirement_requests.items()
+            if request[0] > now
         }
-        if (not self._spherical_retirement_requests or not self._spherical_retirement_pressure
-                or self._inference_asset_retirement_pending or not self._pending_inference_backlog):
+        if (not self._spherical_retirement_requests
+                or not _env_flag('YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT', True)
+                or self._inference_asset_retirement_pending or not self._pending_inference_backlog
+                or (self._spherical_retirement_device is not None
+                    and self._next_spherical_request_locked(self._spherical_retirement_device) is None)):
             self._spherical_retirement_device = None
+            self._spherical_retirement_handoff_device = None
+            self._spherical_retirement_handoff_deadline = 0.0
+        elif (self._spherical_retirement_handoff_device is not None
+                and now >= self._spherical_retirement_handoff_deadline):
+            # A CPU reader can be in a long plane computation. Give a retained
+            # idle GPU only a short claim window, then guarantee inference a
+            # turn instead of allowing the next poll to reserve it again.
+            device = self._spherical_retirement_handoff_device
+            self._spherical_retirement_burst_counts[device] = max(
+                2, self._spherical_retirement_burst_counts.get(device, 0),
+            )
+            self._spherical_retirement_device = None
+            self._spherical_retirement_handoff_device = None
+            self._spherical_retirement_handoff_deadline = 0.0
+            self._spherical_retirement_handoff_expirations += 1
         return self._spherical_retirement_device
+
+    def _next_spherical_request_locked(self, device: int) -> Optional[str]:
+        # Dict insertion order is the first live request, not the last CPU
+        # polling time. Refreshing a demand must not move it behind new work.
+        now = time.monotonic()
+        allow_age = _env_flag('YOLO_TTA_GPU_SPHERICAL_AGE_RETIREMENT', True)
+        return next((purpose for purpose, (_expiry, candidates, first_request) in
+                     self._spherical_retirement_requests.items() if int(device) in candidates
+                     and (self._spherical_retirement_pressure
+                          or (allow_age and now - first_request >= 30.0))), None)
+
+    def _record_spherical_acquisition_locked(self, device: int, purpose: str) -> None:
+        if int(device) in self._worker_devices:
+            # Include opportunistic projections: if inference becomes ready
+            # during one, that in-progress retirement counts toward the burst.
+            self._spherical_retirement_burst_counts[int(device)] += 1
+            request = self._spherical_retirement_requests.get(str(purpose))
+            if self._pending_inference_backlog and self._spherical_retirement_pressure:
+                self._spherical_retirement_pressure_acquisitions += 1
+            elif (self._pending_inference_backlog
+                    and request is not None and time.monotonic() - request[2] >= 30.0):
+                self._spherical_retirement_aged_acquisitions += 1
+            if (self._pending_inference_backlog
+                    and self._spherical_retirement_handoff_device == int(device)):
+                self._spherical_retirement_handoffs += 1
+        self._spherical_retirement_requests.pop(str(purpose), None)
+        self._spherical_retirement_device = None
+        self._spherical_retirement_handoff_device = None
+        self._spherical_retirement_handoff_deadline = 0.0
 
     def _request_spherical_retirement_turn(self, candidates: Sequence[int], purpose: str) -> None:
         """Drain one worker queue for a live projector; other workers keep inferring.
 
-        Demands expire after 30 seconds and are cancelled on CPU completion.
-        Failed CUDA admission imposes a cooldown instead of parking a worker.
+        Demands expire after 30 seconds without a poll and are cancelled on CPU
+        completion. A continuously waiting reader also becomes eligible after
+        30 seconds even below the memory-pressure threshold, so a long central
+        inference backlog cannot starve it until the terminal device release.
+        YOLO_TTA_GPU_SPHERICAL_AGE_RETIREMENT=0 disables age admission; the
+        existing pressure-retirement switch disables both admission reasons.
+        One drain admits at most two projections before that worker must accept
+        inference again. Failed admission imposes a cooldown instead of parking
+        a worker. Waiting readers refresh their FIFO demand during the first
+        projection so release can hand the drained worker to the next reader;
+        that idle-GPU handoff must be claimed within two seconds.
         """
         if not self._is_spherical_retirement(purpose):
             return
         with self._lock:
-            if (not self._spherical_retirement_pressure or not self._pending_inference_backlog
+            if (not self._pending_inference_backlog
                     or self._inference_asset_retirement_pending
                     or time.monotonic() < self._spherical_retirement_retry_after
                     or not _env_flag('YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT', True)):
                 return
-            if any(self._is_spherical_retirement(owner) for owner in self._stage_leases.values()):
-                return
             prior = self._reserved_spherical_device_locked()
-            if prior is not None and prior not in candidates:
-                return
-            devices = [int(device) for device in candidates if int(device) in self._worker_devices
-                       and int(device) not in self._stage_leases]
+            devices = [int(device) for device in candidates if int(device) in self._worker_devices]
             if not devices:
                 return
-            self._spherical_retirement_requests[str(purpose)] = time.monotonic() + 30.0
-            if prior not in devices:
+            now = time.monotonic()
+            previous = self._spherical_retirement_requests.get(str(purpose))
+            self._spherical_retirement_requests[str(purpose)] = (
+                now + 30.0, tuple(devices), previous[2] if previous is not None else now,
+            )
+            if any(self._is_spherical_retirement(owner) for owner in self._stage_leases.values()):
+                return
+            if prior is None:
+                # The oldest demand with an eligible worker chooses the next
+                # drain. A specific-device caller cannot steal an older turn.
+                available = set(device for device in self._worker_devices
+                                if device not in self._stage_leases
+                                and self._spherical_retirement_burst_counts.get(device, 0) < 2)
+                allow_age = _env_flag('YOLO_TTA_GPU_SPHERICAL_AGE_RETIREMENT', True)
+                devices = next(([device for device in request_devices if device in available]
+                                for _expiry, request_devices, first_request in
+                                self._spherical_retirement_requests.values()
+                                if (self._spherical_retirement_pressure
+                                    or (allow_age and now - first_request >= 30.0))
+                                and any(device in available for device in request_devices)), [])
+                if not devices:
+                    return
                 order = sorted(self._worker_devices)
                 ranks = {device: (index - self._spherical_retirement_cursor) % len(order)
                          for index, device in enumerate(order)}
@@ -605,8 +692,7 @@ class _MainProcessGpuStageCoordinator:
             if failed:
                 self._spherical_retirement_retry_after = time.monotonic() + 10.0
                 self._spherical_retirement_requests.clear()
-            if not self._spherical_retirement_requests:
-                self._spherical_retirement_device = None
+            self._reserved_spherical_device_locked()
             callback = self._wake_callback
         if callback is not None:
             try:
@@ -658,7 +744,7 @@ class _MainProcessGpuStageCoordinator:
                 return False
             reserved = self._reserved_spherical_device_locked()
             return bool(reserved != int(device_index)
-                        or str(purpose) not in self._spherical_retirement_requests
+                        or self._next_spherical_request_locked(int(device_index)) != str(purpose)
                         or any(self._is_spherical_retirement(owner) for owner in self._stage_leases.values()))
         # In the non-D1 fast-bundle fallback, a completed view may borrow an idle
         # worker GPU for backprojection while other devices still infer. Terminal
@@ -694,6 +780,13 @@ class _MainProcessGpuStageCoordinator:
             self._spherical_retirement_pressure = False
             self._spherical_retirement_requests.clear()
             self._spherical_retirement_device = None
+            self._spherical_retirement_handoff_device = None
+            self._spherical_retirement_handoff_deadline = 0.0
+            self._spherical_retirement_burst_counts.clear()
+            self._spherical_retirement_handoffs = 0
+            self._spherical_retirement_aged_acquisitions = 0
+            self._spherical_retirement_pressure_acquisitions = 0
+            self._spherical_retirement_handoff_expirations = 0
             self._spherical_retirement_retry_after = 0.0
             self._spherical_retirement_cursor = 0
             self._wake_callback = None
@@ -720,6 +813,9 @@ class _MainProcessGpuStageCoordinator:
             ):
                 return False
             self._inference_inflight[device] += 1
+            # A successful inference dispatch ends this worker's retirement
+            # burst. Pressure oscillation alone cannot reset the two-turn cap.
+            self._spherical_retirement_burst_counts.pop(device, None)
             return True
 
     def finish_inference(self, device_index: int) -> None:
@@ -758,8 +854,7 @@ class _MainProcessGpuStageCoordinator:
                 return None
             self._stage_leases[device] = str(purpose)
             if self._is_spherical_retirement(purpose):
-                self._spherical_retirement_requests.pop(str(purpose), None)
-                self._spherical_retirement_device = None
+                self._record_spherical_acquisition_locked(device, purpose)
             return _MainProcessGpuStageLease(self, device, str(purpose))
 
     def try_acquire_stage(self, torch_mod: object, purpose: str) -> Optional[_MainProcessGpuStageLease]:
@@ -816,12 +911,13 @@ class _MainProcessGpuStageCoordinator:
                 if self._is_spherical_retirement(purpose):
                     self._spherical_retirement_requests.clear()
                     self._spherical_retirement_device = None
+                    self._spherical_retirement_handoff_device = None
+                    self._spherical_retirement_handoff_deadline = 0.0
                     self._spherical_retirement_retry_after = time.monotonic() + 10.0
                 return None
             self._stage_leases[int(best_index)] = str(purpose)
             if self._is_spherical_retirement(purpose):
-                self._spherical_retirement_requests.pop(str(purpose), None)
-                self._spherical_retirement_device = None
+                self._record_spherical_acquisition_locked(int(best_index), purpose)
             return _MainProcessGpuStageLease(self, int(best_index), str(purpose))
 
     def release_stage(self, device_index: int, purpose: str) -> None:
@@ -830,6 +926,21 @@ class _MainProcessGpuStageCoordinator:
             current = self._stage_leases.get(int(device_index))
             if current == str(purpose):
                 self._stage_leases.pop(int(device_index), None)
+                reserved = self._reserved_spherical_device_locked()
+                if (self._is_spherical_retirement(current)
+                        and reserved is None
+                        and self._pending_inference_backlog
+                        and not self._inference_asset_retirement_pending
+                        and time.monotonic() >= self._spherical_retirement_retry_after
+                        and _env_flag('YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT', True)
+                        and not any(self._is_spherical_retirement(owner) for owner in self._stage_leases.values())
+                        and self._spherical_retirement_burst_counts.get(int(device_index), 0) < 2
+                        and self._next_spherical_request_locked(int(device_index)) is not None):
+                    # Keep one already-drained GPU for one additional live FIFO
+                    # reader. Inference remains eligible on all other workers.
+                    self._spherical_retirement_device = int(device_index)
+                    self._spherical_retirement_handoff_device = int(device_index)
+                    self._spherical_retirement_handoff_deadline = time.monotonic() + 2.0
             callback = self._wake_callback
         if callback is not None:
             try:
@@ -849,6 +960,10 @@ class _MainProcessGpuStageCoordinator:
                 'spherical_retirement_pressure': bool(self._spherical_retirement_pressure),
                 'spherical_retirement_reserved_device': self._reserved_spherical_device_locked(),
                 'spherical_retirement_request_count': len(self._spherical_retirement_requests),
+                'spherical_retirement_handoffs': int(self._spherical_retirement_handoffs),
+                'spherical_retirement_aged_acquisitions': int(self._spherical_retirement_aged_acquisitions),
+                'spherical_retirement_pressure_acquisitions': int(self._spherical_retirement_pressure_acquisitions),
+                'spherical_retirement_handoff_expirations': int(self._spherical_retirement_handoff_expirations),
             }
 
 _MAIN_PROCESS_GPU_STAGE_COORDINATOR = _MainProcessGpuStageCoordinator()

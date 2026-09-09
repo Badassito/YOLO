@@ -435,6 +435,39 @@ def _spherical_workload_groups(views: Sequence[ViewInfo]) -> List[Dict[str, obje
     return list(groups.values())
 
 
+def _execution_runtime_provenance() -> Dict[str, object]:
+    """Include nonlinear geometry and scheduling sources in the run receipt."""
+    import hashlib
+    from .geometry_quality import geometry_quality_request_record
+    from .workspace import _env_flag
+
+    result = radial_runtime_provenance()
+    sources = {}
+    package = Path(__file__).resolve().parent
+    for name in ('qsc', 'spherical_geometry', 'spherical_cuda', 'spherical_sampling_cuda',
+                 'cuda_backend', 'spherical_projection',
+                 'spherical_projection_bounds', 'spherical_projection_cuda',
+                 'spherical_preflight', 'spherical_projection_cpu', 'geometry_quality',
+                 'unification.sampling', 'cylindrical_cuda_projection', 'tta_scheduler', 'backprojection'):
+        path = package.joinpath(*name.split('.')).with_suffix('.py')
+        entry = {'path': str(path), 'loaded_in_parent': 'XTA.' + name in sys.modules}
+        try:
+            entry['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            entry.update(sha256=None, read_error=type(exc).__name__)
+        sources[name] = entry
+    result['spherical_sources'] = sources
+    result['geometry_quality_requests'] = geometry_quality_request_record()
+    result['spherical_cpu_compact_requested'] = _env_flag('YOLO_TTA_CPU_SPHERICAL_COMPACT', True)
+    result['spherical_retirement_requests'] = {
+        'enabled': _env_flag('YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT', True),
+        'age_enabled': _env_flag('YOLO_TTA_GPU_SPHERICAL_AGE_RETIREMENT', True),
+        'continuous_wait_seconds': 30.0,
+    }
+    result['spherical_locality_requested'] = bool(_env_int('YOLO_TTA_GPU_SPHERICAL_LOCALITY', 1))
+    return result
+
+
 def _legacy_d1_model_supported(model_path: Optional[str]) -> bool:
     """Legacy D1 requires the TensorRT ring's proto-topology stage.
 
@@ -4289,6 +4322,10 @@ def _main_impl() -> None:
             f'spherical_pressure={gpu_stage_state.get("spherical_retirement_pressure", False)}, '
             f'spherical_reserved_device={gpu_stage_state.get("spherical_retirement_reserved_device")}, '
             f'spherical_requests={gpu_stage_state.get("spherical_retirement_request_count", 0)}, '
+            f'spherical_handoffs={gpu_stage_state.get("spherical_retirement_handoffs", 0)}, '
+            f'spherical_age_grants={gpu_stage_state.get("spherical_retirement_aged_acquisitions", 0)}, '
+            f'spherical_pressure_grants={gpu_stage_state.get("spherical_retirement_pressure_acquisitions", 0)}, '
+            f'spherical_handoff_expirations={gpu_stage_state.get("spherical_retirement_handoff_expirations", 0)}, '
             f'inference_priority={bool(gpu_stage_state.get("inference_priority_active", False))}, '
             f'pending_volume_builds={len(pending_prediction_volume_futures)}, '
             f'queued_build_jobs={len(pending_prediction_build_jobs)}, '
@@ -5078,7 +5115,7 @@ def _main_impl() -> None:
             output_reserve_bytes=publication_output_reserve(
                 nrrd_layer_sink(), nrrd_member_gzip_window_bytes(), nrrd_gzip_chunk_bytes()),
         )
-        print('Execution provenance: ' + json.dumps(radial_runtime_provenance(), sort_keys=True), flush=True)
+        print('Execution provenance: ' + json.dumps(_execution_runtime_provenance(), sort_keys=True), flush=True)
         radial_owner_tasks = [task for task in gpu_worker_tasks_by_id.values()
                               if task.get('projection_contract') == RADIAL_OWNER_CONTRACT]
         if radial_owner_tasks:
@@ -5760,7 +5797,7 @@ def _main_impl() -> None:
             str(hybrid_view_mode_by_parent[parent]) for parent in hybrid_parents
         )
         print('\n=== Process-local inference queue drained; scheduler postprocessing continues ===')
-        print('Execution provenance at inference drain: ' + json.dumps(radial_runtime_provenance(), sort_keys=True), flush=True)
+        print('Execution provenance at inference drain: ' + json.dumps(_execution_runtime_provenance(), sort_keys=True), flush=True)
         drained_backend_notes: List[str] = []
         if gpu_worker_process_active:
             drained_backend_notes.append(

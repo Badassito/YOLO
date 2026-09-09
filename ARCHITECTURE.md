@@ -1,6 +1,6 @@
 # XTA architecture
 
-`GPT-6-Astra-Ultra_v21.0.4_SLURM.py` is the sole versioned launcher. It, the
+`GPT-6-Astra-Ultra_v21.0.5_SLURM.py` is the sole versioned launcher. It, the
 installed `xta` console script, and `python -m XTA` all dispatch
 through `XTA.cli.run()`.
 The implementation lives in the importable `XTA` package so spawned processes
@@ -299,6 +299,176 @@ bounded boxes and 2.40–2.57x for full-image boxes. Empty or very small sparse
 cases incur up to about seven microseconds of additional packing/launch cost.
 These are component measurements, not an H100 pipeline speedup claim. Evidence
 and reproducible commands live in `Scratch/2026-09-09-spherical-optimization`.
+
+Job 142812 subsequently qualified v21.0.4 on the H100 workload: 1,310.9 seconds,
+129.1 seconds (8.97%) less walltime than 142771. All 300,805 frames and 181 NRRD
+writes completed. All 186,355 Spherical/Radial direct-inference frames used
+`tiled_f32`, with no compaction fallback. QSC construction averaged 0.8835 seconds
+per miss versus 1.3263 seconds previously. Retained voxel/component counts match;
+the log is not a bytewise comparison of all cluster masks. The analysis is under
+`Scratch/Experiments/Spherical/142812-analysis`.
+
+### Spherical task locality and bounded retirement turns (v21.0.5)
+
+Ordinary cacheable Spherical direct-union tasks prefer a worker's last queued
+parent or a distinct newly admitted parent. The hint owns no data or lease;
+existing view/byte limits, D1 and hybrid rules remain authoritative. Work stealing
+remains available under memory pressure, device retirement and short tails, and
+an explicitly preferred parent's last admissible lease retains completion
+priority. Oversized uncached patches, tiles and hybrid CPU-origin tasks retain
+their existing selection. `YOLO_TTA_GPU_SPHERICAL_LOCALITY=0` restores prior
+placement. With four GPUs, locality can keep four existing parent leases active
+instead of spreading one parent's work across every GPU, so the first individual
+parent may finish later while repeated plan construction decreases.
+
+Completed-canvas pressure now arms at 75% of the same configured dense window
+and clears at 62.5%, avoiding one-parent threshold oscillation. Live retirement
+requests are FIFO within device eligibility. A drained GPU may serve one
+additional waiting projector, with at most two retirements before that worker
+must accept inference again. The successor has two seconds to claim the handoff;
+an expired handoff restores inference and cannot immediately reserve that worker
+again. Ordinary drain demand still expires after 30 seconds. Terminal asset
+retirement, auxiliary owners, queued/running inference, failure cooldown and
+exclusive stage leases remain authoritative. The existing pressure-retirement
+optout disables the pressure lane.
+
+CPU prefetch that will never be published is now cancelled at the next 128K
+pull-chunk boundary before GPU consumption. All readers are still joined before
+the borrowed source can be released; partial blocks raise cancellation rather
+than entering publication. Failed GPU admission continues the existing CPU
+iterator. The default unbounded scalar reference remains unchanged.
+
+Projection completion logs separately report summed CPU worker time, waits for
+CPU/GPU results, publication, admission probes and reader shutdown. Admission
+probe time includes successful projector construction, and CPU worker sums can
+overlap; these are not additive pipeline phases. Scheduler diagnostics report
+actual handoffs and expired handoffs. Execution receipts additionally hash
+Spherical geometry and scheduling sources, recording whether each is loaded in
+the parent process.
+
+A deterministic production-pattern scheduler simulation completes all 2,640
+leases / 145,440 Spherical frames with unchanged limits and reduces plan builds
+from 480 to 189–195. Its explicit measured-plan/assumed-inference cost model saves
+62–66 seconds; it omits real postprocessing and is not an H100 timing result.
+Controlled real CPU-reader experiments show substantially shorter shutdown at
+early, middle and late plane positions. Job 142828 subsequently completed in
+1,252.1 seconds, saving 58.8 seconds against 142812 with the same 300,805 frames,
+6,401 tasks and 181 NRRD writes. Actual QSC builds fell from 466 to 193; retained
+voxel counts match, without implying bytewise cluster-mask parity. Evidence lives
+under `Scratch/Experiments/Spherical/v21.0.5-142812` and `142828-analysis`.
+
+### Opt-in fast geometry
+
+`YOLO_TTA_FAST_GEOMETRY=1` enables three geometry optimizations while retaining
+the same view plan, shell radii, patches, model frames, model precision and
+categorical interpolation. The default remains off. Component environment
+controls override the bundle, including an explicit `0`:
+
+| Component | Control | Change |
+| --- | --- | --- |
+| Spherical CUDA input sampling | `YOLO_TTA_GPU_SPHERICAL_FP32` | FP32 directions/coordinates and FMA, with the existing virtual logical-T gray8 reconstruction and rounding |
+| Spherical CPU backprojection | `YOLO_TTA_CPU_SPHERICAL_COMPILED` | Compiled scalar FP64 pull with `fastmath=False`, avoiding NumPy coordinate temporaries |
+| Radial CUDA input sampling | `YOLO_TTA_GPU_RADIAL_COLUMN_GEOMETRY` | Compute unchanged FP64 column geometry once and reuse it across rows |
+
+The FP32 Spherical sampler is eligible only when each native and logical source
+axis is at most 4,096. Larger axes and unavailable native kernels use the
+reference path. Directions and validity occupy 13 bytes per pixel instead of
+25, allowing two 3,072-square FP32 patches in the existing 256 MiB LRU. FP32 and
+FP64 entries have distinct identities, strip fallback preserves the allocation
+bound, and CUDA readers record stream ownership across cache eviction. Source
+address arithmetic remains 64-bit. The sampling policy gives only the named
+Spherical FP32 backend an absolute gray8 tolerance of two; generic CUDA keeps
+its existing tolerance of one and categorical sampling is unchanged. This is a
+qualification tolerance, not a runtime pixel comparison or a universal error
+bound for every possible input. Requested mode changes the policy/plan digest;
+runtime diagnostics separately identify the backend that actually ran.
+
+The compiled CPU pull is selected only after initial GPU admission declines.
+Compilation precedes publication; missing Numba or compilation/cache setup
+failure retains the NumPy path. Existing worker counts, bounded blocks,
+cancellation and CPU-to-GPU promotion remain in force. The bundle uses Radial
+column hoisting only for at least 256 active rows, 256 columns and 262,144 active
+pixels; the explicit component override also permits small qualification cases.
+An optional geometry-allocation failure retains the scalar renderer.
+
+Heatsoaked 4090 Laptop component measurements showed roughly 1.3x faster Radial
+rendering at 3,072 square with identical pixels. The isolated Spherical FP32
+sampling kernel was 5.4–11.9x faster at that size; the H100 has very different
+FP64 throughput, so this ratio must not be treated as a cluster forecast.
+Compiled CPU pulls had a median 4.87x speedup over six production-coordinate
+cases with identical labels, using a broadcast source to bound local RAM.
+Those timings exclude full production source-mask bandwidth and pipeline overlap.
+
+Twenty-four thin-structure threshold/roundtrip cases matched reference masks
+exactly with FP32 sampling. A real-model A/B/B/A crop check retained all 632
+forward passes in each run and was reproducible within each mode. Only two
+voxels differed across 63 output layers; the final combined mask was identical,
+with no lost, split or merged components in the changed layers. These fixtures
+do not establish quality on the full cluster dataset. Direct fusion to native-T
+sampling remains tool-only: it changed thin-rod intensities by up to 87 gray
+levels despite bounded geometric shifts. Other view families retain their
+existing sampling paths. Evidence and reproducible tools are indexed under
+`Scratch/Experiments/Spherical/relaxed-geometry-20260909`.
+
+Job 142868 subsequently ran the same 300,805-frame command with fast geometry
+enabled in 1,261.3 seconds, 9.2 seconds slower than 142828. All three features
+activated and all 181 NRRD writes completed. Compiled CPU published twice as many
+slices with less summed worker time, but four late projectors accounted for
+443.7 seconds of overlapping CPU publication time. Smaller directions reduced
+uploads by 47.5%, while construction time increased. Kept voxels increased by a
+net 9,712 (0.002246%); that is not a spatial mask-difference count. This run does
+not establish either an H100 throughput gain or full-volume thin-feature parity.
+The audit is under `Scratch/Experiments/Spherical/142868-analysis`.
+
+### Exact CPU crop publication and bounded retirement wait
+
+Spherical sink-only CPU projection now supplies exact tight slice crops through
+the existing raw-u8 or little-endian row-packbits writer contract. Analytically
+empty ranges allocate no dense planes and bypass pixel scans. CPU workers retain
+bounded Y bands; the compiled FP64 pull also skips X outside conservative bounds
+while keeping global voxel centers and the same categorical arithmetic. Workers
+compute tight boxes, foreground counts and payloads before handing results to the
+publication thread. The writer can append those bytes without another full-plane
+bbox scan, normalization or crop packing. Generic callbacks and dense output
+retain their previous interface, and the unbounded NumPy oracle is unchanged.
+
+`YOLO_TTA_CPU_SPHERICAL_COMPACT=0` restores dense CPU publication. The default-on
+change is independent of fast-geometry sampling and makes no additional numerical
+approximation. Encoded work includes bounded metadata/payload reservations and a
+4,096-slice block limit. Empty records are validated before the optimized callback;
+sink-only failures abort the writer without replaying output. Publication remains
+ordered and exactly once across CPU-to-GPU promotion, with unpublished readers
+cancelled and joined before the borrowed source can be released.
+
+Previously, a CPU projector below the 75% memory-pressure threshold could keep
+polling while central inference backlog prevented a retirement turn indefinitely.
+The coordinator now retains the age of continuously refreshed FIFO demand. After
+30 seconds it may drain one worker for retirement even below the pressure threshold.
+This is eligibility after 30 seconds, not a completion deadline: queued inference,
+existing stage ownership, auxiliary users, terminal asset retirement and memory
+admission remain authoritative. The existing two-projection burst cap, two-second
+handoff claim window and return to inference remain intact. Requests expire after
+30 seconds without refresh; cancellation or expiry resets their age.
+
+`YOLO_TTA_GPU_SPHERICAL_AGE_RETIREMENT=0` disables age admission. The existing
+`YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT=0` disables both pressure and age
+retirement. No memory cap or pressure threshold is lowered. Scheduler diagnostics
+separate age and pressure grants. Projection logs record compact/empty slice
+counts, encoded bytes and computed/scanned pixels. Runtime provenance also hashes
+the native rendering dispatcher and separate FP32 sampler source. These changes
+retain the existing views, model frames, sampling policy and model precision.
+
+Validation and local component measurements are preserved in
+`Scratch/Experiments/Spherical/v21.0.7-142868`; H100 whole-pipeline savings still
+require the same production command on that system.
+
+The full source suite passes 1,144 tests with 140 skips; 94 dedicated CUDA and
+integration tests pass, including eight real compact/dense CPU-to-GPU handoff
+variants. A real-model A/B/B/A check against the preceding fast-geometry snapshot
+in both versions preserves all 632 forward passes, all 63 decoded output layers
+and spatial headers, and same-mode reproducibility. Each candidate run publishes
+1,440 compact CPU slices, including 821 empty slices. The small crop does not
+exercise the 30-second age guard; deterministic coordinator tests cover that rule.
 
 ## Cylindrical view family (v20)
 

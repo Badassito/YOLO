@@ -204,6 +204,10 @@ class TtaSchedulerState:
         default_factory=dict
     )
     gpu_worker_dispatch_cursor: int = 0
+    # One last-queued Spherical parent per worker is a cache-locality hint only.
+    # It owns no task, geometry arrays, or additional inference admission lease.
+    spherical_render_parent_by_worker: Dict[int, Tuple[str, str]] = field(default_factory=dict)
+    spherical_retirement_pressure_active: bool = False
     gpu_worker_next_dynamic_task_id: int = 0
     gpu_worker_pending_task_ids: deque[int] = field(default_factory=deque)
 
@@ -1792,6 +1796,66 @@ class TtaScheduler:
         conf_path = self.state.baseline_confmap_paths.get(key)
         task['result_conf_path'] = str(conf_path) if conf_path is not None else None
 
+    def spherical_locality_parent(self, task: Dict[str, object]) -> Optional[Tuple[str, str]]:
+        """Identify cacheable ordinary Spherical parents without claiming ownership."""
+        view = task.get('view')
+        if (str(task.get('kind', '')) != 'fullframe'
+                or str(task.get('result_mode', 'file')) != 'direct_union'
+                or bool(task.get('hybrid_cpu_eligible_origin', False))
+                or str(getattr(view, 'family', '')) != 'spherical'):
+            return None
+        # The resident direction cache admits at most 256 MiB (25 bytes/pixel).
+        # Oversized patches stream uncached strips, so affinity cannot help them.
+        pixels = int(view.src_h) * int(view.src_w)
+        if pixels <= 0 or pixels * 25 > 256 * 1024**2:
+            return None
+        return self.gpu_worker_fullframe_parent_key(task)
+
+    def prefer_spherical_locality(self, selected_pool, feasible_by_id, preferred_parent=None):
+        """Prefer warm parents or distinct new parents, retaining a stealing fallback.
+
+        The caller has already applied storage, D1, hybrid, and device admission.
+        A worker continues its last queued Spherical parent when possible. Other
+        workers can start different admitted parents rather than duplicate that
+        plan. When neither option is available, the original pool and worker sets
+        remain usable so memory pressure, device retirement, and tails cannot
+        strand a free GPU. The explicitly preferred parent's sole pending lease
+        retains its original workers so cache hints cannot delay an unlock of
+        parent storage. Non-Spherical and hybrid ordering stays authoritative.
+        """
+        if not self.operations._env_int('YOLO_TTA_GPU_SPHERICAL_LOCALITY', 1):
+            return selected_pool, feasible_by_id
+        parents = {
+            int(task_id): self.spherical_locality_parent(self.state.gpu_worker_tasks_by_id[int(task_id)])
+            for _position, task_id in selected_pool
+        }
+        preferred_ids = [task_id for task_id, parent in parents.items()
+                         if preferred_parent is not None and parent == preferred_parent]
+        protected_id = preferred_ids[0] if len(preferred_ids) == 1 else None
+        last = self.state.spherical_render_parent_by_worker
+        claimed = set(last.values())
+        continuing = set()
+        for task_id, parent in parents.items():
+            if parent is not None:
+                continuing.update(worker for worker in feasible_by_id[task_id] if last.get(worker) == parent)
+        preferred_workers = {}
+        for task_id, parent in parents.items():
+            if parent is None or task_id == protected_id:
+                continue
+            feasible = feasible_by_id[task_id]
+            warm = [worker for worker in feasible if last.get(worker) == parent]
+            fresh = ([worker for worker in feasible if worker not in continuing]
+                     if parent not in claimed else [])
+            if warm or fresh:
+                preferred_workers[task_id] = warm or fresh
+        if not preferred_workers:
+            return selected_pool, feasible_by_id
+        pool = [pair for pair in selected_pool if parents[int(pair[1])] is None
+                or int(pair[1]) == protected_id or int(pair[1]) in preferred_workers]
+        feasible = dict(feasible_by_id)
+        feasible.update(preferred_workers)
+        return pool, feasible
+
     def pop_gpu_worker_pending_task_id(self,
         preferred_parent: Optional[Tuple[str, str]] = None,
         candidate_workers: Optional[Sequence[int]] = None,
@@ -1846,6 +1910,9 @@ class TtaScheduler:
         else:
             return None
 
+        selected_pool, feasible_by_id = self.prefer_spherical_locality(
+            selected_pool, feasible_by_id, preferred_parent,
+        )
         parent_pending_counts: Dict[Tuple[str, str], int] = {}
         for _position, task_id in selected_pool:
             parent_key = self.gpu_worker_fullframe_parent_key(self.state.gpu_worker_tasks_by_id[int(task_id)])
@@ -1913,7 +1980,10 @@ class TtaScheduler:
             retained = sum(int(value) for value in self.state.direct_union_postprocess_bytes.values())
             limit = int(self.inputs.direct_union_total_dense_byte_limit)
             active = bool(self.inputs.direct_union_sparse_retirement_active
-                          and retained > 0 and limit > 0 and retained * 4 >= limit * 3)
+                          and retained > 0 and limit > 0
+                          and (retained * 8 > limit * 5 if self.state.spherical_retirement_pressure_active
+                               else retained * 4 >= limit * 3))
+            self.state.spherical_retirement_pressure_active = active
             publish_pressure(active)
             self.operations.runtime_telemetry().gauge('inference.spherical_retirement_pressure', active)
 
@@ -2129,6 +2199,10 @@ class TtaScheduler:
             if str(task_to_dispatch.get('result_mode', 'file')) == self.inputs.hybrid_deferred_result_mode:
                 raise RuntimeError('GPU dispatch retained an unresolved hybrid result contract')
             feasible_workers = self.d1_feasible_workers(task_to_dispatch, candidates)
+            if self.spherical_locality_parent(task_to_dispatch) is not None:
+                # Recheck D1 after hybrid resolution/runtime splitting, preserving
+                # the soft worker subset selected from the pre-admitted pool.
+                feasible_workers = [worker for worker in feasible_workers if worker in _precommit_feasible_workers]
             if not feasible_workers:
                 self.state.gpu_worker_pending_task_ids.appendleft(int(task_id))
                 break
@@ -2174,6 +2248,11 @@ class TtaScheduler:
                 self.operations._main_process_gpu_stage_finish_inference(worker_id)
                 raise
             task_to_dispatch.pop('hybrid_gpu_assist_dispatch', None)
+            spherical_parent = self.spherical_locality_parent(task_to_dispatch)
+            if spherical_parent is not None:
+                self.state.spherical_render_parent_by_worker[int(worker_id)] = spherical_parent
+            elif str(getattr(task_to_dispatch.get('view'), 'family', '')) == 'spherical':
+                self.state.spherical_render_parent_by_worker.pop(int(worker_id), None)
             if cpu_assist_dispatch:
                 task_to_dispatch['hybrid_gpu_assist_dispatched'] = True
                 self.state.gpu_worker_cpu_assist_inflight_task_ids.add(int(task_id))

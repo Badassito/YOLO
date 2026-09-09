@@ -21,6 +21,7 @@ from typing import (
 )
 import numpy as np
 from ._deps import cv2
+from .geometry_quality import radial_columns_requested, spherical_fp32_requested, spherical_fp32_shape_eligible
 
 from .config import (
     ChannelFormat,
@@ -202,6 +203,20 @@ def radial_native_kernel_enabled() -> bool:
     """Compute native Radial patch geometry and interpolation in one CUDA launch."""
     return _env_flag('YOLO_TTA_GPU_RADIAL_NATIVE_KERNEL', True)
 
+def radial_column_geometry_enabled() -> bool:
+    """Resolve the local override or opt-in fast-geometry bundle."""
+    return radial_columns_requested()
+
+
+def radial_column_geometry_for_shape(rows, columns, height_origin, height_length) -> bool:
+    """Avoid extra launch/allocation overhead for small or mostly padded work."""
+    if not radial_column_geometry_enabled():
+        return False
+    if 'YOLO_TTA_GPU_RADIAL_COLUMN_GEOMETRY' in os.environ:
+        return True
+    active_rows = max(0, min(int(height_origin) + int(rows), int(height_length)) - max(0, int(height_origin)))
+    return bool(active_rows >= 256 and int(columns) >= 256 and active_rows * int(columns) >= 256 * 1024)
+
 _RADIAL_NATIVE_KERNELS: Optional[object] = None
 _RADIAL_NATIVE_KERNELS_FAILED = False
 _RADIAL_NATIVE_KERNELS_ERROR = ''
@@ -306,9 +321,85 @@ def _radial_native_kernels() -> Optional[object]:
             out[q] = (float)__float2uint_rn(fminf(255.0f, fmaxf(0.0f, value)));
         }
         '''
+        source += r'''
+        extern "C" __global__ void radial_columns_f64(
+            double* geometry, int columns, int direction_id,
+            double radius, double arc_origin,
+            double center_x, double center_y, double shear) {
+            int u = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+            if (u >= columns) return;
+            const double two_pi = 6.283185307179586476925286766559;
+            double theta = fmod(__ddiv_rn(__dadd_rn(arc_origin, (double)u), radius), two_pi);
+            if (theta < 0.0) theta += two_pi;
+            double px = __dadd_rn(center_x, __dmul_rn(radius, cos(theta)));
+            double py = __dadd_rn(center_y, __dmul_rn(radius, sin(theta)));
+            double offset = direction_id == 0 ? py - center_y : px - center_x;
+            geometry[u] = px;
+            geometry[columns + u] = py;
+            geometry[2 * columns + u] = __dmul_rn(shear, offset);
+        }
+
+        extern "C" __global__ void radial_native_columns_f32(
+            const unsigned char* source, const double* geometry, float* out,
+            int native_t, int logical_t, int full_h, int full_w,
+            int rows, int columns, int base_id, int height_origin) {
+            int u = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+            int row = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
+            if (u >= columns || row >= rows) return;
+            unsigned long long q = (unsigned long long)row * columns + u;
+            int height_length = base_id == 0 ? logical_t : (base_id == 1 ? full_h : full_w);
+            double height = (double)height_origin + (double)row;
+            if (height < 0.0 || height > (double)(height_length - 1)) {
+                out[q] = 0.0f;
+                return;
+            }
+            double px = geometry[u];
+            double py = geometry[columns + u];
+            double stack = __dadd_rn(height, geometry[2 * columns + u]);
+            double tt = base_id == 0 ? stack : py;
+            double yy = base_id == 0 ? py : (base_id == 1 ? stack : px);
+            double xx = base_id == 2 ? stack : px;
+            if (!(tt > -1.0 && tt < (double)logical_t &&
+                  yy > -1.0 && yy < (double)full_h &&
+                  xx > -1.0 && xx < (double)full_w)) {
+                out[q] = 0.0f;
+                return;
+            }
+            int t0 = (int)floor(tt), y0 = (int)floor(yy), x0 = (int)floor(xx);
+            float dt = __double2float_rn(tt - (double)t0);
+            float dy = __double2float_rn(yy - (double)y0);
+            float dx = __double2float_rn(xx - (double)x0);
+            float value = 0.0f;
+            #pragma unroll
+            for (int it = 0; it < 2; ++it) {
+                int ti = t0 + it;
+                float wt = it ? dt : __fsub_rn(1.0f, dt);
+                #pragma unroll
+                for (int iy = 0; iy < 2; ++iy) {
+                    int yi = y0 + iy;
+                    float wy = iy ? dy : __fsub_rn(1.0f, dy);
+                    #pragma unroll
+                    for (int ix = 0; ix < 2; ++ix) {
+                        int xi = x0 + ix;
+                        float wx = ix ? dx : __fsub_rn(1.0f, dx);
+                        if (ti >= 0 && ti < logical_t && yi >= 0 && yi < full_h &&
+                            xi >= 0 && xi < full_w) {
+                            float voxel = radial_logical_voxel(source, ti, yi, xi,
+                                native_t, logical_t, full_h, full_w);
+                            float weight = __fmul_rn(__fmul_rn(wt, wy), wx);
+                            value = __fadd_rn(value, __fmul_rn(voxel, weight));
+                        }
+                    }
+                }
+            }
+            out[q] = (float)__float2uint_rn(fminf(255.0f, fmaxf(0.0f, value)));
+        }
+        '''
         module = cp.RawModule(code=source, options=('--std=c++11', '--fmad=false'))
         _RADIAL_NATIVE_KERNELS = argparse.Namespace(
             cp=cp, module=module, radial_native_f32=module.get_function('radial_native_f32'),
+            radial_columns_f64=module.get_function('radial_columns_f64'),
+            radial_native_columns_f32=module.get_function('radial_native_columns_f32'),
         )
         return _RADIAL_NATIVE_KERNELS
     except Exception as exc:
@@ -3332,6 +3423,16 @@ class _GpuWorkerRenderEngine:
  than once. This bounded cache serves those reads without introducing cross-tile union or
  per-tile crop state. Full-frame rendering keeps its existing allocation behavior."""
         key = (str(view.name), int(frame_idx))
+        if is_spherical_view(view):
+            volume = self._volume_gpu
+            native = bool(volume is not None and bool(getattr(volume, 'is_cuda', False))
+                          and _env_flag('YOLO_TTA_GPU_SPHERICAL_NATIVE_KERNEL', True)
+                          and not bool(getattr(self, '_spherical_native_kernel_disabled', False)))
+            fp32 = bool(native and spherical_fp32_requested()
+                        and not bool(getattr(self, '_spherical_fp32_disabled', False))
+                        and spherical_fp32_shape_eligible((volume.shape[0], self._logical_t,
+                                                           volume.shape[1], volume.shape[2])))
+            key += ('fp32_virtual_gray8' if fp32 else ('reference_fp64' if native else 'reference_torch'),)
         cache = self._native_plane_cache
         plane = cache.get(key)
         if plane is not None:
@@ -3494,9 +3595,45 @@ class _GpuWorkerRenderEngine:
         if kernels is None:
             raise RuntimeError('Radial CuPy/NVRTC kernel unavailable: ' + _RADIAL_NATIVE_KERNELS_ERROR)
         out = torch.empty((rows, columns), dtype=torch.float32, device=self.device)
+        if bool(out.is_cuda):
+            out.record_stream(self._stream)
         cp_source = self._fused_cupy_volume(kernels)
         cp_out = kernels.cp.asarray(out)
         block = (32, 8)
+        geometry = None
+        height_length = logical_t if base_id == 0 else (full_h if base_id == 1 else full_w)
+        if (radial_column_geometry_for_shape(rows, columns, view.radial_height_origin, height_length)
+                and not bool(getattr(self, '_radial_column_geometry_disabled', False))
+                and columns * 3 * 8 <= 4 * 1024**2):
+            try:
+                geometry = torch.empty((3, columns), dtype=torch.float64, device=self.device)
+            except torch.OutOfMemoryError:
+                self._radial_column_geometry_disabled = True
+                print('Radial column geometry workspace unavailable; retaining the scalar CUDA renderer.', flush=True)
+        if geometry is not None:
+            # This per-call table cannot be overwritten by a concurrent frame.
+            # CuPy launches are invisible to Torch's allocator; retain the table
+            # through its render-stream reads even when the caller uses another stream.
+            if bool(geometry.is_cuda):
+                geometry.record_stream(self._stream)
+            cp_geometry = kernels.cp.asarray(geometry)
+            external = _cupy_external_stream(kernels.cp, self._stream)
+            kernels.radial_columns_f64(
+                ((columns + 255) // 256,), (256,),
+                (cp_geometry, np.int32(columns), np.int32(direction_id), np.float64(radius),
+                 np.float64(view.radial_arc_origin), np.float64(view.center_x),
+                 np.float64(view.center_y), np.float64(shear)), stream=external,
+            )
+            kernels.radial_native_columns_f32(
+                ((columns + block[0] - 1) // block[0], (rows + block[1] - 1) // block[1]), block,
+                (cp_source, cp_geometry, cp_out, np.int32(native_t), np.int32(logical_t),
+                 np.int32(full_h), np.int32(full_w), np.int32(rows), np.int32(columns),
+                 np.int32(base_id), np.int32(view.radial_height_origin)), stream=external,
+            )
+            if not bool(getattr(self, '_radial_column_geometry_announced', False)):
+                self._radial_column_geometry_announced = True
+                print('Radial column geometry CUDA renderer active: FP64 shell geometry reused across rows.', flush=True)
+            return out
         kernels.radial_native_f32(
             ((columns + block[0] - 1) // block[0], (rows + block[1] - 1) // block[1]), block,
             (cp_source, cp_out,

@@ -102,9 +102,12 @@ class SphericalHostAdmissionTests(unittest.TestCase):
             _bind_callbacks(scheduler, fullframe=mock.Mock(side_effect=complete))
             scheduler.dispatch_gpu_worker_inference_window()
             self.assertTrue(all(not q.empty() for q in state.gpu_task_queues.values()))
-            # Active-parent priority fills the first four workers from one trajectory.
-            self.assertEqual({q.queue[0]['view'].name for q in state.gpu_task_queues.values()},
-                             {tasks[0]['view'].name})
+            # Locality fills the same four-parent admission window with one
+            # trajectory per worker, avoiding four builds of the same QSC plan.
+            self.assertEqual(len({q.queue[0]['view'].name for q in state.gpu_task_queues.values()}), 4)
+            self.assertTrue(all(len({task['view'].name for task in q.queue}) == 1
+                                for q in state.gpu_task_queues.values()))
+            self.assertEqual(len(state.direct_union_inference_views), 4)
             pressure_stops = 0
             while state.gpu_worker_pending_task_ids or any(not q.empty() for q in state.gpu_task_queues.values()):
                 progressed = False
