@@ -128,6 +128,7 @@ class SphericalSchedulerContracts(unittest.TestCase):
             engine._render_cartesian_native_u8_cached(view, 0)
         for cls in (cuda_backend.GpuRenderedYoloSource, cuda_backend.GpuTileRenderedYoloSource):
             with (mock.patch.object(cuda_backend, 'ensure_ultralytics_accepts_in_memory_volume_source'),
+                  mock.patch.dict('os.environ', {'YOLO_TTA_NATIVE_TRT_RING': '0'}),
                   mock.patch.dict('sys.modules', {'ultralytics.data.loaders': None}),
                   self.subTest(source=cls.__name__)):
                 job = SimpleNamespace(M_out_to_src=np.eye(2, 3, dtype=np.float32))

@@ -31,6 +31,70 @@ def inspect_seams(source: str):
 
 
 class PackageInventoryTests(unittest.TestCase):
+    def test_release_authenticates_upload_and_observability(self) -> None:
+        for category, target in (
+            ('definitions', 'RadialCudaProjector'),
+            ('definitions', 'backproject_spherical_volume_to_volume'),
+            ('definitions', '_execution_runtime_provenance'),
+            ('preserved_radial_definition_updates', None),
+            ('preserved_radial_module_updates', None),
+        ):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            records = manifest['v21_0_6_review'][category]
+            record = records[0] if target is None else next(item for item in records if item['name'] == target)
+            record['sha256'] = '0' * 64
+            with self.subTest(category=category, target=target), self.assertRaisesRegex(
+                    RuntimeError, 'v21.0.6 review digest mismatch'):
+                inventory.reviewed_v21_0_6_contract(
+                    manifest, manifest['v21_review'], *(manifest[f'v21_0_{i}_review'] for i in range(1, 6)))
+
+    def test_release_requires_the_preserved_radial_class_predecessor(self) -> None:
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = manifest['v21_0_6_review']
+        next(item for item in review['definitions'] if item['name'] == 'RadialCudaProjector')['previous_sha256'] = '0' * 64
+        authenticated = hashlib.sha256(json.dumps(review, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        with mock.patch.object(inventory, 'REVIEWED_V21_0_6_SHA256', authenticated), self.assertRaisesRegex(
+                RuntimeError, 'v21.0.6 supersession does not match its historical pin'):
+            inventory.reviewed_v21_0_6_contract(
+                    manifest, manifest['v21_review'], *(manifest[f'v21_0_{i}_review'] for i in range(1, 6)))
+
+    def test_release_requires_exact_preserved_module_and_upload_predecessors(self) -> None:
+        for category, validate in (
+            ('preserved_radial_module_updates', inventory.reviewed_radial_module_hashes),
+            ('preserved_radial_definition_updates', inventory.reviewed_radial_definition_hashes),
+        ):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            patches = [manifest[f'v21_0_{i}_review'] for i in range(1, 7)]
+            patches[-1][category][0]['previous_sha256'] = '0' * 64
+            with self.subTest(category=category), self.assertRaisesRegex(RuntimeError, 'preserved predecessor'):
+                validate(manifest['v21_review'], patches)
+
+    def test_release_does_not_allow_unknown_preserved_modules(self) -> None:
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        patches = [manifest[f'v21_0_{i}_review'] for i in range(1, 7)]
+        patches[-1]['preserved_radial_module_updates'][0]['module'] = 'unreviewed_module'
+        with self.assertRaisesRegex(RuntimeError, 'unknown, duplicate or unexplained Radial module'):
+            inventory.reviewed_radial_module_hashes(manifest['v21_review'], patches)
+
+    def test_source_upload_method_has_an_independent_review_pin(self) -> None:
+        original_digest = inventory.digest
+        def altered_upload(node):
+            return '0' * 64 if getattr(node, 'name', None) == '_upload_cropped_source' else original_digest(node)
+        with mock.patch.object(inventory, 'digest', side_effect=altered_upload), self.assertRaisesRegex(
+                RuntimeError, 'preserved Radial arithmetic: RadialCudaProjector._upload_cropped_source'):
+            verify_inventory()
+
+    def test_release_pins_native_ring_and_observability_contracts(self) -> None:
+        for target in ('_ResidentTensorRTRingExecutor', 'GpuRenderedYoloSource',
+                       '_claim_specialized_prediction_targets', 'RuntimeTelemetry', 'TtaScheduler'):
+            manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+            review = manifest['v21_0_6_review']
+            record = next(item for item in review['definitions'] if item['name'] == target)
+            record['sha256'] = '0' * 64
+            with self.subTest(target=target), self.assertRaisesRegex(RuntimeError, 'v21.0.6 review digest mismatch'):
+                inventory.reviewed_v21_0_6_contract(
+                    manifest, manifest['v21_review'], *(manifest[f'v21_0_{i}_review'] for i in range(1, 6)))
+
     def test_release_authenticates_compact_projection_and_age_admission(self) -> None:
         for target in ('_MainProcessGpuStageCoordinator', '_project_spherical_encoded_block',
                        '_pull_spherical_f64'):

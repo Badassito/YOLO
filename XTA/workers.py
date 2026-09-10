@@ -61,6 +61,8 @@ from .runtime import (
     close_memmap_array,
     cpu_inference_supports_view,
     initialize_runtime_observability,
+    runtime_trace_event,
+    flush_runtime_task_trace,
 )
 from .workspace import configure_pipeline_modes
 from .geometry import (
@@ -1239,6 +1241,7 @@ def _cpu_inference_worker_main(
             if task is None:
                 break
             task_id = int(task['task_id'])
+            runtime_trace_event('worker_dequeue', task=task, device=f'cpu:{instance_id}')
             transferred_task_fds: List[int] = []
             try:
                 task_local = dict(task)
@@ -1255,11 +1258,14 @@ def _cpu_inference_worker_main(
                 task_local['render_workers'] = int(render_workers)
                 task_local['postprocess_workers'] = 1
                 started = time.perf_counter()
+                runtime_trace_event('worker_compute_start', task=task_local, device=f'cpu:{instance_id}')
                 stats = run_prediction_volume_in_openvino_worker(runner, cfg, task_local)
+                runtime_trace_event('worker_compute_done', task=task_local, device=f'cpu:{instance_id}')
                 stats = dict(stats)
                 stats['worker_compute_seconds'] = max(0.0, time.perf_counter() - started)
                 stats['backend'] = 'cpu'
                 stats['cpu_instance'] = int(instance_id)
+                runtime_trace_event('worker_publication_done', task=task_local, device=f'cpu:{instance_id}')
                 result_queue.put({
                     'type': 'result', 'worker_kind': 'cpu',
                     'cpu_index': int(instance_id), 'task_id': int(task_id),
@@ -1267,6 +1273,7 @@ def _cpu_inference_worker_main(
                 })
             except Exception as exc:
                 import traceback
+                runtime_trace_event('worker_error', task=task, device=f'cpu:{instance_id}', error=repr(exc))
                 result_queue.put({
                     'type': 'result', 'worker_kind': 'cpu',
                     'cpu_index': int(instance_id), 'task_id': int(task_id),
@@ -1277,6 +1284,7 @@ def _cpu_inference_worker_main(
     finally:
         _close_fd_list(persistent_source_memfds.values())
         persistent_source_memfds.clear()
+        flush_runtime_task_trace()
 
 @dataclass
 class _DeferredGpuWorkerTaskResult:
@@ -1688,6 +1696,11 @@ def run_prediction_volume_in_worker(
         except _ResidentTensorRTRingFatalError:
             raise
         except Exception as exc:
+            if bool(getattr(source, '_native_trt_data_consumed', False)):
+                raise _ResidentTensorRTRingFatalError(
+                    'Native-mask TensorRT task failed after data inference began; '
+                    'CPU replay would repeat its forward passes'
+                ) from exc
             if str(task.get('result_mode', 'file')) == 'd1_owner':
                 raise
             if not isinstance(source, (GpuRenderedYoloSource, GpuTileRenderedYoloSource)):
@@ -2118,15 +2131,20 @@ def _gpu_inference_worker_main(
     completed = None
     manager = None
 
-    def _publish_deferred(finished_task_id: int, deferred: _DeferredGpuWorkerTaskResult) -> None:
+    def _publish_deferred(finished_task_id: int, deferred: _DeferredGpuWorkerTaskResult,
+                          trace_context: Dict[str, object]) -> None:
         try:
             finished_stats = deferred.finish()
+            runtime_trace_event('worker_publication_done', task_id=finished_task_id,
+                                device=f'cuda:{gpu_index}', **trace_context)
             result_queue.put({
                 'type': 'result', 'task_id': int(finished_task_id),
                 'gpu_index': int(gpu_index), 'ok': True, 'stats': finished_stats,
             })
         except Exception as exc:  # pragma: no cover - surfaced to scheduler
             import traceback
+            runtime_trace_event('worker_error', task_id=finished_task_id,
+                                device=f'cuda:{gpu_index}', error=repr(exc), phase='publication', **trace_context)
             result_queue.put({
                 'type': 'result', 'task_id': int(finished_task_id),
                 'gpu_index': int(gpu_index), 'ok': False,
@@ -2136,6 +2154,7 @@ def _gpu_inference_worker_main(
     def _schedule_deferred_publication(
         finished_task_id: int,
         deferred: _DeferredGpuWorkerTaskResult,
+        trace_context: Dict[str, object],
     ) -> None:
         future = deferred.flush_future
         with publication_condition:
@@ -2143,7 +2162,7 @@ def _gpu_inference_worker_main(
 
         def _done(_future: Future) -> None:
             try:
-                _publish_deferred(int(finished_task_id), deferred)
+                _publish_deferred(int(finished_task_id), deferred, trace_context)
             except BaseException as exc:
                 # Do not strand worker teardown if the result transport itself is broken.
                 try:
@@ -2208,6 +2227,9 @@ def _gpu_inference_worker_main(
             break
         task_id = int(task['task_id'])
         task_type = str(task.get('task_type', 'inference'))
+        control_task = task_type != 'inference' or bool(task.get('op'))
+        runtime_trace_event('worker_control_dequeue' if control_task else 'worker_dequeue',
+                            task=task, device=f'cuda:{gpu_index}', operation=task.get('op'))
         if str(task.get('op', '')) == 'release_inference_assets':
             try:
                 # These last-task locals can retain completed Future callbacks or
@@ -2352,14 +2374,24 @@ def _gpu_inference_worker_main(
             )
             task_local['postprocess_workers'] = int(local_cpu_workers)
             compute_started = time.perf_counter()
+            runtime_trace_event('worker_compute_start', task=task_local, device=f'cuda:{gpu_index}')
             completed = run_prediction_volume_in_worker(inference_assets.model, cfg, task_local)
             compute_seconds = max(0.0, time.perf_counter() - compute_started)
+            runtime_trace_event('worker_compute_done', task=task_local, device=f'cuda:{gpu_index}',
+                                deferred_publication=isinstance(completed, _DeferredGpuWorkerTaskResult))
             if isinstance(completed, _DeferredGpuWorkerTaskResult):
                 completed.stats['worker_compute_seconds'] = float(compute_seconds)
                 # Each future publishes itself when its persistent retirement lane settles.
                 # Lane acquisition in predict_source_and_accumulate provides the hard bound;
                 # there is no single publication queue or semaphore serializing completions.
-                _schedule_deferred_publication(int(task_id), completed)
+                # Capture only small scalar identity, not the changing task local
+                # or its source-transfer descriptors, in the completion callback.
+                trace_context = {'view': str(getattr(task.get('view'), 'name', '')),
+                    'family': str(getattr(task.get('view'), 'family', '')),
+                    'kind': str(task.get('kind', '')), 'model_name': str(task.get('model_name', '')),
+                    'task_type': task_type, 'slice_start': task.get('slice_start'),
+                    'slice_count': task.get('slice_count')}
+                _schedule_deferred_publication(int(task_id), completed, trace_context)
                 result_queue.put({
                     'type': 'compute_released', 'task_id': int(task_id),
                     'gpu_index': int(gpu_index), 'ok': True,
@@ -2385,6 +2417,7 @@ def _gpu_inference_worker_main(
             else:
                 completed = dict(completed)
                 completed['worker_compute_seconds'] = float(compute_seconds)
+                runtime_trace_event('worker_publication_done', task=task_local, device=f'cuda:{gpu_index}')
                 result_queue.put({
                     'type': 'result', 'task_id': task_id, 'gpu_index': int(gpu_index),
                     'ok': True, 'stats': completed,
@@ -2394,6 +2427,8 @@ def _gpu_inference_worker_main(
             # TensorRT contexts can no longer be reused safely. Surface a worker-fatal result
             # and exit instead of dequeuing another view on the compromised backend.
             import traceback
+            runtime_trace_event('worker_error', task=task, device=f'cuda:{gpu_index}',
+                                error=repr(exc), fatal=True)
             result_queue.put({
                 'type': 'fatal', 'task_id': task_id, 'gpu_index': int(gpu_index),
                 'error': repr(exc), 'traceback': traceback.format_exc(),
@@ -2401,6 +2436,7 @@ def _gpu_inference_worker_main(
             return
         except Exception as exc:  # pragma: no cover - per-task failure surfaced to main
             import traceback
+            runtime_trace_event('worker_error', task=task, device=f'cuda:{gpu_index}', error=repr(exc))
             result_queue.put({
                 'type': 'result', 'task_id': task_id, 'gpu_index': int(gpu_index), 'ok': False,
                 'error': repr(exc), 'traceback': traceback.format_exc(),
@@ -2408,10 +2444,13 @@ def _gpu_inference_worker_main(
         finally:
             _close_fd_list(transferred_task_fds)
     finally:
-        _wait_for_deferred_publications()
-        _shutdown_d1_worker_pipeline()
-        shutdown_radial_owners()
-        _shutdown_resident_trt_pipeline_cache()
-        _shutdown_gpu_union_retirement_manager()
-        _close_fd_list(persistent_source_memfds.values())
-        persistent_source_memfds.clear()
+        try:
+            _wait_for_deferred_publications()
+            _shutdown_d1_worker_pipeline()
+            shutdown_radial_owners()
+            _shutdown_resident_trt_pipeline_cache()
+            _shutdown_gpu_union_retirement_manager()
+            _close_fd_list(persistent_source_memfds.values())
+            persistent_source_memfds.clear()
+        finally:
+            flush_runtime_task_trace()

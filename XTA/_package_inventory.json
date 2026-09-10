@@ -11337,5 +11337,327 @@
       "spherical_projection_cpu",
       "spherical_sampling_cuda"
     ]
+  },
+  "v21_0_6_review": {
+    "release": "21.0.6",
+    "previous_review_sha256": "9078a719026147d7af6b990634090f78a0874ba1297f49f89e062700f791a9e3",
+    "source_git_commit": "31c95fd7c90133403dc953ae24e03aeab6c6aec9",
+    "source_snapshot": {
+      "branch": "codex/v21-spherical-optimization",
+      "version": "21.0.9",
+      "commit": "85bef93b0695b72682bfb2216d10257bdb53fc24",
+      "included_commits": [
+        "34ad95786640bec23ab5f87e2d2d4fca66eb2fae",
+        "85bef93b0695b72682bfb2216d10257bdb53fc24"
+      ]
+    },
+    "definitions": [
+      {
+        "module": "backprojection",
+        "previous_sha256": "824d252a562f53cf6dfc2c10a5a5073c7a06c9eef6814fd8c5b5fadc85cee8e0",
+        "sha256": "b1826434cd99e36afb2609f31c4fcb5b344e893b9a0a530a347e2868cf6f453a",
+        "name": "_MainProcessGpuStageLease",
+        "reason": "Add explicit native-mask TensorRT ring policy, FP32 tiled persistent buffers, exact threshold-before-nearest restoration, safe graph reuse/recapture and fatal post-consumption failures; trace exclusive GPU lease boundaries."
+      },
+      {
+        "module": "backprojection",
+        "previous_sha256": "3645e9c5a49b9fd9f74c3fa325f4d9d6f2ba872bbbb6d7de10f9d5a848179041",
+        "sha256": "b9ec224209dc2533e0e7c0cf221054c8a3330af954c028c7c68801a364aeb5cd",
+        "name": "_ResidentTensorRTRingExecutor",
+        "reason": "Add explicit native-mask TensorRT ring policy, FP32 tiled persistent buffers, exact threshold-before-nearest restoration, safe graph reuse/recapture and fatal post-consumption failures; trace exclusive GPU lease boundaries."
+      },
+      {
+        "module": "backprojection",
+        "previous_sha256": "f13530361829bad0e0f79b7db8cd47cd838b002bd97837b30a9ef12f6da87a14",
+        "sha256": "a8a628c094caf953dc1f319fd6035f2d009bbf988ac5197bbd7c9cba40ecd2ce",
+        "name": "_resident_trt_pipeline_acquire",
+        "reason": "Add explicit native-mask TensorRT ring policy, FP32 tiled persistent buffers, exact threshold-before-nearest restoration, safe graph reuse/recapture and fatal post-consumption failures; trace exclusive GPU lease boundaries."
+      },
+      {
+        "module": "backprojection",
+        "previous_sha256": "e30dfaafbf5312cccfb8188948c328badc4b007f859ea828948e73d55b73b07b",
+        "sha256": "dfbe1e64ca67bd60a25d98b6f29c72943a551860394e1a5b3075fa88611ea71b",
+        "name": "_resident_trt_pipeline_signature",
+        "reason": "Add explicit native-mask TensorRT ring policy, FP32 tiled persistent buffers, exact threshold-before-nearest restoration, safe graph reuse/recapture and fatal post-consumption failures; trace exclusive GPU lease boundaries."
+      },
+      {
+        "module": "backprojection",
+        "previous_sha256": null,
+        "sha256": "cde926ec94e9eae3e35c4ae5a3854c677ab6f2a3fb22e6336c71517412d333e9",
+        "name": "_resident_trt_post_policy",
+        "reason": "Add explicit native-mask TensorRT ring policy, FP32 tiled persistent buffers, exact threshold-before-nearest restoration, safe graph reuse/recapture and fatal post-consumption failures; trace exclusive GPU lease boundaries."
+      },
+      {
+        "module": "backprojection",
+        "previous_sha256": null,
+        "sha256": "34f3b083e0ad955540deaeabb22f466878b99d4a03c5768a5e277d879020f9d8",
+        "name": "_resident_trt_proto_policy",
+        "reason": "Add explicit native-mask TensorRT ring policy, FP32 tiled persistent buffers, exact threshold-before-nearest restoration, safe graph reuse/recapture and fatal post-consumption failures; trace exclusive GPU lease boundaries."
+      },
+      {
+        "module": "backprojection",
+        "previous_sha256": "a19f4eb0d7c6dc7395e792abd2934b67d9ecc27f8a35aba35d8a75e0763c9d08",
+        "sha256": "f82aec94bf54bc9093597f5a0509ea8248e6805c26da22f60f4108939724de20",
+        "name": "_try_resident_trt_ring_accumulate",
+        "reason": "Add explicit native-mask TensorRT ring policy, FP32 tiled persistent buffers, exact threshold-before-nearest restoration, safe graph reuse/recapture and fatal post-consumption failures; trace exclusive GPU lease boundaries."
+      },
+      {
+        "module": "cuda_backend",
+        "previous_sha256": "50604c99c95c518c493acd48285ce0b289d58802274e473eaaeec022fa9ce990",
+        "sha256": "23066ead662b7a250ec6490481dbec0410523afba2be430cac013acf9123a295",
+        "name": "GpuRenderedYoloSource",
+        "reason": "Opt in resident batch-one Radial/Spherical sources to static slots while preserving native renderers, source FP16 rounding before binding conversion, asynchronous slot ownership and legacy fused/D1 exclusions."
+      },
+      {
+        "module": "cuda_backend",
+        "previous_sha256": "579248dc8f0e396372e97162265d435710946105260f610d265ccb6db0909ae9",
+        "sha256": "c4b5c1f696c9191eb6ac8f32de2691c76e069fa9c7b62252141e1711a0cf1029",
+        "name": "GpuTileRenderedYoloSource",
+        "reason": "Opt in resident batch-one Radial/Spherical sources to static slots while preserving native renderers, source FP16 rounding before binding conversion, asynchronous slot ownership and legacy fused/D1 exclusions."
+      },
+      {
+        "module": "cuda_backend",
+        "previous_sha256": "0fd9e4fdde04e7d0d0417ae93e48973503432faed97b106bf2fab937a978b8da",
+        "sha256": "724f08d4b41a4563531d2f1a8d361a569bc6e27e4fb6e89dc7debdaebfc33bc5",
+        "name": "_GpuWorkerRenderEngine",
+        "reason": "Opt in resident batch-one Radial/Spherical sources to static slots while preserving native renderers, source FP16 rounding before binding conversion, asynchronous slot ownership and legacy fused/D1 exclusions."
+      },
+      {
+        "module": "cuda_backend",
+        "previous_sha256": null,
+        "sha256": "ce7d3d922f7b14344e77e49ab37e2ac3516606ba3fa0bfa99ffc91f55486d21f",
+        "name": "native_trt_ring_enabled",
+        "reason": "Opt in resident batch-one Radial/Spherical sources to static slots while preserving native renderers, source FP16 rounding before binding conversion, asynchronous slot ownership and legacy fused/D1 exclusions."
+      },
+      {
+        "module": "inference",
+        "previous_sha256": null,
+        "sha256": "17aa62a867c0d6ae23c5c705800182cfd3b77f348d242d64a37614810c7eabbe",
+        "name": "_claim_specialized_prediction_targets",
+        "reason": "Account for native radius target coverage after specialized device completion and retain generic/native host phase timing without changing mask arithmetic."
+      },
+      {
+        "module": "inference",
+        "previous_sha256": "f5d32dd391acb2a3f05b7ab2b8d668e8ebb20466021d926f67dd86220d606f1d",
+        "sha256": "2ddc948e40c41f0d21ca2e218150036afb5204f43113d4b5b74c93aaa39ecf3f",
+        "name": "_direct_predict_stream",
+        "reason": "Account for native radius target coverage after specialized device completion and retain generic/native host phase timing without changing mask arithmetic."
+      },
+      {
+        "module": "inference",
+        "previous_sha256": "99ca4d32238e6c6915ee2e2815b9b65d83a664eb3416a2652ff883d7d3be2601",
+        "sha256": "99f5635dc4c4dbbfa4278e997c3fb32bc1520034a9cad7008a768ad3a4935f75",
+        "name": "predict_source_and_accumulate",
+        "reason": "Account for native radius target coverage after specialized device completion and retain generic/native host phase timing without changing mask arithmetic."
+      },
+      {
+        "module": "pipeline",
+        "name": "_execution_runtime_provenance",
+        "previous_sha256": "8341d44bfd33a75ab4e2338dc44b45c05bc9d0e49ebd3860d7298e930d4d42fc",
+        "sha256": "49634d9448997e2d9d07bfaef5c0b2abad77cb2424c3679c2c2c651424cb8007",
+        "reason": "Record native TensorRT and task-trace requests plus runtime implementation hashes in execution provenance. Record the exact cropped-upload pipeline request in runtime provenance."
+      },
+      {
+        "module": "runtime",
+        "previous_sha256": "e5af8d88bd824c2d76b4f90b1994b8d970aa23b907c30f8cff555ab27568e0fb",
+        "sha256": "eecc1b26aa2a938e7e3f95d16119b3ee95662d14552e9549872d90f11fb16ed9",
+        "name": "RuntimeTelemetry",
+        "reason": "Add bounded per-process host task event batches and serialized lossless flushes; preserve fractional counters and large integers, reject nonfinite counters, and keep tracing optional and failure-safe."
+      },
+      {
+        "module": "runtime",
+        "previous_sha256": null,
+        "sha256": "6e5775629a4b8f2d0d3ef23db8f1fea8030feb17886362eb0a26d2864427d009",
+        "name": "flush_runtime_task_trace",
+        "reason": "Add bounded per-process host task event batches and serialized lossless flushes; preserve fractional counters and large integers, reject nonfinite counters, and keep tracing optional and failure-safe."
+      },
+      {
+        "module": "runtime",
+        "previous_sha256": null,
+        "sha256": "ffc8ba8d4f8349e6fef061d19c5cff5b48ef50445109e2ae99e7e524db715bdf",
+        "name": "runtime_trace_event",
+        "reason": "Add bounded per-process host task event batches and serialized lossless flushes; preserve fractional counters and large integers, reject nonfinite counters, and keep tracing optional and failure-safe."
+      },
+      {
+        "module": "tta_scheduler",
+        "previous_sha256": "fc1e41b27063e2ef9746d045ec27a9a8d42d8c47e1768a54efed853d9be2f240",
+        "sha256": "c87c38a668ec9b0b5f11a1079ac5945c9755b6468e2e9034e98175846905564b",
+        "name": "TtaScheduler",
+        "reason": "Trace actual queue dispatch/receipt separately from handler time, including controlled D1 replay identity without changing scheduling decisions."
+      },
+      {
+        "module": "workers",
+        "previous_sha256": "d81849f59a28b4dc57633d4a95817401f2430df55e17a325c9d205fdd49512a7",
+        "sha256": "100596a48619d7b2c129ccf67b3f1262821b28c42a749e1994c9079ed8809391",
+        "name": "_cpu_inference_worker_main",
+        "reason": "Trace dequeue/compute/publication boundaries and prohibit CPU replay after native TensorRT data consumption, preserving setup fallback and worker ownership."
+      },
+      {
+        "module": "workers",
+        "previous_sha256": "fe54c592cd78e1e67dedca3f736a934900a77bb95531421191c2d32731b0b0bb",
+        "sha256": "b4172e9b25798b66ebd4219b7c716ecbe912e9443cb98f9db29e5966946f745d",
+        "name": "_gpu_inference_worker_main",
+        "reason": "Trace dequeue/compute/publication boundaries and prohibit CPU replay after native TensorRT data consumption, preserving setup fallback and worker ownership."
+      },
+      {
+        "module": "workers",
+        "previous_sha256": "63a0b88d4f6f1d03abd8f50f993be448c0191a52400e6e88b8d5008ba7072017",
+        "sha256": "2590e4f06e7b44a78aea53e6b8a25b7c15e621485c2efa9d383c617b1ead0a90",
+        "name": "run_prediction_volume_in_worker",
+        "reason": "Trace dequeue/compute/publication boundaries and prohibit CPU replay after native TensorRT data consumption, preserving setup fallback and worker ownership."
+      },
+      {
+        "module": "cylindrical_cuda_projection",
+        "name": "RadialCudaProjector",
+        "previous_sha256": "123acc79a54c42266679f2ac69c175ab22a4f4884b47f5b83c10129cc073ca29",
+        "sha256": "9ef4a3d1b92b09714edbc640e9eb5cf612ee6a8e17d9885cccd2b916c1b94285",
+        "reason": "Overlap exact source-crop packing with H2D copies using two event-fenced lanes inside the existing pinned budget; retain settled fallback and fatal ownership fencing."
+      },
+      {
+        "module": "spherical_projection",
+        "name": "backproject_spherical_volume_to_volume",
+        "previous_sha256": "51537f01ae8d2a4a731415b4e3a26f9381f29eb64a2bdfff37ec2c46a9abf42f",
+        "sha256": "396365ff1bf8644e7e183ebeb3e3d705107a75a8a8943b005e102538a3d65f9b",
+        "reason": "Expose source upload, packing and lane-fence timing without changing projection math, scheduling or publication; absent counters remain unavailable."
+      }
+    ],
+    "statements": [
+      {
+        "module": "__init__",
+        "label": "Assign:7",
+        "previous_sha256": "7eba64c4b8a3fd0eff15c02328812e662d37093cf74bb812b74dc6fb6b3ac2d5",
+        "sha256": "941ba461fa8a41e1db48716bc935c87acea8b0ee04b6f4206bc996e4ba3555fc",
+        "reason": "Align runtime and sole launcher identity with main v21.0.6."
+      },
+      {
+        "module": "backprojection",
+        "previous_sha256": null,
+        "sha256": "d8b579991a7a991a6886e4d898186a5931f0f2307a9ef24f0ee29fab503d3940",
+        "label": "binding__RESIDENT_TRT_NATIVE_POLICIES_ANNOUNCED",
+        "reason": "Add explicit native-mask TensorRT ring policy, FP32 tiled persistent buffers, exact threshold-before-nearest restoration, safe graph reuse/recapture and fatal post-consumption failures; trace exclusive GPU lease boundaries."
+      },
+      {
+        "module": "backprojection",
+        "previous_sha256": "e0f84b872d507a5b88b88c9af515c3260986fe00645750e1a59035f5d754b547",
+        "sha256": "77912cdc942011618e04671290c6b8fe924a571eae0fa2e33660cf5d0e4c2c75",
+        "label": "importfrom_.inference",
+        "reason": "Add explicit native-mask TensorRT ring policy, FP32 tiled persistent buffers, exact threshold-before-nearest restoration, safe graph reuse/recapture and fatal post-consumption failures; trace exclusive GPU lease boundaries."
+      },
+      {
+        "module": "backprojection",
+        "previous_sha256": "55d19970b9283f35064260bcc75b2a76f95c0ef36435567e00bfe09ea15cb54f",
+        "sha256": "575584bc7ae499091fbc1abab78afabdd978d2838b33bc2a9d4f1e2dfe12cdad",
+        "label": "importfrom_.runtime",
+        "reason": "Add explicit native-mask TensorRT ring policy, FP32 tiled persistent buffers, exact threshold-before-nearest restoration, safe graph reuse/recapture and fatal post-consumption failures; trace exclusive GPU lease boundaries."
+      },
+      {
+        "module": "cli",
+        "label": "Assign:13",
+        "previous_sha256": "bd08087f942721985540145bef5fcba7fa33d78116a3bd9477ca8db4ca05787c",
+        "sha256": "15e5ca720145a87aa609471697f026f1fb92d8cbdd2b96f0f3a3db207f58530e",
+        "reason": "Align runtime and sole launcher identity with main v21.0.6."
+      },
+      {
+        "module": "cli",
+        "label": "Assign:14",
+        "previous_sha256": "b5c2320eac17a113e5d9798c8a67c6e55ab0a5d003f8634ab156bdf8b70ced98",
+        "sha256": "48a1a4ab3b932b76e7326224ac34e6486073a353b1cf86b13deb618a2d6eda41",
+        "reason": "Align runtime and sole launcher identity with main v21.0.6."
+      },
+      {
+        "module": "config",
+        "label": "Assign:22",
+        "previous_sha256": "bd08087f942721985540145bef5fcba7fa33d78116a3bd9477ca8db4ca05787c",
+        "sha256": "15e5ca720145a87aa609471697f026f1fb92d8cbdd2b96f0f3a3db207f58530e",
+        "reason": "Align runtime and sole launcher identity with main v21.0.6."
+      },
+      {
+        "module": "config",
+        "label": "Assign:24",
+        "previous_sha256": "eeeba4ab677ceb1c1c6d8cbcfe77e89fdab8cf2dc076e4596a3e21d843e1c6aa",
+        "sha256": "44fdf7a07789747409f4a5be074b800429276e1b95eea3c09448783604ec266d",
+        "reason": "Align runtime and sole launcher identity with main v21.0.6."
+      },
+      {
+        "module": "inference",
+        "previous_sha256": "6a511c4b2342ef6b2259c9e6f97be6af1966cf260a690af1dc2d5e9b21d9922e",
+        "sha256": "f2889f5b18ef380af76d58c5c8c9913a5c39fce3af0278225d0e95ed3cfcac4f",
+        "label": "importfrom_.runtime",
+        "reason": "Account for native radius target coverage after specialized device completion and retain generic/native host phase timing without changing mask arithmetic."
+      },
+      {
+        "module": "runtime",
+        "previous_sha256": null,
+        "sha256": "60e489325a19bee8be6a450945dd253634f01297b803d2869e489219288b5372",
+        "label": "import_operator",
+        "reason": "Add bounded per-process host task event batches and serialized lossless flushes; preserve fractional counters and large integers, reject nonfinite counters, and keep tracing optional and failure-safe."
+      },
+      {
+        "module": "runtime",
+        "previous_sha256": null,
+        "sha256": "9df267ed6eef4f61eaaffaebdf9ac9fe93bcf6d1aab9647b1fd045430624c91e",
+        "label": "import_socket",
+        "reason": "Add bounded per-process host task event batches and serialized lossless flushes; preserve fractional counters and large integers, reject nonfinite counters, and keep tracing optional and failure-safe."
+      },
+      {
+        "module": "tta_scheduler",
+        "previous_sha256": null,
+        "sha256": "c57de0ba7a33bbfa8bd98f393ffc1625f535cb6d51d40109585ae8717fa39463",
+        "label": "importfrom_.runtime",
+        "reason": "Trace actual queue dispatch/receipt separately from handler time, including controlled D1 replay identity without changing scheduling decisions."
+      },
+      {
+        "module": "workers",
+        "previous_sha256": "5083625c02eca5fa300ca11573710156511aa640d952ede48f4ccf458eab6b4d",
+        "sha256": "1cce451c0d777b3ca15408ea3bde0db4b0e11b51fe65c40ebe4db7c8e77a8258",
+        "label": "importfrom_.runtime",
+        "reason": "Trace dequeue/compute/publication boundaries and prohibit CPU replay after native TensorRT data consumption, preserving setup fallback and worker ownership."
+      },
+      {
+        "module": "cylindrical_cuda_projection",
+        "label": "import_os",
+        "previous_sha256": null,
+        "sha256": "ac3a74d6dd975a8e8fe4b7f85fce794793a9355595b850e3926964913948d386",
+        "reason": "Overlap exact source-crop packing with H2D copies using two event-fenced lanes inside the existing pinned budget; retain settled fallback and fatal ownership fencing."
+      }
+    ],
+    "local_import_seam_updates": [
+      {
+        "module": "cuda_backend",
+        "name": "_GpuWorkerRenderEngine",
+        "previous_definition_sha256": "0fd9e4fdde04e7d0d0417ae93e48973503432faed97b106bf2fab937a978b8da",
+        "previous_seam_sha256": "61456a7e052e01fdd6a7d69b765fc39465506c03094833384038bede77b79d72",
+        "definition_sha256": "724f08d4b41a4563531d2f1a8d361a569bc6e27e4fb6e89dc7debdaebfc33bc5",
+        "seam_sha256": "61456a7e052e01fdd6a7d69b765fc39465506c03094833384038bede77b79d72",
+        "reason": "Review the native inference/observability body changes and existing lazy-import locations; relative import statements and lexical scopes remain unchanged."
+      },
+      {
+        "module": "inference",
+        "name": "predict_source_and_accumulate",
+        "previous_definition_sha256": "99ca4d32238e6c6915ee2e2815b9b65d83a664eb3416a2652ff883d7d3be2601",
+        "previous_seam_sha256": "ccf37e9656817910658d67d9c07dd114ce6eb29a820fda1bfa904ac246d955d8",
+        "definition_sha256": "99f5635dc4c4dbbfa4278e997c3fb32bc1520034a9cad7008a768ad3a4935f75",
+        "seam_sha256": "ccf37e9656817910658d67d9c07dd114ce6eb29a820fda1bfa904ac246d955d8",
+        "reason": "Review the native inference/observability body changes and existing lazy-import locations; relative import statements and lexical scopes remain unchanged."
+      }
+    ],
+    "preserved_radial_definition_updates": [
+      {
+        "module": "cylindrical_cuda_projection",
+        "qualified_name": "RadialCudaProjector._upload_cropped_source",
+        "previous_sha256": "5f12562dafcb991f93b1702b8976e33a5117e4e01de357c3cb99c98afe52599a",
+        "sha256": "9081fc88c9a08069df169151b7f9b18199464313530f046f7609e52675014971",
+        "reason": "Explicitly review the preserved upload method: byte ordering, source addressing and total pinned capacity remain exact; lane events prevent reuse until DMA completion."
+      }
+    ],
+    "preserved_radial_module_updates": [
+      {
+        "module": "cylindrical_cuda_projection",
+        "previous_sha256": "a15a139342d17fbc65e3e004f210a842aebc272ec0bd892baccf1bb59fe9d29e",
+        "sha256": "755ef036cb0e059bb46febbf34c294d373beebe0e7eace9fb3f114fbc62bcd9c",
+        "reason": "Supersede only the authenticated uploader module: os flag import and RadialCudaProjector._upload_cropped_source changed; all other module AST statements and methods matchdevelopment v21.0.8."
+      }
+    ],
+    "complete_modules": []
   }
 }

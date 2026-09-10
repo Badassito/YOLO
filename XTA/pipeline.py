@@ -439,13 +439,14 @@ def _execution_runtime_provenance() -> Dict[str, object]:
     """Include nonlinear geometry and scheduling sources in the run receipt."""
     import hashlib
     from .geometry_quality import geometry_quality_request_record
+    from .cuda_backend import native_trt_ring_enabled
     from .workspace import _env_flag
 
     result = radial_runtime_provenance()
     sources = {}
     package = Path(__file__).resolve().parent
     for name in ('qsc', 'spherical_geometry', 'spherical_cuda', 'spherical_sampling_cuda',
-                 'cuda_backend', 'spherical_projection',
+                 'cuda_backend', 'runtime', 'spherical_projection',
                  'spherical_projection_bounds', 'spherical_projection_cuda',
                  'spherical_preflight', 'spherical_projection_cpu', 'geometry_quality',
                  'unification.sampling', 'cylindrical_cuda_projection', 'tta_scheduler', 'backprojection'):
@@ -458,6 +459,9 @@ def _execution_runtime_provenance() -> Dict[str, object]:
         sources[name] = entry
     result['spherical_sources'] = sources
     result['geometry_quality_requests'] = geometry_quality_request_record()
+    result['native_trt_ring_requested'] = native_trt_ring_enabled()
+    result['task_trace_requested'] = _env_flag('YOLO_TTA_TASK_TRACE', False)
+    result['cropped_upload_pipeline_requested'] = _env_flag('YOLO_TTA_CROPPED_UPLOAD_PIPELINE', True)
     result['spherical_cpu_compact_requested'] = _env_flag('YOLO_TTA_CPU_SPHERICAL_COMPACT', True)
     result['spherical_retirement_requests'] = {
         'enabled': _env_flag('YOLO_TTA_GPU_SPHERICAL_PRESSURE_RETIREMENT', True),

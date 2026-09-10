@@ -167,7 +167,7 @@ class FusedRendererOptimizationTests(unittest.TestCase):
         view = SimpleNamespace(name='azimuthal_a120')
         render_done = mock.Mock()
         slot = SimpleNamespace(
-            input=SimpleNamespace(shape=(1, 1, 8, 8)),
+            input=SimpleNamespace(shape=(1, 1, 8, 8), record_stream=mock.Mock()),
             infer_valid=False,
             render_done=render_done,
         )

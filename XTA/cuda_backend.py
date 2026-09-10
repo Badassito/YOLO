@@ -160,6 +160,14 @@ def gpu_worker_render_resident_enabled() -> bool:
     """Allow a full source-volume upload when VRAM admission succeeds."""
     return _env_flag('YOLO_TTA_GPU_RENDER_RESIDENT', True)
 
+def native_trt_ring_enabled() -> bool:
+    """Opt native Radial/Spherical tasks into static TensorRT input slots.
+
+    This controls source delivery only. Their existing native renderers and the
+    executor's separate native-mask policy retain geometry and mask semantics.
+    """
+    return _env_flag('YOLO_TTA_NATIVE_TRT_RING', False)
+
 def gpu_render_reserve_bytes() -> int:
     """VRAM headroom that must remain free AFTER a resident source-volume upload."""
     return int(max(1.0, _env_float('YOLO_TTA_GPU_RENDER_RESERVE_GIB', 12.0)) * GIB)
@@ -3939,6 +3947,10 @@ class _GpuWorkerRenderEngine:
                 f'resident ring input shape {tuple(slot.input.shape)} != {expected_shape}'
             )
         with torch.cuda.stream(self._stream):
+            # A failed pre-consumption render can release its source slots while
+            # this stream still has writes queued. Allocation usually occurred
+            # on the default stream; keep the input storage alive through ours.
+            slot.input.record_stream(self._stream)
             if bool(slot.infer_valid):
                 # This slot's preceding TensorRT enqueue has consumed its input before
                 # the low-priority renderer writes the next frame into the same address.
@@ -3973,6 +3985,12 @@ class _GpuWorkerRenderEngine:
                     mirror_azimuthal_u=bool(mirror_u),
                 )
                 plane.clamp_(0.0, 255.0).mul_(1.0 / 255.0)
+                if (bool(getattr(slot, 'native_preprocess_fp16', False))
+                        and slot.input.dtype != torch.float16):
+                    # Generic native sources honor --quantize before predictor
+                    # preprocessing converts to the engine binding dtype. An
+                    # FP32 binding must retain that intermediate FP16 rounding.
+                    plane = plane.to(torch.float16)
                 slot.input[0, int(channel_idx)].copy_(plane, non_blocking=True)
                 first_channel_by_source[source] = int(channel_idx)
             slot.render_done.record(self._stream)
@@ -3998,6 +4016,7 @@ class _GpuWorkerRenderEngine:
             )
         matrix = np.asarray(tile_affine, dtype=np.float32)
         with torch.cuda.stream(self._stream):
+            slot.input.record_stream(self._stream)
             if bool(slot.infer_valid):
                 self._stream.wait_event(slot.infer_done)
             contextual = tuple(
@@ -4018,6 +4037,9 @@ class _GpuWorkerRenderEngine:
                     mirror_azimuthal_u=bool(mirror_u),
                 )
                 plane.clamp_(0.0, 255.0).mul_(1.0 / 255.0)
+                if (bool(getattr(slot, 'native_preprocess_fp16', False))
+                        and slot.input.dtype != torch.float16):
+                    plane = plane.to(torch.float16)
                 slot.input[0, int(channel_index)].copy_(plane, non_blocking=True)
                 first_channel_by_source[source] = int(channel_index)
             slot.render_done.record(self._stream)
@@ -4049,7 +4071,6 @@ class GpuRenderedYoloSource:
         require_forward_sampling('cuda', DataRole.INTENSITY)
         self.engine = engine
         self.view = view
-        self.resident_ring_supported = not (is_radial_view(view) or is_spherical_view(view))
         self.job = job
         self.slice_offset = int(slice_offset)
         self.name = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(name)).strip('_') or 'gpu_rendered_volume'
@@ -4065,6 +4086,11 @@ class GpuRenderedYoloSource:
         self.fp16 = bool(fp16)
         self.nf = max(0, int(num_frames))
         self.bs = max(1, int(batch_size))
+        self.resident_ring_supported = bool(
+            not (is_radial_view(view) or is_spherical_view(view))
+            or (native_trt_ring_enabled() and self.bs == 1 and self.nf > 0
+                and str(getattr(engine, '_mode', '')) == 'resident')
+        )
         self.yield_nf = int(math.ceil(float(self.nf) / float(self.bs)) * self.bs) if self.nf > 0 else 0
         self.synthetic_count = max(0, int(self.yield_nf) - int(self.nf))
         self.azimuthal_padding_count = azimuthal_batch_padding_count(
@@ -4115,7 +4141,8 @@ class GpuRenderedYoloSource:
 
  Unified ``--quantize`` selects the predictor precision policy, but exported TensorRT
  engines may expose an input binding whose dtype differs from that policy. The capability
- probe resolves the actual binding first; ``self.fp16`` is only the generic fallback."""
+ probe resolves the actual binding first. Native shells also preserve the generic
+ source's optional FP16 rounding before conversion to that binding dtype."""
         if not bool(getattr(self, 'resident_ring_supported', True)):
             raise RuntimeError('Radial shell and Spherical QSC views use generic CUDA inference; the resident ring is unsupported')
         if (
@@ -4152,6 +4179,12 @@ class GpuRenderedYoloSource:
                 )
                 for i in range(2)
             ]
+        # Refreshed even on cache hits: native render graphs are disabled, so this
+        # task-local preprocessing policy does not alter captured inference graphs.
+        for slot in self._direct_ring:
+            slot.native_preprocess_fp16 = bool(
+                (is_radial_view(self.view) or is_spherical_view(self.view)) and self.fp16
+            )
         family = (
             'azimuthal' if str(self.view.family) == 'azimuthal'
             else ('tilted' if is_tilted_view(self.view) else '')
@@ -4293,7 +4326,6 @@ class GpuTileRenderedYoloSource:
         require_forward_sampling('cuda', DataRole.INTENSITY)
         self.engine = engine
         self.view = view
-        self.resident_ring_supported = not (is_radial_view(view) or is_spherical_view(view))
         self.tile_job = tile_job
         self.tile_affine = np.asarray(tile_job.M_out_to_src, dtype=np.float32)
         self.slice_offset = int(slice_offset)
@@ -4306,6 +4338,11 @@ class GpuTileRenderedYoloSource:
         self.fp16 = bool(fp16)
         self.nf = max(0, int(num_frames))
         self.bs = max(1, int(batch_size))
+        self.resident_ring_supported = bool(
+            not (is_radial_view(view) or is_spherical_view(view))
+            or (native_trt_ring_enabled() and self.bs == 1 and self.nf > 0
+                and str(getattr(engine, '_mode', '')) == 'resident')
+        )
         self.yield_nf = int(math.ceil(float(self.nf) / float(self.bs)) * self.bs) if self.nf > 0 else 0
         self.synthetic_count = max(0, int(self.yield_nf) - int(self.nf))
         self.azimuthal_padding_count = azimuthal_batch_padding_count(
@@ -4379,6 +4416,9 @@ class GpuTileRenderedYoloSource:
                 for i in range(2)
             ]
         for slot in self._direct_ring:
+            slot.native_preprocess_fp16 = bool(
+                (is_radial_view(self.view) or is_spherical_view(self.view)) and self.fp16
+            )
             slot.render_graph = None
             slot.render_graph_key = None
             slot.render_expected_key = None

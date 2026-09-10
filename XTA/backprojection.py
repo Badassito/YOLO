@@ -66,6 +66,7 @@ from .runtime import (
     parallel_map_unordered,
     runtime_telemetry,
     runtime_telemetry_phase,
+    runtime_trace_event,
 )
 
 # Explicit lower-layer dependencies keep imports one-way.
@@ -82,10 +83,13 @@ from .inference import (
     ModelInputChannelMismatchError,
     ResidentRingUnitDescriptor,
     _ResidentGpuPipelineSlot,
+    _affine_theta_for_grid_sample,
     _cuda_graph_capture_context,
+    _get_cached_affine_grid,
     _resident_mask_kernels,
     _split_segmentation_backend_outputs,
     _tiled_f16_proto_union_applicable,
+    _tiled_f32_proto_union_applicable,
     _warp_matrix_is_identity,
     resident_trt_cuda_graphs_enabled,
     resident_trt_native_warp_enabled,
@@ -106,6 +110,22 @@ if TYPE_CHECKING:
 # module. Keeping them process-local avoids copied mutable state across module seams.
 _RESIDENT_TRT_RING_ANNOUNCED = False
 _RESIDENT_TRT_RING_FALLBACK_WARNED = False
+_RESIDENT_TRT_NATIVE_POLICIES_ANNOUNCED: set = set()
+
+
+def _resident_trt_post_policy(source: object) -> str:
+    """Native shells retain their network-threshold/native-cleanup contract."""
+    family = str(getattr(getattr(source, 'view', None), 'family', ''))
+    return 'native_mask' if family in ('radial', 'spherical') else 'legacy_proto'
+
+
+def _resident_trt_proto_policy(post_policy: str, track_conf: bool) -> Tuple[str, int]:
+    if post_policy not in ('legacy_proto', 'native_mask'):
+        raise ValueError(f'unsupported resident TensorRT post policy {post_policy!r}')
+    requested = proto_hole_treatment_mode()
+    mode = requested if (requested == 'close' and not track_conf
+                         and post_policy == 'legacy_proto') else 'off'
+    return mode, int(proto_hole_treatment_radius())
 
 @dataclass(frozen=True)
 class AzimuthalBackprojectionSample:
@@ -460,6 +480,8 @@ class _MainProcessGpuStageLease:
         self.device_index = int(device_index)
         self.purpose = str(purpose)
         self._released = False
+        runtime_trace_event('gpu_stage_acquired', device=f'cuda:{self.device_index}',
+                            purpose=self.purpose)
 
     def torch_device(self, torch_mod: object) -> object:
         return torch_mod.device(f'cuda:{int(self.device_index)}')
@@ -469,6 +491,8 @@ class _MainProcessGpuStageLease:
             return
         self._released = True
         self._coordinator.release_stage(self.device_index, self.purpose)
+        runtime_trace_event('gpu_stage_released', device=f'cuda:{self.device_index}',
+                            purpose=self.purpose)
 
     def __enter__(self) -> '_MainProcessGpuStageLease':
         return self
@@ -1283,6 +1307,7 @@ class _ResidentTensorRTRingExecutor:
         confidence_threshold: float,
         collect_slice_bboxes: bool = False,
         dynamic_unit_descriptors: bool = False,
+        post_policy: str = 'legacy_proto',
     ) -> None:
         import torch  # type: ignore
         self.torch = torch
@@ -1332,13 +1357,12 @@ class _ResidentTensorRTRingExecutor:
         self.track_conf = bool(track_conf)
         self.collect_slice_bboxes = bool(collect_slice_bboxes)
         self.confidence_threshold = float(confidence_threshold)
-        requested_proto_mode = proto_hole_treatment_mode()
+        self.post_policy = str(post_policy)
         # Confidence-based component cleanup expects an untouched confidence/mask relation;
         # the prioritized D1 command does not allocate a confidence map.
-        self.proto_hole_treatment = (
-            requested_proto_mode if requested_proto_mode == 'close' and not self.track_conf else 'off'
+        self.proto_hole_treatment, self.proto_hole_radius = _resident_trt_proto_policy(
+            self.post_policy, self.track_conf,
         )
-        self.proto_hole_radius = int(proto_hole_treatment_radius())
         self.proto_hole_treatment_active = bool(
             self.proto_hole_treatment == 'close' and self.proto_hole_radius > 0
         )
@@ -1564,13 +1588,15 @@ class _ResidentTensorRTRingExecutor:
         slot.compact_coeff = None
         slot.compact_proto_boxes = None
         slot.compact_confs = None
-        if _tiled_f16_proto_union_applicable(torch, head, proto):
+        if (_tiled_f16_proto_union_applicable(torch, head, proto)
+                or (getattr(self, 'post_policy', 'legacy_proto') == 'native_mask'
+                    and _tiled_f32_proto_union_applicable(torch, head, proto))):
             masks = int(proto.shape[1])
             # Capacity remains anchors so confidence compaction preserves the existing
             # no-truncation semantics.  At 3K/32 prototypes these add ~16 MiB per ring
             # slot and keep all addresses stable for postprocess CUDA Graph capture.
             slot.compact_coeff = torch.empty(
-                (anchors, masks), dtype=torch.float16, device=device,
+                (anchors, masks), dtype=head.dtype, device=device,
             )
             slot.compact_proto_boxes = torch.empty(
                 (anchors, 4), dtype=torch.float32, device=device,
@@ -1623,6 +1649,18 @@ class _ResidentTensorRTRingExecutor:
         # but keeping this tiny allocation resident lets cached TensorRT contexts serve
         # D1 and ordinary tasks without context churn.
         slot.native_bbox = torch.empty((4,), dtype=torch.int32, device=device)
+        slot.native_mask_grid = None
+        if (getattr(self, 'post_policy', 'legacy_proto') == 'native_mask'
+                and not self.identity_native_warp):
+            # Use the generic path's exact float32 affine grid. Retain the owner in
+            # both slots until the task drains, even if the shared LRU evicts it.
+            theta = _affine_theta_for_grid_sample(
+                self.default_descriptor.M_out_to_native, int(self.out_size),
+                int(self.native_h), int(self.native_w),
+            )
+            slot.native_mask_grid = _get_cached_affine_grid(
+                theta, int(self.native_h), int(self.native_w), device,
+            )
 
     def configure_slice_bbox_collection(self, enabled: bool) -> None:
         """Select whether post quantization emits D1 metadata for the next task."""
@@ -1635,6 +1673,58 @@ class _ResidentTensorRTRingExecutor:
         # currently uses dynamic descriptors, but invalidate defensively if that changes.
         for slot in self.slots:
             slot.post_graph = None
+        if getattr(self, 'post_policy', 'legacy_proto') == 'native_mask':
+            self._native_post_graph_dirty = True
+            self.post_graph_count = 0
+
+    def reconfigure_post_policy(
+        self, *, post_policy: str, track_conf: bool, confidence_threshold: float,
+        collect_slice_bboxes: bool, native_h: int, native_w: int,
+        M_out_to_native: np.ndarray, dynamic_unit_descriptors: bool,
+    ) -> None:
+        """Replace only drained postprocessing state, retaining both TRT contexts.
+
+        Input/output bindings, inference graphs and renderer metadata stay owned by
+        the existing slots. Policy changes never execute another model forward.
+        """
+        mode, radius = _resident_trt_proto_policy(str(post_policy), bool(track_conf))
+        if bool(getattr(self, '_closed', False)):
+            raise RuntimeError('cannot reconfigure a closed TensorRT executor')
+        self.synchronize()
+        # Synchronize is event-based for completed tasks. Explicitly drain every
+        # post stream too, including an optional warmup/capture without post_valid.
+        # Do not release any graph/private buffer if a drain cannot be proved.
+        for slot in self.slots:
+            slot.post_stream.synchronize()
+        self.post_policy = str(post_policy)
+        self.track_conf = bool(track_conf)
+        self.confidence_threshold = float(confidence_threshold)
+        self.collect_slice_bboxes = bool(collect_slice_bboxes)
+        self.proto_hole_treatment, self.proto_hole_radius = mode, radius
+        self.proto_hole_treatment_active = bool(mode == 'close' and radius > 0)
+        self.dynamic_unit_descriptors = bool(dynamic_unit_descriptors) if post_policy == 'native_mask' else True
+        self.native_h, self.native_w = int(native_h), int(native_w)
+        self.default_descriptor = ResidentRingUnitDescriptor(
+            unit_index=0, destination_index=0, native_h=self.native_h, native_w=self.native_w,
+            M_out_to_native=np.asarray(M_out_to_native, dtype=np.float32).reshape(2, 3),
+        )
+        self.identity_native_warp, self.native_to_out = self._descriptor_warp(self.default_descriptor)
+        for slot in self.slots:
+            slot.post_graph = None
+            # This dictionary contains post-kernel views only. Renderer metadata
+            # and TensorRT binding owners have separate dictionaries/attributes.
+            slot._cupy_refs.clear()
+            for name in ('compact_indices', 'compact_count', 'compact_coeff', 'compact_proto_boxes',
+                         'compact_confs', 'max_logit', 'proto_tmp', 'conf_proto',
+                         'native_union', 'native_conf', 'native_bbox', 'native_mask_grid'):
+                setattr(slot, name, None)
+            self._allocate_post_buffers(slot)
+            self._set_slot_unit_descriptor(slot, self.default_descriptor)
+            slot.infer_valid = slot.post_valid = False
+        # Legacy descriptors remain dynamic, so this validates without capture.
+        # Native static descriptors get fresh post-only graphs for the new policy.
+        self._refresh_native_post_graphs()
+        runtime_telemetry().add('trt_ring.post_policy_reconfigurations', 1)
 
     def reconfigure_destination(
         self,
@@ -1649,8 +1739,13 @@ class _ResidentTensorRTRingExecutor:
         matrix = np.asarray(M_out_to_native, dtype=np.float32).reshape(2, 3)
         same_geometry = bool(new_h == int(self.native_h) and new_w == int(self.native_w))
         same_matrix = bool(np.array_equal(matrix, self.default_descriptor.M_out_to_native))
-        effective_dynamic = True  # post scalar arguments must remain task-dynamic.
+        effective_dynamic = (
+            bool(dynamic_unit_descriptors)
+            if getattr(self, 'post_policy', 'legacy_proto') == 'native_mask' else True
+        )
         if same_geometry and same_matrix and bool(self.dynamic_unit_descriptors) == effective_dynamic:
+            if bool(getattr(self, '_native_post_graph_dirty', False)):
+                self._refresh_native_post_graphs()
             return
         self.synchronize()
         self.native_h = int(new_h)
@@ -1683,7 +1778,39 @@ class _ResidentTensorRTRingExecutor:
             self._set_slot_unit_descriptor(slot, self.default_descriptor)
             slot.infer_valid = False
             slot.post_valid = False
+        if getattr(self, 'post_policy', 'legacy_proto') == 'native_mask':
+            self._refresh_native_post_graphs()
         runtime_telemetry().add('trt_ring.destination_reconfigurations', 1)
+
+    def _refresh_native_post_graphs(self) -> None:
+        """Validate and recapture changed post buffers without model forwards."""
+        torch = self.torch
+        capture = bool(resident_trt_cuda_graphs_enabled() and not self.dynamic_unit_descriptors)
+        for slot in self.slots:
+            slot.post_graph = None
+            try:
+                with torch.cuda.stream(slot.post_stream):
+                    self._launch_post(slot)
+                slot.post_stream.synchronize()
+            except BaseException as exc:
+                raise RuntimeError(f'resident TensorRT post warmup failed for slot {slot.slot_id}') from exc
+            if capture:
+                try:
+                    graph = torch.cuda.CUDAGraph()
+                    with _cuda_graph_capture_context(torch, graph, slot.post_stream):
+                        self._launch_post(slot)
+                    slot.post_stream.synchronize()
+                    slot.post_graph = graph
+                except Exception:
+                    slot.post_graph = None
+                    try:
+                        slot.post_stream.synchronize()
+                    except BaseException as exc:
+                        raise _ResidentTensorRTRingFatalError(
+                            f'resident TensorRT post stream recovery failed for slot {slot.slot_id}'
+                        ) from exc
+        self.post_graph_count = sum(slot.post_graph is not None for slot in self.slots)
+        self._native_post_graph_dirty = False
 
     def _execute_context(self, slot: _ResidentGpuPipelineSlot) -> None:
         context = slot.context
@@ -1716,8 +1843,9 @@ class _ResidentTensorRTRingExecutor:
             refs['native_bbox'] if self.collect_slice_bboxes else np.uintp(0)
         )
         use_tiled_union = 'compact_coeff' in refs
+        tiled_tag = 'f16' if head.dtype == self.torch.float16 else 'f32'
         if use_tiled_union:
-            self.kernels.compact_f16_tiled(
+            getattr(self.kernels, f'compact_{tiled_tag}_tiled')(
                 ((anchors + 255) // 256,), (256,),
                 (
                     refs['head'], np.int32(anchors), np.float32(self.confidence_threshold),
@@ -1748,11 +1876,12 @@ class _ResidentTensorRTRingExecutor:
         pixels = ph * pw
         if use_tiled_union:
             tiled_block = (32, 4)
+            tiled_width = tiled_block[0] * (2 if tiled_tag == 'f16' else 1)
             tiled_grid = (
-                (pw + tiled_block[0] * 2 - 1) // (tiled_block[0] * 2),
+                (pw + tiled_width - 1) // tiled_width,
                 (ph + tiled_block[1] - 1) // tiled_block[1],
             )
-            self.kernels.union_f16_f16_tiled(
+            getattr(self.kernels, f'union_{tiled_tag}_{tiled_tag}_tiled')(
                 tiled_grid, tiled_block,
                 (
                     refs['proto'], refs['compact_coeff'], refs['compact_proto_boxes'],
@@ -1775,6 +1904,9 @@ class _ResidentTensorRTRingExecutor:
                 ),
                 stream=external,
             )
+        if getattr(self, 'post_policy', 'legacy_proto') == 'native_mask':
+            self._launch_native_mask_post(slot, external, bbox_arg)
+            return
         if self.proto_hole_treatment_active:
             self.kernels.proto_threshold_signed(
                 ((pixels + 255) // 256,), (256,),
@@ -1825,6 +1957,49 @@ class _ResidentTensorRTRingExecutor:
                 ),
                 stream=external,
             )
+
+    def _launch_native_mask_post(self, slot: _ResidentGpuPipelineSlot,
+                                 external: object, bbox_arg: object) -> None:
+        """Preserve generic interpolation -> threshold -> nearest warp exactly.
+
+        The legacy fused affine samples logits before thresholding; doing that
+        for native shells changes mask topology. Keep the same Torch operations
+        as direct prediction while reusing the ring's bindings and device union.
+        """
+        import torch.nn.functional as F  # type: ignore
+        torch, cp = self.torch, self.kernels.cp
+        if slot.unit_descriptor is None or not np.array_equal(
+                slot.unit_descriptor.M_out_to_native,
+                self.default_descriptor.M_out_to_native):
+            raise RuntimeError('native-mask ring requires the task-wide post affine')
+        ph, pw = int(slot.proto.shape[2]), int(slot.proto.shape[3])
+        network_union = (F.interpolate(
+            slot.max_logit.reshape(1, 1, ph, pw),
+            size=(int(self.out_size), int(self.out_size)), mode='bilinear', align_corners=False,
+        ).reshape(int(self.out_size), int(self.out_size)) > 0.0).to(torch.float32)
+        planes = [network_union]
+        if self.track_conf:
+            planes.append(F.interpolate(
+                slot.conf_proto.reshape(1, 1, ph, pw),
+                size=(int(self.out_size), int(self.out_size)), mode='nearest',
+            ).reshape(int(self.out_size), int(self.out_size)))
+        if slot.native_mask_grid is not None:
+            warped = F.grid_sample(
+                torch.stack(planes, dim=0).unsqueeze(0), slot.native_mask_grid,
+                mode='nearest', padding_mode='zeros', align_corners=False,
+            )
+            planes = [warped[0, index] for index in range(len(planes))]
+        # Every mask value is now exactly 0 or 1. Identity quantization preserves
+        # those pixels and the generic confidence rounding while emitting bboxes.
+        refs = slot._cupy_refs
+        native_refs = [cp.asarray(plane) for plane in planes]
+        self.kernels.upsample_quantize(
+            ((int(self.native_w) + 31) // 32, (int(self.native_h) + 7) // 8), (32, 8),
+            (native_refs[0], native_refs[1] if self.track_conf else np.uintp(0),
+             np.int32(self.native_h), np.int32(self.native_w),
+             np.int32(self.native_h), np.int32(self.native_w), refs['native_union'],
+             refs.get('native_conf', np.uintp(0)), bbox_arg), stream=external,
+        )
 
     def _validate_concurrent_contexts(self) -> None:
         """Enqueue both contexts concurrently before admitting the specialized source."""
@@ -2120,6 +2295,7 @@ class _ResidentTensorRTRingExecutor:
             slot.compact_coeff = None
             slot.compact_proto_boxes = None
             slot.compact_confs = None
+            slot.native_mask_grid = None
             slot.max_logit = None
             slot.proto_tmp = None
             slot.conf_proto = None
@@ -2195,6 +2371,7 @@ def _resident_trt_pipeline_signature(
     track_conf: bool,
     confidence_threshold: float,
     dynamic_unit_descriptors: bool,
+    post_policy: str = 'legacy_proto',
 ) -> Tuple[object, ...]:
     engine = _trt_engine_from_autobackend(backend)
     # TensorRT bindings depend on engine/profile/input shape, not on the destination
@@ -2206,6 +2383,7 @@ def _resident_trt_pipeline_signature(
         id(engine), str(input_dtype), int(input_channels), int(out_size),
         bool(track_conf), float(confidence_threshold),
         str(proto_hole_treatment_mode()), int(proto_hole_treatment_radius()),
+        str(post_policy),
     )
 
 def _resident_trt_pipeline_invalidate(backend: object, reason: Optional[BaseException] = None) -> None:
@@ -2276,6 +2454,7 @@ def _resident_trt_pipeline_acquire(
     confidence_threshold: float,
     collect_slice_bboxes: bool,
     dynamic_unit_descriptors: bool,
+    post_policy: str = 'legacy_proto',
 ) -> Tuple['_ResidentTensorRTRingExecutor', bool]:
     """Acquire the actual executor, not merely its two render slots."""
     persist = bool(resident_trt_pipeline_persistence_enabled())
@@ -2288,11 +2467,16 @@ def _resident_trt_pipeline_acquire(
         M_out_to_native=M_out_to_native, track_conf=bool(track_conf),
         confidence_threshold=float(confidence_threshold),
         dynamic_unit_descriptors=bool(dynamic_unit_descriptors),
+        post_policy=str(post_policy),
     )
     stale: Optional[Dict[str, object]] = None
     with _RESIDENT_TRT_PIPELINE_CACHE_LOCK:
         entry = _RESIDENT_TRT_PIPELINE_CACHE.get(id(backend))
-        if persist and entry is not None and entry.get('signature') == signature:
+        # The first four fields identify TensorRT's engine/input allocation.
+        # Remaining fields identify postprocessing and can change in-place only
+        # after the existing task/streams drain and all post owners are replaced.
+        compatible = bool(entry is not None and tuple(entry.get('signature', ()))[:4] == signature[:4])
+        if persist and compatible:
             if bool(entry.get('in_use', False)):
                 raise RuntimeError('resident TensorRT executor cache re-entered concurrently')
             executor = entry['executor']
@@ -2311,19 +2495,31 @@ def _resident_trt_pipeline_acquire(
         try:
             executor.resume_after_generic()
             executor.reset_for_task()
-            executor.configure_slice_bbox_collection(bool(collect_slice_bboxes))
-            executor.reconfigure_destination(
-                native_h=int(native_h),
-                native_w=int(native_w),
-                M_out_to_native=np.asarray(M_out_to_native, dtype=np.float32),
-                dynamic_unit_descriptors=True,
-            )
+            if entry.get('signature') != signature:
+                executor.reconfigure_post_policy(
+                    post_policy=str(post_policy), track_conf=bool(track_conf),
+                    confidence_threshold=float(confidence_threshold),
+                    collect_slice_bboxes=bool(collect_slice_bboxes),
+                    native_h=int(native_h), native_w=int(native_w),
+                    M_out_to_native=np.asarray(M_out_to_native, dtype=np.float32),
+                    dynamic_unit_descriptors=bool(dynamic_unit_descriptors),
+                )
+            else:
+                executor.configure_slice_bbox_collection(bool(collect_slice_bboxes))
+                executor.reconfigure_destination(
+                    native_h=int(native_h),
+                    native_w=int(native_w),
+                    M_out_to_native=np.asarray(M_out_to_native, dtype=np.float32),
+                    dynamic_unit_descriptors=(bool(dynamic_unit_descriptors)
+                                              if post_policy == 'native_mask' else True),
+                )
             source._direct_ring = executor.slots
             slots = source.prepare_direct_ring(input_dtype=input_dtype)
             if len(slots) != 2 or any(a is not b for a, b in zip(slots, executor.slots)):
                 raise RuntimeError('cached TensorRT executor did not retain its static ring slots')
             entry['render_engine'] = getattr(source, 'engine', None)
             entry['render_volume_key'] = getattr(getattr(source, 'engine', None), '_volume_key', None)
+            entry['signature'] = signature
             return executor, True
         except Exception as exc:
             source._direct_ring = None
@@ -2341,7 +2537,9 @@ def _resident_trt_pipeline_acquire(
         collect_slice_bboxes=bool(collect_slice_bboxes),
         # Persistent executors use runtime post descriptors so destination geometry
         # can change without invalidating TensorRT execution contexts.
-        dynamic_unit_descriptors=True,
+        dynamic_unit_descriptors=(bool(dynamic_unit_descriptors)
+                                  if post_policy == 'native_mask' else True),
+        post_policy=str(post_policy),
     )
     if persist:
         with _RESIDENT_TRT_PIPELINE_CACHE_LOCK:
@@ -2420,6 +2618,7 @@ def _release_resident_trt_pipeline_cache() -> int:
             del _RESIDENT_TRT_PIPELINE_CACHE[key]
     return len(entries)
 
+@runtime_telemetry_phase('trt_ring.task_host')
 def _try_resident_trt_ring_accumulate(
     predictor: object,
     source: object,
@@ -2454,6 +2653,7 @@ def _try_resident_trt_ring_accumulate(
         return _decline()
     if not isinstance(source, (GpuRenderedYoloSource, GpuTileRenderedYoloSource)):
         return _decline()
+    post_policy = _resident_trt_post_policy(source)
     source_channels = int(getattr(source, 'channel_count', 1))
     if source_channels != int(cfg.input_channels):
         try:
@@ -2541,7 +2741,8 @@ def _try_resident_trt_ring_accumulate(
         # direct-to-binding renderer. Keep its all-view numerical preflight ahead
         # of binding/context acquisition; generic PT, tile, and multichannel
         # renderers use their own paths without borrowing these ring kernels.
-        if isinstance(source, GpuRenderedYoloSource) and int(source_channels) == 1:
+        if (isinstance(source, GpuRenderedYoloSource) and int(source_channels) == 1
+                and post_policy == 'legacy_proto'):
             source.engine.run_startup_fused_preflight(
                 gpu_worker_fused_preflight_specs(),
                 out_size=int(out_size),
@@ -2565,6 +2766,7 @@ def _try_resident_trt_ring_accumulate(
             confidence_threshold=float(threshold),
             collect_slice_bboxes=getattr(device_union, 'slice_bboxes_dev', None) is not None,
             dynamic_unit_descriptors=bool(dynamic_descriptors),
+            post_policy=post_policy,
         )
     except _ResidentTensorRTRingFatalError:
         raise
@@ -2588,6 +2790,10 @@ def _try_resident_trt_ring_accumulate(
             )
         return None
 
+    native_route_key = (
+        (str(source.view.family), str(executor.slots[0].head.dtype), str(executor.slots[0].proto.dtype))
+        if post_policy == 'native_mask' else None
+    )
     pending: 'deque[Tuple[int, _ResidentGpuPipelineSlot]]' = deque()
     try:
         frame_counts_dev = torch.zeros(
@@ -2598,6 +2804,11 @@ def _try_resident_trt_ring_accumulate(
             if item is None:
                 break
             unit_index, slot = item
+            if post_policy == 'native_mask':
+                # Mark before enqueue: a failing asynchronous API may already
+                # have submitted a forward. Later cleanup/publication errors
+                # must not send this source through the worker's CPU retry.
+                source._native_trt_data_consumed = True
             executor.enqueue_inference(slot)
             pending.append((int(unit_index), slot))
         submitted = len(pending)
@@ -2625,9 +2836,40 @@ def _try_resident_trt_ring_accumulate(
     except Exception as exc:
         source._direct_ring = None
         _resident_trt_pipeline_invalidate(backend, exc)
+        if post_policy == 'native_mask':
+            raise _ResidentTensorRTRingFatalError(
+                'Native-mask TensorRT task failed after source consumption began; '
+                'replaying its forward passes is forbidden'
+            ) from exc
         raise
     else:
-        _resident_trt_pipeline_release(backend, executor, source)
+        try:
+            _resident_trt_pipeline_release(backend, executor, source)
+        except Exception as exc:
+            if post_policy == 'native_mask':
+                source._direct_ring = None
+                _resident_trt_pipeline_invalidate(backend, exc)
+                raise _ResidentTensorRTRingFatalError(
+                    'Native-mask TensorRT release failed after source consumption; '
+                    'replaying its forward passes is forbidden'
+                ) from exc
+            raise
+
+    if post_policy == 'native_mask':
+        family = str(source.view.family)
+        telemetry = runtime_telemetry()
+        telemetry.add(f'trt_ring.native_mask.{family}.tasks', 1)
+        telemetry.add(f'trt_ring.native_mask.{family}.frames', int(num_frames))
+        telemetry.add('trt_ring.native_mask.cache_hits', int(cache_hit))
+        key = native_route_key
+        if key not in _RESIDENT_TRT_NATIVE_POLICIES_ANNOUNCED:
+            _RESIDENT_TRT_NATIVE_POLICIES_ANNOUNCED.add(key)
+            print(
+                f'Native-mask TensorRT ring active for {family}: '
+                f'head={key[1]}, proto={key[2]}, post_policy=native_mask, '
+                'proto_hole=off, mask_restore=network_threshold_then_nearest_native; '
+                'native cleanup and projection remain downstream.', flush=True,
+            )
 
     if cache_hit and not _RESIDENT_TRT_RING_CACHE_HIT_ANNOUNCED:
         _RESIDENT_TRT_RING_CACHE_HIT_ANNOUNCED = True
@@ -2638,7 +2880,8 @@ def _try_resident_trt_ring_accumulate(
     if not _RESIDENT_TRT_RING_ANNOUNCED:
         _RESIDENT_TRT_RING_ANNOUNCED = True
         post_mode = (
-            'identity' if executor.identity_native_warp else 'fused-native-affine'
+            'network-threshold-then-nearest-native' if post_policy == 'native_mask'
+            else ('identity' if executor.identity_native_warp else 'fused-native-affine')
         )
         print(
             'Resident TensorRT batch-1 ring active: two independent execution contexts, '

@@ -31,6 +31,10 @@ REVIEWED_V21_0_2_SHA256 = 'f33ab49e331d8d175194c8d70919e7e398a399f39e1503c891b96
 REVIEWED_V21_0_3_SHA256 = '9d09663dab895ff2c9da78175b5e5acbf6a6bd96adfcff66a441a2c97ea90eeb'
 REVIEWED_V21_0_4_SHA256 = '8c8875883d5568194c7a709023ae50061b2a7b6c8a04f5fd48bc3fc5bd24cec7'
 REVIEWED_V21_0_5_SHA256 = '9078a719026147d7af6b990634090f78a0874ba1297f49f89e062700f791a9e3'
+REVIEWED_V21_0_6_SHA256 = 'fc3c2ca5ab0af6257ee9b4fd3b4bf9f66a9c669007a87377a9d7d47cb13858c7'
+# This method was previously covered by the immutable full Radial module and
+# class pins. Name its exact pre-v21.0.6 AST before reviewing the upload change.
+REVIEWED_PRESERVED_RADIAL_UPLOAD_SHA256 = '5f12562dafcb991f93b1702b8976e33a5117e4e01de357c3cb99c98afe52599a'
 
 # These definitions have reviewed, intentional implementation changes.
 INTENTIONALLY_CHANGED = {
@@ -1274,10 +1278,44 @@ def reviewed_v21_0_5_contract(
     )
 
 
+def reviewed_v21_0_6_contract(
+    manifest: dict[str, object], v21: dict[str, object],
+    first_patch: dict[str, object], second_patch: dict[str, object],
+    third_patch: dict[str, object], fourth_patch: dict[str, object],
+    fifth_patch: dict[str, object],
+) -> dict[str, object]:
+    return _reviewed_v21_patch_contract(
+        manifest, v21, key='v21_0_6_review', release='21.0.6',
+        expected_digest=REVIEWED_V21_0_6_SHA256, previous_digest=REVIEWED_V21_0_5_SHA256,
+        earlier_patches=(first_patch, second_patch, third_patch, fourth_patch, fifth_patch),
+    )
+
+
+def reviewed_radial_module_hashes(v21, patches):
+    """Require explicit authenticated successors for preserved full modules."""
+    expected = {item['module']: item['sha256'] for item in v21['preserved_radial_modules']}
+    for patch in patches:
+        seen = set()
+        for item in patch.get('preserved_radial_module_updates', ()):
+            module = item.get('module')
+            if module in seen or module not in expected or not item.get('reason'):
+                raise RuntimeError('unknown, duplicate or unexplained Radial module review')
+            seen.add(module)
+            if item.get('previous_sha256') != expected[module]:
+                raise RuntimeError('Radial module review does not match its preserved predecessor')
+            value = item.get('sha256')
+            if not isinstance(value, str) or len(value) != 64 or any(c not in '0123456789abcdef' for c in value):
+                raise RuntimeError('Radial module review has an invalid digest')
+            expected[module] = value
+    return expected
+
+
 def reviewed_radial_definition_hashes(v21, patches):
     """Permit only authenticated, predecessor-pinned updates to preserved methods."""
     expected = {(item['module'], item['qualified_name']): item['sha256']
                 for item in v21['preserved_radial_definitions']}
+    expected[('cylindrical_cuda_projection', 'RadialCudaProjector._upload_cropped_source')] = (
+        REVIEWED_PRESERVED_RADIAL_UPLOAD_SHA256)
     for patch in patches:
         seen = set()
         for item in patch.get('preserved_radial_definition_updates', ()):
@@ -1308,7 +1346,8 @@ def main() -> None:
     third_patch = reviewed_v21_0_3_contract(manifest, v21, patch, second_patch)
     fourth_patch = reviewed_v21_0_4_contract(manifest, v21, patch, second_patch, third_patch)
     fifth_patch = reviewed_v21_0_5_contract(manifest, v21, patch, second_patch, third_patch, fourth_patch)
-    patches = (patch, second_patch, third_patch, fourth_patch, fifth_patch)
+    sixth_patch = reviewed_v21_0_6_contract(manifest, v21, patch, second_patch, third_patch, fourth_patch, fifth_patch)
+    patches = (patch, second_patch, third_patch, fourth_patch, fifth_patch, sixth_patch)
     patch_definitions = {
         (item['module'], item['name']): item for review in patches for item in review['definitions']
     }
@@ -1391,20 +1430,20 @@ def main() -> None:
         expected = Counter(item['sha256'] for item in list(effective_definitions.values()) + effective_statements if item['module'] == module)
         if available[module] != expected:
             raise RuntimeError(f'v21 complete-module statement coverage differs: {module}')
-    for item in v21['preserved_radial_modules']:
-        source = (PACKAGE / f'{item["module"]}.py').read_text(encoding='utf-8')
-        if hashlib.sha256(source.encode('utf-8')).hexdigest() != item['sha256']:
-            raise RuntimeError(f'v21 changed a preserved Radial module: {item["module"]}')
+    for module, expected_hash in reviewed_radial_module_hashes(v21, patches).items():
+        source = (PACKAGE / f'{module}.py').read_text(encoding='utf-8')
+        if hashlib.sha256(source.encode('utf-8')).hexdigest() != expected_hash:
+            raise RuntimeError(f'v21 changed a preserved Radial module: {module}')
     radial_method_hashes = reviewed_radial_definition_hashes(v21, patches)
-    for item in v21['preserved_radial_definitions']:
-        scope = trees[item['module']]
-        for name in item['qualified_name'].split('.'):
+    for (module, qualified_name), expected_hash in radial_method_hashes.items():
+        scope = trees[module]
+        for name in qualified_name.split('.'):
             matches = [node for node in scope.body if getattr(node, 'name', None) == name]
             if len(matches) != 1:
-                raise RuntimeError(f'v21 preserved Radial definition is missing: {item["qualified_name"]}')
+                raise RuntimeError(f'v21 preserved Radial definition is missing: {qualified_name}')
             scope = matches[0]
-        if digest(scope) != radial_method_hashes[(item['module'], item['qualified_name'])]:
-            raise RuntimeError(f'v21 changed preserved Radial arithmetic: {item["qualified_name"]}')
+        if digest(scope) != expected_hash:
+            raise RuntimeError(f'v21 changed preserved Radial arithmetic: {qualified_name}')
 
     expected_local_import_seams = {**REVIEWED_LOCAL_IMPORT_SEAMS, **v21_seams}
     for review in patches:

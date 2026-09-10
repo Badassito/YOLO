@@ -28,6 +28,7 @@ from .experimental_features import (
 )
 from .geometry import ViewInfo
 from .cylindrical_owner import is_radial_owner_task
+from .runtime import runtime_trace_event
 
 
 @dataclass(frozen=True)
@@ -2085,6 +2086,7 @@ class TtaScheduler:
         )
         for worker, command in controls.items():
             self.operations.preflight_multiprocessing_payload(command)
+            runtime_trace_event('scheduler_control_dispatch', task=command, device=f'cuda:{worker}')
             state.gpu_task_queues[worker].put(command)
         self.operations.runtime_telemetry().gauge('inference.asset_release.pending_workers', worker_ids)
         return False
@@ -2236,8 +2238,11 @@ class TtaScheduler:
                 dispatch_task.pop('hybrid_gpu_assist_dispatch', None)
                 self.operations._attach_memfd_transfers_to_task(dispatch_task)
                 self.operations.preflight_multiprocessing_payload(dispatch_task)
+                runtime_trace_event('scheduler_dispatch', task=dispatch_task, device=f'cuda:{worker_id}')
                 self.state.gpu_task_queues[int(worker_id)].put(dispatch_task)
-            except BaseException:
+            except BaseException as exc:
+                runtime_trace_event('scheduler_dispatch_error', task=task_to_dispatch,
+                                    device=f'cuda:{worker_id}', error=repr(exc))
                 if tile_storage_reserved:
                     self.release_tile_dense_result_task_id(
                         int(task_id), reason='dispatch failure', refill=False,
@@ -2498,8 +2503,11 @@ class TtaScheduler:
                 dispatch_task = dict(task)
                 self.operations._attach_memfd_transfers_to_task(dispatch_task)
                 self.operations.preflight_multiprocessing_payload(dispatch_task)
+                runtime_trace_event('scheduler_dispatch', task=dispatch_task, device=f'cpu:{worker_id}')
                 self.state.cpu_task_queues[int(worker_id)].put(dispatch_task)
-            except BaseException:
+            except BaseException as exc:
+                runtime_trace_event('scheduler_dispatch_error', task=task,
+                                    device=f'cpu:{worker_id}', error=repr(exc))
                 if tile_storage_reserved:
                     self.release_tile_dense_result_task_id(
                         int(task_id), reason='CPU dispatch failure', refill=False,
@@ -2613,6 +2621,7 @@ class TtaScheduler:
         group.reduction_dispatched = True
         group.reduction_started_at = time.perf_counter()
         try:
+            runtime_trace_event('scheduler_control_dispatch', task=control, device=f'cuda:{group.leader_worker_id}')
             self.state.gpu_task_queues[int(group.leader_worker_id)].put(control)
         except BaseException:
             group.reduction_dispatched = False
@@ -2657,6 +2666,7 @@ class TtaScheduler:
                 ),
             }
             self.operations.preflight_multiprocessing_payload(control)
+            runtime_trace_event('scheduler_control_dispatch', task=control, device=f'cuda:{worker}')
             self.state.gpu_task_queues[int(worker)].put(control)
         if set(group.host_artifacts_by_worker) == set(group.participants):
             self._dispatch_d1_group_reduction(group, force_host=True)
@@ -2682,6 +2692,7 @@ class TtaScheduler:
                 'd1_group_lease_token': str(artifact.get('lease_token', '')),
             }
             self.operations.preflight_multiprocessing_payload(control)
+            runtime_trace_event('scheduler_control_dispatch', task=control, device=f'cuda:{worker}')
             self.state.gpu_task_queues[int(worker)].put(control)
 
     def _complete_d1_group_release(self, group: D1ParentGroup) -> Dict[str, object]:
@@ -2777,7 +2788,7 @@ class TtaScheduler:
                 held = self._complete_d1_group_release(group)
                 # Re-enter only after every participant confirms release.  This is the
                 # dispatch boundary that may reserve the same workers for the next group.
-                self.process_one_worker_result(held)
+                self.process_one_worker_result(held, replayed=True)
             return
         if mtype == 'd1_group_host_exported':
             worker = int(msg.get('gpu_index', -1))
@@ -2889,9 +2900,27 @@ class TtaScheduler:
             'release_seconds': float(self.state.d1_group_release_seconds_total),
         }
 
-    def process_one_worker_result(self, msg: Dict[str, object]) -> None:
+    def _trace_worker_receipt(self, msg: Dict[str, object]) -> None:
+        """Timestamp the actual transport dequeue, before scheduler handling."""
         mtype = str(msg.get('type'))
         worker_kind = str(msg.get('worker_kind', 'gpu')).strip().lower()
+        trace_device = (f'cpu:{msg.get("cpu_index", -1)}' if worker_kind == 'cpu'
+                        else f'cuda:{msg.get("gpu_index", -1)}')
+        trace_task = self.state.gpu_worker_tasks_by_id.get(msg.get('task_id', -1), {})
+        trace_name = ('scheduler_result_received' if mtype == 'result' else
+                      'scheduler_compute_released' if mtype == 'compute_released' else
+                      'scheduler_worker_error' if mtype == 'fatal' else 'scheduler_control_received')
+        runtime_trace_event(trace_name, task=trace_task, device=trace_device,
+                            task_id=msg.get('task_id'), message_type=mtype, ok=msg.get('ok'))
+
+    def process_one_worker_result(self, msg: Dict[str, object], *, replayed: bool = False) -> None:
+        mtype = str(msg.get('type'))
+        worker_kind = str(msg.get('worker_kind', 'gpu')).strip().lower()
+        runtime_trace_event('scheduler_result_handled' if mtype == 'result' else 'scheduler_message_handled',
+            task=self.state.gpu_worker_tasks_by_id.get(msg.get('task_id', -1), {}),
+            device=(f'cpu:{msg.get("cpu_index", -1)}' if worker_kind == 'cpu'
+                    else f'cuda:{msg.get("gpu_index", -1)}'),
+            task_id=msg.get('task_id'), message_type=mtype, replayed=replayed)
         if mtype == 'ready':
             if worker_kind == 'cpu':
                 ready_cpu_index = int(msg.get('cpu_index', -1))
@@ -3156,6 +3185,7 @@ class TtaScheduler:
                 continue
             except (EOFError, OSError):
                 break
+            self._trace_worker_receipt(message)
             state.pushed_worker_results.append(message)
             state.scheduler_wake.set()
 
@@ -3172,6 +3202,7 @@ class TtaScheduler:
                 message = state.gpu_result_queue.get_nowait()  # type: ignore[attr-defined]
             except queue.Empty:
                 break
+            self._trace_worker_receipt(message)
             self.process_one_worker_result(message)
 
     def wait_for_one_process_result(self, timeout: float) -> None:
@@ -3188,6 +3219,7 @@ class TtaScheduler:
             message = state.gpu_result_queue.get(timeout=float(timeout))  # type: ignore[attr-defined]
         except queue.Empty:
             return
+        self._trace_worker_receipt(message)
         self.process_one_worker_result(message)
 
     def process_inference_outstanding(self) -> bool:

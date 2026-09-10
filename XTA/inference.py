@@ -52,6 +52,7 @@ from .runtime import (
     choose_parallel_chunk_size,
     choose_slice_parallel_workers,
     parallel_for_indices_chunked,
+    runtime_telemetry_phase,
 )
 from .geometry import (
     BatchResultFrameSpec,
@@ -3801,6 +3802,7 @@ def _build_direct_device_compacted_payload(
     except Exception:
         return None
 
+@runtime_telemetry_phase('inference.direct_stream_host')
 def _direct_predict_stream(
     predictor: object,
     source: object,
@@ -3941,6 +3943,26 @@ def _direct_predict_stream(
     print(f'Direct compaction {source_label}: '
           + ', '.join(f'{name}={count}' for name, count in kernel_counts.items())
           + f', failed_probes={failed_probes}', flush=True)
+
+def _claim_specialized_prediction_targets(target: object, device_union: object, num_frames: int) -> None:
+    """Commit the same host coverage contract as per-result generic processing.
+
+    Native Radial owners carry shape/coverage metadata only; the ring bypasses
+    the generic result callback that normally claims each radius. Validate all
+    device rows first, including empty masks, without reading the host target.
+    """
+    claim = getattr(target, 'claim_result', None)
+    if not callable(claim):
+        return
+    written = np.asarray(getattr(device_union, 'written', ()), dtype=bool)
+    count = int(num_frames)
+    if count <= 0 or written.shape != (count,) or not bool(written.all()):
+        raise RuntimeError('Specialized prediction did not complete every target frame')
+    if tuple(getattr(target, 'shape', ()))[:1] != (count,):
+        raise RuntimeError('Specialized prediction target depth differs from its frame lease')
+    for index in range(count):
+        claim(index)
+
 
 def predict_source_and_accumulate(
     model,
@@ -4241,7 +4263,7 @@ def predict_source_and_accumulate(
         azimuthal_padding_processed = 0
         if specialized_stats is not None:
             # The resident ring wrote the device union and task metadata directly.
-            pass
+            _claim_specialized_prediction_targets(view_union_mm, device_union, num_frames)
         elif worker_count <= 1:
             for idx, r in enumerate(results):
                 spec = prediction_result_frame_spec(source, int(idx), num_frames=int(num_frames))

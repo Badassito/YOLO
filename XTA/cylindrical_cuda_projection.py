@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import operator
+import os
 import threading
 import time
 from typing import Any
@@ -557,6 +558,12 @@ class RadialCudaProjector:
         cp = self._cp
         self._source_gpu = cp.empty(max(1, self.source_h2d_bytes), dtype=cp.uint8)
         capacity = int(self._upload_stage.size)
+        self.source_upload_pipeline = False
+        self.source_upload_stage_bytes = capacity
+        self.source_upload_copy_count = 0
+        self.source_upload_stream_fences = 0
+        self.source_upload_lane_waits = 0
+        self.source_upload_lane_wait_seconds = 0.0
         pack = _pack_radial_source_block_compiled
         boxes, offsets = self.contract.arrays['bboxes'], self.contract.arrays['source_offsets']
         if pack is not None:
@@ -568,6 +575,48 @@ class RadialCudaProjector:
                 pack = None
         if pack is not None:
             self.source_pack_backend = 'numba_nogil'
+            pipeline = os.environ.get('YOLO_TTA_CROPPED_UPLOAD_PIPELINE', '1').strip().lower() not in (
+                '', '0', 'false', 'no', 'off',
+            )
+            events = None
+            if pipeline and capacity >= 2 and self.source_h2d_bytes > capacity:
+                try:
+                    events = (cp.cuda.Event(disable_timing=True), cp.cuda.Event(disable_timing=True))
+                except Exception:
+                    # No source copy has been enqueued; serial upload remains safe.
+                    events = None
+            if events is not None:
+                self.source_upload_pipeline = True
+                self.source_pack_backend = 'numba_nogil_pipelined'
+                half = capacity // 2
+                pending = [False, False]
+                # Constructor cleanup already retains this dictionary, the pinned
+                # owner and the device allocation until its stream fence succeeds.
+                # Leave these event owners attached on every exceptional path.
+                self._events['source_upload_lane_0'], self._events['source_upload_lane_1'] = events
+                for index, first in enumerate(range(0, self.source_h2d_bytes, half)):
+                    lane = index & 1
+                    if pending[lane]:
+                        waited = time.perf_counter()
+                        events[lane].synchronize()
+                        self.source_upload_lane_wait_seconds += time.perf_counter() - waited
+                        self.source_upload_lane_waits += 1
+                    count = min(half, self.source_h2d_bytes - first)
+                    stage_offset = lane * half
+                    pack_started = time.perf_counter()
+                    pack(source, boxes, offsets, first, self._upload_stage[stage_offset:stage_offset + count])
+                    self.source_pack_seconds += time.perf_counter() - pack_started
+                    cp.cuda.runtime.memcpyAsync(int(self._source_gpu.data.ptr) + first,
+                        int(self._upload_pin.ptr) + stage_offset, count,
+                        cp.cuda.runtime.memcpyHostToDevice, int(self._stream.ptr))
+                    self.source_upload_copy_count += 1
+                    events[lane].record(self._stream)
+                    pending[lane] = True
+                self._stream.synchronize()
+                self.source_upload_stream_fences += 1
+                self._events.pop('source_upload_lane_0')
+                self._events.pop('source_upload_lane_1')
+                return
             for first in range(0, self.source_h2d_bytes, capacity):
                 count = min(capacity, self.source_h2d_bytes - first)
                 pack_started = time.perf_counter()
@@ -575,7 +624,9 @@ class RadialCudaProjector:
                 self.source_pack_seconds += time.perf_counter() - pack_started
                 cp.cuda.runtime.memcpyAsync(int(self._source_gpu.data.ptr) + first,
                     int(self._upload_pin.ptr), count, cp.cuda.runtime.memcpyHostToDevice, int(self._stream.ptr))
+                self.source_upload_copy_count += 1
                 self._stream.synchronize()
+                self.source_upload_stream_fences += 1
             return
         self.source_pack_backend = 'numpy'
         filled = uploaded = 0
@@ -583,7 +634,9 @@ class RadialCudaProjector:
         def flush(count):
             cp.cuda.runtime.memcpyAsync(int(self._source_gpu.data.ptr) + uploaded,
                 int(self._upload_pin.ptr), count, cp.cuda.runtime.memcpyHostToDevice, int(self._stream.ptr))
+            self.source_upload_copy_count += 1
             self._stream.synchronize()
+            self.source_upload_stream_fences += 1
 
         for shell, (y0, y1, x0, x1) in enumerate(self.contract.arrays['bboxes']):
             y0, y1, x0, x1 = map(int, (y0, y1, x0, x1))

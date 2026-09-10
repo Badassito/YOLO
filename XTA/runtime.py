@@ -10,10 +10,12 @@ import json
 import math
 import mmap
 import os
+import operator
 import queue
 import re
 import shutil
 import signal
+import socket
 import sys
 import tempfile
 import threading
@@ -118,9 +120,15 @@ class RuntimeTelemetry:
     """Low-overhead process-local phase and throughput telemetry."""
 
     def __init__(self) -> None:
-        self.enabled = _env_flag('YOLO_TTA_TELEMETRY', True)
+        self.trace_enabled = _env_flag('YOLO_TTA_TASK_TRACE', False)
+        self.enabled = _env_flag('YOLO_TTA_TELEMETRY', True) or self.trace_enabled
         self.lock = threading.RLock()
+        self._flush_lock = threading.RLock()
         self.started_ns = time.monotonic_ns()
+        self.hostname = socket.gethostname()
+        self._trace_events: List[Dict[str, object]] = []
+        self._trace_sequence = 0
+        self._trace_batch_limit = 256
         self.phase_ns: Counter[str] = Counter()
         self.phase_calls: Counter[str] = Counter()
         self.counters: Counter[str] = Counter()
@@ -130,7 +138,11 @@ class RuntimeTelemetry:
         self._last_flush = time.monotonic()
         self.flush_seconds = max(2.0, _env_float('YOLO_TTA_TELEMETRY_FLUSH_SECONDS', 15.0))
         requested = os.environ.get('YOLO_TTA_TELEMETRY_PATH', '').strip()
-        if requested:
+        directory = os.environ.get('YOLO_TTA_TELEMETRY_DIR', '').strip()
+        if directory:
+            base = re.sub(r'[^A-Za-z0-9_.-]', '_', os.environ.get('SLURM_JOB_ID', 'local'))
+            self.path = Path(directory) / f'telemetry-{base}-{os.getpid()}.jsonl'
+        elif requested:
             self.path = Path(requested)
         else:
             base = os.environ.get('SLURM_JOB_ID') or str(os.getpid())
@@ -168,15 +180,65 @@ class RuntimeTelemetry:
         if not self.enabled:
             return
         try:
-            amount: object = int(value)  # type: ignore[arg-type]
+            # Preserve integer counters beyond float's exact range, including
+            # numeric text accepted by the previous counter API.
+            amount = int(value) if isinstance(value, str) else operator.index(value)
         except Exception:
             try:
                 amount = float(value)  # type: ignore[arg-type]
             except Exception:
                 return
+            if not math.isfinite(amount):
+                return
         with self.lock:
-            self.counters[str(name)] += amount  # type: ignore[operator]
+            try:
+                total = self.counters[str(name)] + amount
+            except OverflowError:
+                return
+            if isinstance(total, float) and not math.isfinite(total):
+                return
+            self.counters[str(name)] = total
             self._dirty += 1
+
+    def trace_event(self, event: str, **fields: object) -> None:
+        """Buffer bounded host task boundaries, never tensor/frame samples.
+
+        Serialized batch emission applies bounded backpressure on the optional
+        trace path. No events can append while their batch is being written.
+        """
+        if not self.enabled or not self.trace_enabled:
+            return
+        with self._flush_lock:
+            if not self.enabled:
+                return
+            with self.lock:
+                self._trace_sequence += 1
+                record = {}
+                for key, value in list(fields.items())[:32]:
+                    if isinstance(value, np.generic):
+                        value = value.item()
+                    if isinstance(value, Path):
+                        value = str(value)
+                    # Events carry scalar identity/counters only: accidentally
+                    # passing a tensor, array or container must not retain or
+                    # serialize source pixels or an unbounded object graph.
+                    if value is not None and not isinstance(value, (str, int, float, bool)):
+                        continue
+                    if isinstance(value, float) and not math.isfinite(value):
+                        continue
+                    record[str(key)[:128]] = value[:512] if isinstance(value, str) else value
+                record.update(event=str(event)[:128], pid=os.getpid(),
+                    thread_id=threading.get_ident(), thread=threading.current_thread().name[:128],
+                    wall_time_ns=time.time_ns(), monotonic_ns=time.monotonic_ns(),
+                    trace_session=f'{os.getpid()}-{self.started_ns}', sequence=self._trace_sequence,
+                    hostname=self.hostname,
+                    run_id=os.environ.get('YOLO_TTA_TRACE_RUN_ID') or os.environ.get('SLURM_JOB_ID', ''),
+                    cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES', ''))
+                self._trace_events.append(record)
+                self._dirty += 1
+                full = len(self._trace_events) >= self._trace_batch_limit
+            if full:
+                self.flush()
 
     def gauge(self, name: str, value: object) -> None:
         if not self.enabled:
@@ -216,8 +278,9 @@ class RuntimeTelemetry:
                 'counters': dict(self.counters),
                 'gauges': dict(self.gauges),
                 'fallbacks': dict(self.fallbacks),
+                'events': list(self._trace_events),
+                'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES', ''),
             }
-            self._dirty = 0
         return payload
 
     def maybe_flush(self) -> None:
@@ -230,22 +293,27 @@ class RuntimeTelemetry:
             self.flush()
 
     def flush(self, *, final: bool = False) -> None:
-        if not self.enabled:
-            return
-        payload = self.snapshot(final=bool(final))
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open('a', encoding='utf-8') as handle:
-                handle.write(json.dumps(payload, sort_keys=True, separators=(',', ':')) + '\n')
+        with self._flush_lock:
+            if not self.enabled:
+                return
             with self.lock:
-                self._last_flush = time.monotonic()
-        except Exception as exc:
-            with self.lock:
-                self.enabled = False
+                payload = self.snapshot(final=bool(final))
+                dirty = self._dirty
             try:
-                print(f'[runtime telemetry disabled] {exc}', file=sys.stderr)
-            except Exception:
-                pass
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open('a', encoding='utf-8') as handle:
+                    handle.write(json.dumps(payload, sort_keys=True, separators=(',', ':')) + '\n')
+                with self.lock:
+                    del self._trace_events[:len(payload['events'])]
+                    self._dirty = max(0, self._dirty - dirty)
+                    self._last_flush = time.monotonic()
+            except Exception as exc:
+                with self.lock:
+                    self.enabled = False
+                try:
+                    print(f'[runtime telemetry disabled] {exc}', file=sys.stderr)
+                except Exception:
+                    pass
 
 class RuntimeSystemSampler:
     def __init__(self, telemetry: RuntimeTelemetry) -> None:
@@ -489,6 +557,36 @@ def shutdown_runtime_observability() -> None:
 def runtime_telemetry() -> RuntimeTelemetry:
     telemetry = _RUNTIME_TELEMETRY
     return telemetry if telemetry is not None else initialize_runtime_observability()
+
+def runtime_trace_event(event: str, *, task=None, device=None, **fields: object) -> None:
+    """Record an optional host boundary without allowing tracing to break work."""
+    if not _env_flag('YOLO_TTA_TASK_TRACE', False):
+        return
+    try:
+        metadata = {}
+        if isinstance(task, dict):
+            for key in ('task_id', 'task_type', 'op', 'kind', 'model_name', 'slice_start', 'slice_count'):
+                if key in task:
+                    metadata[key] = task[key]
+            view = task.get('view')
+            if view is not None:
+                metadata.update(view=str(getattr(view, 'name', '')), family=str(getattr(view, 'family', '')))
+        if device is not None:
+            metadata['device'] = str(device)
+        metadata.update(fields)
+        runtime_telemetry().trace_event(event, **metadata)
+    except Exception:
+        # A diagnostic failure must never alter inference/admission/publication.
+        return
+
+def flush_runtime_task_trace() -> None:
+    """Preserve a worker's final partial batch without changing sampler lifetime."""
+    telemetry = _RUNTIME_TELEMETRY
+    if telemetry is not None and telemetry.trace_enabled:
+        try:
+            telemetry.flush()
+        except Exception:
+            pass
 
 def runtime_telemetry_phase(phase: str) -> Callable[[Callable[..., object]], Callable[..., object]]:
     """Decorate a core function directly instead of installing a late monkeypatch."""
