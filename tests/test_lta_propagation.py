@@ -459,6 +459,185 @@ class LtaPropagationTests(unittest.TestCase):
             retained.hole_fill_added_pixels,
         )
 
+    def test_bidirectional_stream_restores_each_prompt_and_preserves_both_boundaries(self) -> None:
+        seeds = tuple(
+            LtaMaskSeed(
+                lineage=_lineage(f"bidirectional-{object_id}"),
+                frame_index=12,
+                object_id=object_id,
+                mask=np.eye(7, dtype=bool) if object_id == 3 else np.fliplr(np.eye(7, dtype=bool)),
+            )
+            for object_id in (9, 3)
+        )
+        request = LtaPropagationRequest(
+            work_id="bidirectional-boundaries",
+            session=SamSessionPlan("sequence", 4, 10, 15),
+            prompt_frame=12,
+            direction="both",
+            seeds=seeds,
+            conf=0.15,
+        )
+
+        def adapter(_measured, _raw, **kwargs):
+            predictions = []
+            # Match the tracker bridge: forward owns the prompt, then backward
+            # visits the preceding frames in descending order.
+            for frame in (12, 13, 14, 11, 10):
+                for local_id in (0, 1):
+                    mask = np.zeros((7, 7), dtype=bool)
+                    mask[local_id, frame - 10] = True
+                    if frame == 12:
+                        mask[:] = True  # Prompt drift must never enter the union.
+                    prediction = SamFramePrediction(
+                        sequence_id=request.session.sequence_id,
+                        session_index=request.session.session_index,
+                        frame_index=frame,
+                        object_id=local_id,
+                        initial_detection_score=1.0,
+                        frame_tracker_score=0.8 if frame < 12 else 0.6,
+                        binary_mask=mask,
+                    )
+                    predictions.append(prediction)
+                    if kwargs.get("prediction_callback") is not None:
+                        kwargs["prediction_callback"](prediction)
+            return {
+                "propagation": tuple(predictions) if kwargs.get("retain_predictions", True) else (),
+                "seed_roundtrip_policy": "overlap-aware",
+                "seed_roundtrip_passed": True,
+                "anchor_integrity_passed": False,
+            }
+
+        retained = run_mask_injected_session(
+            object(), object(), resource=[object()] * 5, request=request,
+            adapter=adapter, fill_mask=lambda mask: np.asarray(mask, dtype=bool).copy(),
+        )
+        emitted = []
+        streamed = run_mask_injected_session(
+            object(), object(), resource=[object()] * 5, request=request,
+            adapter=adapter, fill_mask=lambda mask: np.asarray(mask, dtype=bool).copy(),
+            prediction_callback=emitted.append, retain_predictions=False,
+        )
+
+        self.assertEqual(streamed.predictions, ())
+        self.assertEqual(len(emitted), 10)
+        self.assertEqual(
+            {(item.prediction.frame_index, item.prediction.object_id) for item in emitted},
+            {(frame, object_id) for frame in range(10, 15) for object_id in (3, 9)},
+        )
+        for seed in seeds:
+            prompt = next(
+                item for item in emitted
+                if item.prediction.frame_index == 12 and item.lineage == seed.lineage
+            )
+            np.testing.assert_array_equal(prompt.prediction.binary_mask, seed.mask)
+            self.assertEqual(prompt.prediction.frame_tracker_score, 1.0)
+        for frame in range(10, 15):
+            np.testing.assert_array_equal(
+                np.logical_or.reduce(tuple(
+                    item.prediction.binary_mask for item in emitted
+                    if item.prediction.frame_index == frame
+                )),
+                retained.frame_union(frame),
+            )
+        self.assertEqual(
+            {(seed.frame_index, seed.object_id) for seed in streamed.dogfood_seeds},
+            {(frame, object_id) for frame in (10, 14) for object_id in (3, 9)},
+        )
+        for seed, retained_seed in zip(streamed.dogfood_seeds, retained.dogfood_seeds):
+            self.assertEqual(seed.lineage, _lineage(f"bidirectional-{seed.object_id}"))
+            self.assertEqual(seed.provenance, LtaSeedProvenance.TEMPORAL_DOGFOOD)
+            self.assertEqual(seed.tracker_probability, 0.8 if seed.frame_index == 10 else 0.6)
+            expected = np.zeros((7, 7), dtype=bool)
+            expected[0 if seed.object_id == 3 else 1, seed.frame_index - 10] = True
+            np.testing.assert_array_equal(seed.mask, expected)
+            np.testing.assert_array_equal(seed.mask, retained_seed.mask)
+
+    def test_adapter_rejects_foreign_sessions_and_broadcastable_masks_before_publication(self) -> None:
+        request = LtaPropagationRequest(
+            work_id="prediction-contract",
+            session=SamSessionPlan("sequence", 2, 10, 13),
+            prompt_frame=11,
+            direction="both",
+            seeds=(LtaMaskSeed(_lineage(), 11, 9, _donut()),),
+            conf=0.15,
+        )
+        for frame in (10, 11, 12):
+            for invalid_field, invalid_value, error in (
+                ("sequence_id", "stale-sequence", "different session"),
+                ("session_index", 1, "different session"),
+                ("binary_mask", np.ones((1, 7), dtype=bool), "mask shape"),
+                ("binary_mask", np.ones((7, 1), dtype=bool), "mask shape"),
+            ):
+                for streaming in (False, True):
+                    with self.subTest(frame=frame, field=invalid_field, streaming=streaming):
+                        fields = {
+                            "sequence_id": request.session.sequence_id,
+                            "session_index": request.session.session_index,
+                            "frame_index": frame,
+                            "object_id": 0,
+                            "initial_detection_score": 1.0,
+                            "frame_tracker_score": 0.9,
+                            "binary_mask": _donut(),
+                            invalid_field: invalid_value,
+                        }
+                        prediction = SamFramePrediction(**fields)
+
+                        def adapter(_measured, _raw, **kwargs):
+                            if streaming:
+                                kwargs["prediction_callback"](prediction)
+                            return {
+                                "propagation": () if streaming else (prediction,),
+                                "seed_roundtrip_policy": "overlap-aware",
+                                "seed_roundtrip_passed": True,
+                            }
+
+                        emitted = []
+                        with self.assertRaisesRegex(RuntimeError, error):
+                            run_mask_injected_session(
+                                object(), object(), resource=[object()] * 3, request=request,
+                                adapter=adapter,
+                                fill_mask=lambda mask: np.asarray(mask, dtype=bool).copy(),
+                                prediction_callback=emitted.append if streaming else None,
+                                retain_predictions=not streaming,
+                            )
+                        self.assertEqual(emitted, [])
+
+    def test_hole_filling_must_preserve_injection_and_prediction_geometry(self) -> None:
+        request = LtaPropagationRequest(
+            work_id="fill-contract",
+            session=SamSessionPlan("sequence", 0, 0, 2),
+            prompt_frame=0,
+            direction="forward",
+            seeds=(LtaMaskSeed(_lineage(), 0, 0, _donut()),),
+            conf=0.15,
+        )
+        for corrupt_injection in (True, False):
+            with self.subTest(corrupt_injection=corrupt_injection):
+                emitted = []
+
+                def fill_mask(mask):
+                    array = np.asarray(mask, dtype=bool)
+                    if corrupt_injection or array.all():
+                        return array[:1, :].copy()
+                    return array.copy()
+
+                def adapter(_measured, _raw, **kwargs):
+                    self.assertFalse(corrupt_injection)
+                    kwargs["prediction_callback"](SamFramePrediction(
+                        sequence_id="sequence", session_index=0, frame_index=1,
+                        object_id=0, initial_detection_score=1.0, frame_tracker_score=0.9,
+                        binary_mask=np.ones((7, 7), dtype=bool),
+                    ))
+                    return {}  # pragma: no cover - callback must reject changed geometry
+
+                with self.assertRaisesRegex(RuntimeError, "hole filling changed.*shape"):
+                    run_mask_injected_session(
+                        object(), object(), resource=[object()] * 2, request=request,
+                        adapter=adapter, fill_mask=fill_mask,
+                        prediction_callback=emitted.append, retain_predictions=False,
+                    )
+                self.assertEqual(emitted, [])
+
     def test_streaming_callback_error_runs_adapter_cleanup(self) -> None:
         cleaned: list[bool] = []
 

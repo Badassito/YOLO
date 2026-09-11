@@ -13,6 +13,12 @@ review products.  All NRRDs use the source tile/frame offset so they align in
 3D Slicer.  SAM's tracker-only bridge persists canonical sigmoid probabilities;
 the conversion to ``TrackletFrame`` passes those probabilities through exactly
 once and records that identity transform in the run summary.
+
+Positive labels can be incomplete.  Exact masks override only their own
+matched lineage; unmatched objects survive on every proposed frame, including
+other annotated slices.  Final hard-positive restoration adds foreground
+without clearing other objects.  The nearest-anchor reference remains a
+single-source diagnostic, and XOR remains the unmodified opposing disagreement.
 """
 
 from __future__ import annotations
@@ -427,17 +433,20 @@ def _or_tracklets_into_volume(
             )
 
 
-def _force_anchor(
+def _restore_anchor_positives(
     volume: Any,
     *,
     anchor_frame: int,
     frame_start: int,
     masks: Sequence[Any],
 ) -> None:
+    """Restore known foreground without treating unlabeled pixels as negatives."""
+
     import numpy as np
 
     union = np.logical_or.reduce(tuple(np.asarray(mask, dtype=bool) for mask in masks))
-    volume[int(anchor_frame) - int(frame_start)] = np.asarray(union, dtype=np.uint8)
+    target = volume[int(anchor_frame) - int(frame_start)]
+    np.bitwise_or(target, np.asarray(union, dtype=np.uint8), out=target)
 
 
 def _nrrd_product(
@@ -770,9 +779,21 @@ def main() -> None:
         "matching_config": asdict(matching_config),
         "handoff_config": asdict(handoff_config),
         "authoritative_anchor_policy": (
-            "each selected anchor slice is overwritten with its exact tile-local label "
-            "union after all compositions"
+            "exact masks override their own matched lineage at each selected anchor; "
+            "final hard-positive OR preserves unmatched foreground on annotated slices"
         ),
+        "diagnostic_product_policies": {
+            "reconciled": "matched handoff plus every unmatched proposal and hard positives",
+            "nearest_anchor_reference": (
+                "one anchor's complete proposal selected by fixed midpoint, plus hard "
+                "positives; opposing unmatched tracks are not added to this reference"
+            ),
+            "observation_recall_union": "both anchor proposals ORed with hard positives",
+            "opposing_disagreement": (
+                "XOR of the two anchor proposals after their own per-instance authority; "
+                "hard positives are not added to disagreement"
+            ),
+        },
         "seed_integrity_policy": {
             "private_injection": (
                 "authoritative per-object and union masks must retain IoU >=0.999999; "
@@ -783,8 +804,9 @@ def main() -> None:
                 "the anchor; it is recorded as a non-gating diagnostic"
             ),
             "output_anchor": (
-                "predictions_to_tracklets and final binary volumes hard-reinject the "
-                "exact authoritative masks"
+                "predictions_to_tracklets restores exact authoritative instance masks; "
+                "final foreground products contain those hard positives and may also "
+                "contain unmatched objects outside the labels"
             ),
         },
         "unmatched_tracklet_policy": "preserve verbatim in reconciled binary union",
@@ -1050,25 +1072,25 @@ def main() -> None:
                 union_frame.mask,
                 dtype=np.uint8,
             )
-        _force_anchor(
+        _restore_anchor_positives(
             left_volume,
             anchor_frame=left_anchor_frame,
             frame_start=frame_start,
             masks=left_masks,
         )
-        _force_anchor(
+        _restore_anchor_positives(
             right_volume,
             anchor_frame=right_anchor_frame,
             frame_start=frame_start,
             masks=right_masks,
         )
-        _force_anchor(
+        _restore_anchor_positives(
             reconciled_volume,
             anchor_frame=left_anchor_frame,
             frame_start=frame_start,
             masks=left_masks,
         )
-        _force_anchor(
+        _restore_anchor_positives(
             reconciled_volume,
             anchor_frame=right_anchor_frame,
             frame_start=frame_start,
@@ -1097,13 +1119,13 @@ def main() -> None:
         for offset, frame_index in enumerate(range(frame_start, frame_stop)):
             source = left_volume if float(frame_index) <= midpoint else right_volume
             product_volume[offset] = source[offset]
-        _force_anchor(
+        _restore_anchor_positives(
             product_volume,
             anchor_frame=left_anchor_frame,
             frame_start=frame_start,
             masks=left_masks,
         )
-        _force_anchor(
+        _restore_anchor_positives(
             product_volume,
             anchor_frame=right_anchor_frame,
             frame_start=frame_start,
@@ -1126,13 +1148,13 @@ def main() -> None:
 
         for offset in range(depth):
             np.bitwise_or(left_volume[offset], right_volume[offset], out=product_volume[offset])
-        _force_anchor(
+        _restore_anchor_positives(
             product_volume,
             anchor_frame=left_anchor_frame,
             frame_start=frame_start,
             masks=left_masks,
         )
-        _force_anchor(
+        _restore_anchor_positives(
             product_volume,
             anchor_frame=right_anchor_frame,
             frame_start=frame_start,
@@ -1257,6 +1279,8 @@ def main() -> None:
             "right": right_conversion,
         },
         "binary_publication_policy": plan["binary_publication_policy"],
+        "authoritative_anchor_policy": plan["authoritative_anchor_policy"],
+        "diagnostic_product_policies": plan["diagnostic_product_policies"],
         "matching": matching_record,
         "composition": composition_record,
         "products": products,

@@ -264,9 +264,11 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         metavar="OUTPUT",
         help=(
             "Optional outputs: images, labels, overlay, voxel_volume, summary; "
-            "the nrrd token is accepted for compatibility. "
-            "<input-stem>_Global_final_output.seg.nrrd and the machine-readable "
-            "manifest are always written"
+            "the nrrd token is accepted for compatibility. The native tile union "
+            "before postprocessing, a complete NRRD checkpoint after each requested "
+            "filter, <input-stem>_Global_final_output.seg.nrrd, and the machine-readable "
+            "manifest are always written. Filter checkpoints precede hard-positive "
+            "restoration; the final output includes all authoritative foreground"
         ),
     )
     parser.add_argument(
@@ -286,6 +288,11 @@ def resolve_lta_config(args: argparse.Namespace) -> LtaConfig:
     for field_name in ("input", "output", "model"):
         if not str(getattr(args, field_name)).strip():
             raise ValueError(f"--{field_name} must not be empty")
+    if args.temp is not None and not str(args.temp).strip():
+        raise ValueError(
+            "--temp must name a directory; its value is empty. "
+            "Check that the scratch environment variable is set."
+        )
     if not math.isfinite(float(args.conf)) or not 0.0 <= float(args.conf) <= 1.0:
         raise ValueError("--conf must be finite and in [0,1]")
     exemplar_dirs = tuple(str(value).strip() for value in (args.exemplar or ()))

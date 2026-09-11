@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from pathlib import Path
@@ -319,51 +320,78 @@ def _parse_ratio(value: object) -> Optional[float]:
 
 
 def probe_video_with_ffprobe(path: Path) -> VideoMetadata:
-    """Read video metadata with ffprobe without importing a decode runtime."""
+    """Read exact video bounds without routinely decoding the video twice.
+
+    Container frame counts take precedence. FFV1 packets contain one complete
+    frame (RFC 9043 section 4.4), so demuxed packet counts are exact for that
+    codec. Other codecs retain decoded-frame counting when metadata is absent;
+    duration multiplied by frame rate is never used as a count.
+    """
 
     executable = shutil.which("ffprobe")
     if executable is None:
         raise LtaInputError(
             f"ffprobe is required to discover video frame bounds: {path}"
         )
-    command = [
-        executable,
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-count_frames",
-        "-show_entries",
-        "stream=width,height,avg_frame_rate,r_frame_rate,nb_read_frames",
-        "-of",
-        "json",
-        str(path),
-    ]
+    def probe(method: str, count_option: str | None = None) -> Mapping[str, object]:
+        command = [executable, "-v", "error", "-select_streams", "v:0"]
+        if count_option is not None:
+            command.append(count_option)
+        command.extend([
+            "-show_entries",
+            "stream=codec_name,width,height,avg_frame_rate,r_frame_rate,nb_frames,nb_read_frames,nb_read_packets",
+            "-of", "json", str(path),
+        ])
+        started = time.monotonic()
+        print(f"LTA video probe: method={method} path={path}", flush=True)
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, check=True)
+            payload = json.loads(result.stdout)
+            streams = payload.get("streams", ()) if isinstance(payload, Mapping) else ()
+            if not isinstance(streams, (list, tuple)) or not streams or not isinstance(streams[0], Mapping):
+                raise ValueError("no video stream")
+        except (OSError, subprocess.CalledProcessError, ValueError, TypeError) as exc:
+            raise LtaInputError(f"Could not probe video {path} with {method}: {exc}") from exc
+        print(f"LTA video probe complete: method={method} seconds={time.monotonic() - started:.3f} path={path}", flush=True)
+        return streams[0]
+
+    def positive_count(value: object) -> int | None:
+        if isinstance(value, bool):
+            return None
+        text = str(value).strip()
+        if not text.isdecimal():
+            return None
+        count = int(text)
+        return count if count > 0 else None
+
+    stream = probe("stream_metadata")
     try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise LtaInputError(f"Could not probe video {path}: {exc}") from exc
-    try:
-        streams = json.loads(result.stdout).get("streams", [])
-        if not streams:
-            raise ValueError("no video stream")
-        stream = streams[0]
-        frame_count_raw = stream.get("nb_read_frames")
-        if frame_count_raw in (None, "", "N/A"):
-            raise ValueError("ffprobe returned no decoded-frame count")
-        frame_count = int(frame_count_raw)
         width = int(stream["width"])
         height = int(stream["height"])
+        if width <= 0 or height <= 0:
+            raise ValueError("video dimensions must be positive")
         fps = _parse_ratio(stream.get("avg_frame_rate")) or _parse_ratio(
             stream.get("r_frame_rate")
         )
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (KeyError, TypeError, ValueError) as exc:
         raise LtaInputError(f"Invalid ffprobe metadata for {path}: {exc}") from exc
+
+    frame_count = positive_count(stream.get("nb_frames"))
+    method = "metadata_nb_frames"
+    if frame_count is None and str(stream.get("codec_name", "")).casefold() == "ffv1":
+        method = "ffv1_packet_count"
+        try:
+            packets = probe(method, "-count_packets")
+            frame_count = positive_count(packets.get("nb_read_packets"))
+        except LtaInputError as exc:
+            print(f"LTA video probe fallback: FFV1 packet count unavailable ({exc})", flush=True)
+    if frame_count is None:
+        method = "decoded_frame_count"
+        decoded = probe(method, "-count_frames")
+        frame_count = positive_count(decoded.get("nb_read_frames"))
+    if frame_count is None:
+        raise LtaInputError(f"ffprobe returned no positive decoded-frame count for {path}")
+    print(f"LTA video bounds: frames={frame_count} method={method} path={path}", flush=True)
     return VideoMetadata(
         frame_count=int(frame_count),
         width=width,
@@ -1142,6 +1170,8 @@ def discover_lta_inputs(
     resolved_exemplar_roots.sort(key=_canonical_path_key)
 
     resolved_video_probe = video_probe or probe_video_with_ffprobe
+    target_started = time.monotonic()
+    print(f"LTA discovery: scanning target path={input_path}", flush=True)
     target_volumes = _discover_root(
         root=target_root,
         role=SourceRole.TARGET,
@@ -1149,18 +1179,29 @@ def discover_lta_inputs(
         video_probe=resolved_video_probe,
         image_probe=image_probe,
     )
-    exemplar_volumes = tuple(
-        volume
-        for root in resolved_exemplar_roots
-        for volume in _discover_root(
+    print(f"LTA discovery target complete: volumes={len(target_volumes)} seconds={time.monotonic() - target_started:.3f}", flush=True)
+    discovered_exemplars = []
+    for root in resolved_exemplar_roots:
+        exemplar_started = time.monotonic()
+        print(f"LTA discovery: scanning exemplar root={root}", flush=True)
+        volumes = _discover_root(
             root=root,
             role=SourceRole.EXEMPLAR,
             selected_media=None,
             video_probe=resolved_video_probe,
             image_probe=image_probe,
         )
+        discovered_exemplars.extend(volumes)
+        print(f"LTA discovery exemplar complete: root={root} volumes={len(volumes)} seconds={time.monotonic() - exemplar_started:.3f}", flush=True)
+    exemplar_volumes = tuple(discovered_exemplars)
+    positive_images = sum(
+        sum(bool(annotation.polygons) for annotation in volume.annotations)
+        for volume in (*target_volumes, *exemplar_volumes) if volume.kind != "video"
     )
+    pool_started = time.monotonic()
+    print(f"LTA discovery: building positive exemplar pool; positive_images_to_hash={positive_images}", flush=True)
     positive_pool = _build_positive_pool(target_volumes + exemplar_volumes)
+    print(f"LTA discovery positive pool complete: exemplars={len(positive_pool)} seconds={time.monotonic() - pool_started:.3f}", flush=True)
     if require_positive and not positive_pool:
         raise NoPositiveExemplarError(
             "LTA requires at least one valid class-0 YOLO segmentation polygon "

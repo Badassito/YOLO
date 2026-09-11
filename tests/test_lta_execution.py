@@ -28,12 +28,15 @@ from XTA.lta_execution import (
     _aligned_annotations,
     _allocate_view_union,
     _authoritative_tile_owners,
+    _consume_chain_manifest,
     _hard_positive_volume,
     _aligned_known_background_frames,
     _known_background_audit,
     _new_worker_audit,
     _lineage_from_record,
+    _materialize_source_volume,
     _plan_initial_chains,
+    _preflight_lta_storage,
     _plan_relay_generation,
     _relay_generation_bound,
     _seeds_for_tile,
@@ -75,6 +78,18 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+class LtaVideoMaterializationTests(unittest.TestCase):
+    def test_video_decode_requires_exact_count_in_named_scratch_file(self) -> None:
+        source = types.SimpleNamespace(frame_count=7, height=6, width=5, video_path=Path('input.mkv'))
+        with mock.patch('XTA.media.decode_video_to_memmap_gray8') as decode:
+            result = _materialize_source_volume(source, path=Path('scratch/source.gray8.dat'))
+        self.assertIs(result, decode.return_value)
+        decode.assert_called_once_with(
+            Path('input.mkv'), Path('scratch/source.gray8.dat'), 7, 5, 6,
+            overwrite=True, prefer_memory=False, reserve_bytes=0, strict_frame_count=True,
+        )
+
+
 class _FakeWorkerPool:
     instances: list["_FakeWorkerPool"] = []
 
@@ -114,9 +129,12 @@ class _FakeWorkerPool:
             )[0]
             relay_mask = np.zeros((size, size), dtype=bool)
             relay_mask[1, 1] = True
+            # Model a crossing inside the observation interval so the relay
+            # still exercises onward tracking when the anchor covers the view.
+            relay_frame = min(start + 1, stop - 1)
             relay_seed = LtaMaskSeed(
                 lineage=source_seed.lineage,
-                frame_index=stop - 1,
+                frame_index=relay_frame,
                 object_id=0,
                 mask=relay_mask,
                 provenance=LtaSeedProvenance.SPATIAL_RELAY,
@@ -136,7 +154,7 @@ class _FakeWorkerPool:
                     },
                     "source_tile_index": 0,
                     "destination_tile_index": 1,
-                    "frame_index": stop - 1,
+                    "frame_index": relay_frame,
                     "temporal_direction": "forward",
                     "generation": 1,
                     "visited_tile_indices": [0, 1],
@@ -322,6 +340,103 @@ class LtaProductionExecutionTests(unittest.TestCase):
                 execute_lta_plan(plan)
             self.assertFalse(plan.output_root.exists())
             self.assertFalse(plan.temp_root.exists())
+
+    def test_storage_preflight_checks_separate_output_filesystem_before_decode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan = self._plan(root, (0,))
+            with (
+                mock.patch("XTA.lta_execution.PRODUCTION_LTA_TILE_SIZE", 4),
+                mock.patch(
+                    "XTA.lta_execution._storage_capacity_probe",
+                    side_effect=[(root, 1, 1 << 40), (root, 2, 1)],
+                ),
+                mock.patch("XTA.lta_execution._materialize_source_volume") as decode,
+                self.assertRaisesRegex(RuntimeError, "output capacity preflight failed before decode"),
+            ):
+                execute_lta_plan(plan)
+            decode.assert_not_called()
+            self.assertFalse(plan.output_root.exists())
+            self.assertFalse(plan.temp_root.exists())
+
+    def test_parent_finalization_budget_intersects_node_affinity_and_slurm(self) -> None:
+        from XTA.lta_cpu import resolve_worker_cpu_budget
+        budget = resolve_worker_cpu_budget(
+            4, affinity_count=192, cpu_count=192, environ={"SLURM_CPUS_PER_TASK": "8"},
+        )
+        original_execute = execute_lta_plan
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch("XTA.lta_cpu.resolve_worker_cpu_budget", return_value=budget),
+                mock.patch(f"{__name__}.execute_lta_plan", side_effect=lambda plan, **_kwargs: original_execute(plan, workers=None)),
+            ):
+                result, _pool, _bytes = self._run(Path(temp_dir), (0, 1, 2, 3))
+            manifest = json.loads(result.manifest_path.read_text())
+        audit = manifest["execution"]["worker_audit"]
+        self.assertEqual(audit["parent_cpu_budget"]["effective_cpu_count"], 8)
+        self.assertEqual(audit["parent_cpu_budget"]["constraints"]["process_affinity"], 192)
+        self.assertEqual(audit["parent_finalization_workers"], 8)
+        self.assertEqual(audit["parent_native_threads_during_tracking"]["cv2"], 1)
+
+    def test_shared_filesystem_reserves_combined_scratch_and_public_nrrds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan = self._plan(root, (0,))
+            view = plan.volumes[0].runtime_views[0]
+            with mock.patch(
+                "XTA.lta_execution._storage_capacity_probe",
+                side_effect=[(root, 1, 1 << 40), (root, 2, 1 << 40)],
+            ):
+                separate = _preflight_lta_storage(plan, view)
+            self.assertFalse(separate["scratch_and_output_share_filesystem"])
+            reservations = separate["filesystem_reservations"]
+            self.assertEqual([item["role"] for item in reservations], ["scratch", "output"])
+            combined_estimate = sum(item["estimated_bytes_before_headroom"] for item in reservations)
+            # Both individual reservations fit, but they do not fit together
+            # on one filesystem. Shared storage must account for their sum.
+            individually_sufficient = max(item["required_bytes_with_headroom"] for item in reservations)
+            with (
+                mock.patch(
+                    "XTA.lta_execution._storage_capacity_probe",
+                    side_effect=[(root, 1, individually_sufficient)] * 2,
+                ),
+                self.assertRaisesRegex(RuntimeError, "scratch and output capacity preflight"),
+            ):
+                _preflight_lta_storage(plan, view)
+            with mock.patch(
+                "XTA.lta_execution._storage_capacity_probe",
+                side_effect=[(root, 1, (1 << 30) + combined_estimate)] * 2,
+            ):
+                shared = _preflight_lta_storage(plan, view)
+            self.assertTrue(shared["scratch_and_output_share_filesystem"])
+            self.assertEqual(len(shared["filesystem_reservations"]), 1)
+            self.assertEqual(shared["estimated_bytes_before_headroom"], combined_estimate)
+            self.assertEqual(shared["required_bytes_with_headroom"], (1 << 30) + combined_estimate)
+
+    def test_storage_reserves_every_filter_checkpoint_and_final_nrrd_on_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan = self._plan(root, (0,))
+            plan = replace(plan, postprocessing={
+                **plan.postprocessing,
+                "enable_3d_void_fill": True,
+                "gaussian_smoothing_enabled": True,
+                "keep_objects": 2,
+            })
+            with mock.patch(
+                "XTA.lta_execution._storage_capacity_probe",
+                side_effect=[(root, 1, 1 << 40), (root, 2, 1 << 40)],
+            ):
+                audit = _preflight_lta_storage(plan, plan.volumes[0].runtime_views[0])
+            self.assertEqual(audit["postprocessing_checkpoint_count"], 4)
+            self.assertEqual(audit["output_nrrd_count_including_final"], 5)
+            self.assertTrue(audit["compressed_final_nrrd_included"])
+            output_reservation = audit["filesystem_reservations"][1]
+            self.assertEqual(
+                output_reservation["estimated_bytes_before_headroom"],
+                audit["components"]["compressed_public_nrrd_upper_bound"],
+            )
+            self.assertGreater(output_reservation["estimated_bytes_before_headroom"], 5 * 4 * 4 * 6)
 
     def test_overlapping_authoritative_polygon_has_one_direct_tile_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -575,6 +690,8 @@ class LtaProductionExecutionTests(unittest.TestCase):
         preserve_temp: bool = False,
         cleanup_failure: bool = False,
         revalidation_failure: bool = False,
+        postprocessing_override: dict | None = None,
+        finalization_operations: object | None = None,
     ):
         pools = []
 
@@ -597,7 +714,16 @@ class LtaProductionExecutionTests(unittest.TestCase):
             return result
 
         def finalizer(layers, **_kwargs):
-            return _Finalization(layers)
+            if finalization_operations is not None:
+                from XTA.lta_postprocessing import finalize_lta_native_union
+                return finalize_lta_native_union(
+                    layers, operations=finalization_operations, **_kwargs,
+                )
+            result = _Finalization(layers)
+            _kwargs["checkpoint_callback"](
+                "before_postprocessing", result.terminal_union, {"execution_order": []},
+            )
+            return result
 
         def nrrd_writer(output_dir, *, stem, terminal_union, **_kwargs):
             path = Path(output_dir) / f"{stem}_Global_final_output.seg.nrrd"
@@ -618,6 +744,8 @@ class LtaProductionExecutionTests(unittest.TestCase):
             )
 
         plan = self._plan(root, devices)
+        if postprocessing_override is not None:
+            plan = replace(plan, postprocessing=postprocessing_override)
         if preserve_temp and cleanup_failure:
             raise ValueError("test helper cleanup modes are mutually exclusive")
         if cleanup_failure:
@@ -811,15 +939,56 @@ class LtaProductionExecutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             result, pool, _bytes = self._run(Path(temp_dir), (0, 1, 2, 3))
             manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+            identity = json.loads((result.manifest_path.parent / "lta_execution_identity.json").read_text())
+            trace_events = [
+                json.loads(line)
+                for path in (result.manifest_path.parent / "lta_diagnostics").glob("coordinator-*.jsonl")
+                for line in path.read_text().splitlines()
+            ]
+
+        self.assertEqual(identity["contract"], "lta.window_dag/1")
+        self.assertEqual(identity["requested_devices"], [0, 1, 2, 3])
+        self.assertEqual(identity["scratch_root"], manifest["run_plan"]["temp_root"])
+        self.assertEqual(
+            next(event for event in trace_events if event["event"] == "run_contract")["scratch_root"],
+            identity["scratch_root"],
+        )
+        self.assertEqual(identity["run_completion_marker"], "manifest.json")
+        self.assertNotIn("status", identity)
+        self.assertEqual(identity["source_fingerprint"], manifest["execution"]["worker_audit"]["source_fingerprint"])
+        phases = {event["phase"] for event in trace_events if event["event"] == "phase_start"}
+        self.assertTrue({"decode_source_cache", "prepare_authoritative_volume", "plan_seed_window_graph", "worker_pool_startup", "wait_for_window_result", "window_result_reduction", "relay_planning"} <= phases)
+        self.assertTrue(any(event["event"] == "coordinator_complete" for event in trace_events))
 
         preflight = manifest["run_plan"]["device_schedule"]
         self.assertEqual(preflight["status"], "superseded")
         self.assertEqual(preflight["superseded_by"], "execution.device_schedule")
         self.assertNotIn("work", preflight)
+        self.assertEqual(
+            manifest["execution"]["temporal_propagation"],
+            {
+                "policy": "full_view_per_anchor_recall_union",
+                "per_anchor_frame_range": [0, 4],
+                "cross_anchor_identity_reconciliation": False,
+                "output_combination": "union",
+                "missing_at_other_anchors": "does_not_terminate_lineage",
+                "continuation": "nonempty_directional_dogfood_boundaries",
+            },
+        )
 
         actual = manifest["execution"]["device_schedule"]
         work = actual["work"]
         self.assertEqual(actual["status"], "settled")
+        self.assertEqual(actual["policy"], "physical_view_affinity_with_bounded_head_assist")
+        self.assertEqual(actual["helper_queue_order"], "head")
+        self.assertEqual(actual["maximum_uncommitted_worker_unions"], 4)
+        storage = manifest["execution"]["storage_preflight"]
+        self.assertEqual(storage["maximum_uncommitted_worker_unions"], 4)
+        self.assertEqual(storage["components"]["bounded_worker_union_reserve"], 4 * 4 * 4 * 4)
+        self.assertEqual(storage["postprocessing_checkpoint_count"], 1)
+        self.assertTrue(storage["compressed_postprocessing_checkpoints_included"])
+        self.assertEqual(storage["output_nrrd_count_including_final"], 2)
+        self.assertGreater(storage["components"]["compressed_public_nrrd_upper_bound"], 2 * 4 * 4 * 6)
         self.assertTrue(actual["coordinator_selected"])
         self.assertEqual(actual["work_count"], len(pool.used_devices))
         self.assertEqual(len(work), len(pool.used_devices))
@@ -851,6 +1020,228 @@ class LtaProductionExecutionTests(unittest.TestCase):
                 "minimum_tracker_probability": 0.5,
             },
         )
+
+    def test_helper_first_completion_bounds_union_files_and_keeps_all_devices_working(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan = self._plan(root, (0, 1, 2, 3))
+            source = plan.discovery.target_volumes[0]
+            # Four overlapping lineages at each of two anchors create eight
+            # independent chains, enough to exercise more than one GPU batch.
+            source = replace(source, annotations=tuple(
+                replace(annotation, polygons=tuple(
+                    replace(polygon, row_index=index)
+                    for polygon in annotation.polygons for index in range(4)
+                ))
+                for annotation in source.annotations
+            ))
+            plan = replace(plan, discovery=replace(plan.discovery, target_volumes=(source,)))
+            original_wait = _FakeWorkerPool.wait_result
+            original_submit = _FakeWorkerPool.submit
+            original_audit = _accumulate_worker_audit
+            dispatch_counts = []
+            union_file_counts = []
+            committed_work_ids = []
+
+            def count_union_files():
+                return sum(
+                    len(tuple(plan.temp_root.rglob(pattern)))
+                    for pattern in ("union.uint8.raw", ".union.uint8.raw.partial")
+                )
+
+            def reserve_active_union(pool, task, *, execution_device_id):
+                original_submit(pool, task, execution_device_id=execution_device_id)
+                output = Path(task.payload["output_dir"])
+                output.mkdir(parents=True, exist_ok=False)
+                (output / ".union.uint8.raw.partial").write_bytes(b"active")
+                union_file_counts.append(count_union_files())
+
+            def helpers_finish_first(pool, timeout=None):
+                dispatch_counts.append(len(pool.used_devices))
+                pool.pending.insert(0, pool.pending.pop())
+                output = Path(pool.pending[0][0].payload["output_dir"])
+                (output / ".union.uint8.raw.partial").unlink()
+                output.rmdir()
+                result = original_wait(pool, timeout)
+                union_file_counts.append(count_union_files())
+                return result
+
+            def record_ordered_audit(audit, manifest, result):
+                committed_work_ids.append(result.work_id)
+                original_audit(audit, manifest, result)
+
+            with (
+                mock.patch.object(self, "_plan", return_value=plan),
+                mock.patch.object(_FakeWorkerPool, "submit", reserve_active_union),
+                mock.patch.object(_FakeWorkerPool, "wait_result", helpers_finish_first),
+                mock.patch("XTA.lta_execution._accumulate_worker_audit", side_effect=record_ordered_audit),
+            ):
+                result, pool, straggler_bytes = self._run(root, (0, 1, 2, 3))
+            manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+            baseline_plan = replace(
+                plan, output_root=root / "ordered-output", temp_root=root / "ordered-temp",
+            )
+            with mock.patch.object(self, "_plan", return_value=baseline_plan):
+                _baseline, _baseline_pool, ordered_bytes = self._run(root, (0, 1, 2, 3))
+
+        # The helper reopens work 4 through 7 while work 0 is still running;
+        # the previous per-device commit slots held dispatch at four tasks.
+        self.assertEqual(dispatch_counts[:8], [4, 5, 6, 7, 8, 8, 8, 8])
+        self.assertEqual(pool.used_devices[:8], [0, 1, 2, 3, 3, 3, 3, 3])
+        self.assertEqual(max(union_file_counts), 4)
+        self.assertTrue(all(count <= 4 for count in union_file_counts))
+        self.assertEqual(straggler_bytes, ordered_bytes)
+        order_by_work = {
+            record["work_id"]: record["plan_order"]
+            for record in manifest["execution"]["device_schedule"]["work"]
+        }
+        self.assertEqual(
+            [order_by_work[work_id] for work_id in committed_work_ids],
+            sorted(order_by_work.values()),
+        )
+        self.assertEqual(manifest["execution"]["device_schedule"]["status"], "settled")
+
+    def test_dense_reduction_failure_prevents_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with mock.patch(
+                "XTA.lta_execution._consume_chain_manifest",
+                side_effect=RuntimeError("injected dense reduction failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected dense reduction failure"):
+                    self._run(root, (0, 1))
+            self.assertFalse((root / "output" / "manifest.json").exists())
+            self.assertEqual(list((root / "output").glob("*.seg.nrrd")), [])
+
+    def test_bounded_production_driver_rejects_suffix_dispatch(self) -> None:
+        from XTA.lta_execution import _drive_workers_to_fixed_point
+
+        scheduler = LtaViewAffinityScheduler((), (0, 1))
+        with self.assertRaisesRegex(ValueError, "requires helper_queue_order='head'"):
+            _drive_workers_to_fixed_point(
+                scheduler=scheduler, pool=None, initial=(), view_plan=None,
+                cache_ref=None, view_union=None, relay_mask_revisions={},
+                temp_root=Path("unused"), conf=0.15, empty_frame_limit=30,
+                worker_task_timeout=30.0,
+            )
+
+    def test_unrelated_anchors_propagate_across_prior_midpoint_and_union_through_dogfood(self) -> None:
+        from XTA.lta_propagation import run_mask_injected_session as execute_propagation_session
+        from XTA.lta_sam import LTA_SESSION_FRAMES, SamFramePrediction
+        from XTA.lta_windows import WindowPlan, owned_frame_range
+        from XTA.lta_worker_adapter import execute_worker_task
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan = self._plan(root, (0,))
+            frame_count = 96
+            view = replace(
+                plan.volumes[0].runtime_views[0],
+                frame_count=frame_count,
+                sessions=plan_sam_sessions("sequence", frame_count),
+                encoded_frame_indices=tuple(range(frame_count)),
+            )
+            grid = view.tile_grids[0]
+            cache_path = root / "cache.raw"
+            np.zeros((frame_count, 4, 6), dtype=np.uint8).tofile(cache_path)
+            stat = cache_path.stat()
+            cache_ref = LtaPhysicalViewCacheRef(
+                path=cache_path, shape=(frame_count, 4, 6), dtype="uint8",
+                physical_view_id="transverse", identity_sha256="c" * 64,
+                size_bytes=stat.st_size, mtime_ns=stat.st_mtime_ns,
+            )
+            by_frame = {}
+            for anchor, (row, column) in ((72, (2, 1)), (24, (1, 0))):
+                mask = np.zeros((4, 4), dtype=bool)
+                mask[row, column] = True
+                by_frame[anchor] = (LtaMaskSeed(
+                    lineage=LtaLineageId(
+                        volume_id=view.volume_id,
+                        physical_view_id=view.physical_view_id,
+                        runtime_view_id=view.runtime_view_id,
+                        tile_config_id=grid.config_id,
+                        lineage_id=f"unrelated-{anchor}",
+                    ),
+                    frame_index=anchor, object_id=0, mask=mask,
+                    visited_tile_indices=(0,),
+                ),)
+            with mock.patch(
+                "XTA.lta_execution._seeds_for_tile",
+                side_effect=lambda _source, _annotations, _view, _grid, tile_index, **_kwargs: (
+                    by_frame if tile_index == 0 else {}
+                ),
+            ):
+                chains, _inventory = _plan_initial_chains(
+                    plan.discovery.target_volumes[0], (), view, cache_ref,
+                    temp_root=root / "chain-temp", conf=0.15, empty_frame_limit=30,
+                )
+
+            self.assertEqual(len(chains), 2)
+            self.assertEqual([chain.payload["windows"][0]["prompt_frame"] for chain in chains], [24, 72])
+            for chain in chains:
+                self.assertEqual((chain.work.frame_start, chain.work.frame_stop), (0, frame_count))
+                windows = tuple(WindowPlan(**record) for record in chain.payload["windows"])
+                self.assertEqual({window.branch for window in windows}, {"center", "backward", "forward"})
+                self.assertTrue(all(window.frame_count <= LTA_SESSION_FRAMES for window in windows))
+                self.assertEqual(
+                    sorted(frame for window in windows for frame in range(*owned_frame_range(window))),
+                    list(range(frame_count)),
+                )
+
+            def sam_adapter(_measured, _raw, **kwargs):
+                session = kwargs["session"]
+                prompt = kwargs["prompt_frame"]
+                direction = kwargs["propagation_direction"]
+                forward = range(prompt, session.frame_stop)
+                backward = range(prompt - 1, session.frame_start - 1, -1)
+                frames = (
+                    (*forward, *backward) if direction == "both" else forward
+                    if direction == "forward" else range(prompt, session.frame_start - 1, -1)
+                )
+                for frame in frames:
+                    for object_id, mask in enumerate(kwargs["object_masks"]):
+                        kwargs["prediction_callback"](SamFramePrediction(
+                            sequence_id=session.sequence_id,
+                            session_index=session.session_index,
+                            frame_index=frame, object_id=object_id,
+                            initial_detection_score=1.0, frame_tracker_score=0.9,
+                            binary_mask=mask,
+                        ))
+                return {
+                    "propagation": (), "seed_roundtrip_policy": "overlap-aware",
+                    "seed_roundtrip_passed": True, "anchor_integrity_passed": True,
+                }
+
+            context = types.SimpleNamespace(
+                predictor=object(), profile={"name": "fake"},
+                sam_runtime={"distribution_version": "fake"}, constrained_batches=None,
+            )
+            view_union = np.zeros((frame_count, 4, 6), dtype=np.uint8)
+            for chain_index, chain in enumerate(chains):
+                with mock.patch(
+                    "XTA.lta_propagation.run_mask_injected_session",
+                    side_effect=lambda measured, raw, **kwargs: execute_propagation_session(
+                        measured, raw, adapter=sam_adapter, **kwargs
+                    ),
+                ):
+                    result = execute_worker_task(context, "propagation_chain", {
+                        **chain.payload, "output_dir": str(root / f"worker-{chain_index}"),
+                    })
+                manifest = json.loads(Path(result["artifact_path"]).read_text(encoding="utf-8"))
+                self.assertEqual(manifest["output_frame_range"], [0, frame_count])
+                self.assertTrue(all(window["status"] == "complete" for window in manifest["windows"]))
+                self.assertEqual(set(manifest["lineage_active_frame_ranges"]), {
+                    by_frame[chain.payload["windows"][0]["prompt_frame"]][0].lineage.token,
+                })
+                _consume_chain_manifest(manifest, view_union=view_union)
+
+            # Previously frame 49 cut off the first anchor's lineage, and the
+            # later anchor could not contribute before that midpoint.
+            self.assertTrue(view_union[:, 1, 0].all())
+            self.assertTrue(view_union[:, 2, 1].all())
+            self.assertTrue(view_union[72, 1, 0], "the later anchor erased the earlier lineage")
+            self.assertTrue(view_union[24, 2, 1], "the earlier anchor erased the later lineage")
+            self.assertEqual(int(view_union.sum()), frame_count * 2)
 
     def test_dense_initial_and_relay_prompts_are_batched_before_worker_startup(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

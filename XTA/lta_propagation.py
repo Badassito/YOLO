@@ -540,6 +540,11 @@ def run_mask_injected_session(
     seed_added_pixels = 0
     for seed in request.seeds:
         filled = np.ascontiguousarray(fill_mask(seed.mask), dtype=np.bool_)
+        if filled.shape != seed.mask.shape:
+            raise RuntimeError(
+                f"injection hole filling changed seed mask shape from "
+                f"{seed.mask.shape} to {filled.shape}"
+            )
         added = int(np.count_nonzero(filled & ~np.asarray(seed.mask, dtype=bool)))
         seed_added_pixels += added
         filled_seeds.append(
@@ -604,6 +609,15 @@ def run_mask_injected_session(
                     "mask propagation returned a value outside the "
                     "SamFramePrediction contract"
                 ) from exc
+        if (
+            prediction.sequence_id != request.session.sequence_id
+            or prediction.session_index != request.session.session_index
+        ):
+            raise RuntimeError(
+                "mask propagation returned a prediction from a different session: "
+                f"expected={(request.session.sequence_id, request.session.session_index)!r}, "
+                f"actual={(prediction.sequence_id, prediction.session_index)!r}"
+            )
         seed = by_local_id.get(int(prediction.object_id))
         if seed is None:
             raise RuntimeError(
@@ -617,10 +631,19 @@ def run_mask_injected_session(
             raise RuntimeError(
                 f"propagation returned frames outside its direction: {[key[0]]}"
             )
+        raw_mask = np.asarray(prediction.binary_mask, dtype=np.bool_)
+        if raw_mask.shape != seed.mask.shape:
+            raise RuntimeError(
+                f"mask propagation returned mask shape {raw_mask.shape}; "
+                f"expected seed mask shape {seed.mask.shape}"
+            )
         filled = np.ascontiguousarray(fill_mask(prediction.binary_mask), dtype=np.bool_)
-        added = int(
-            np.count_nonzero(filled & ~np.asarray(prediction.binary_mask, dtype=bool))
-        )
+        if filled.shape != raw_mask.shape:
+            raise RuntimeError(
+                f"prediction hole filling changed mask shape from "
+                f"{raw_mask.shape} to {filled.shape}"
+            )
+        added = int(np.count_nonzero(filled & ~raw_mask))
         prediction_added_pixels += added
         canonical = SamFramePrediction(
             sequence_id=prediction.sequence_id,

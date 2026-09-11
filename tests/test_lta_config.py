@@ -20,6 +20,11 @@ class LtaConfigTests(unittest.TestCase):
         "--enable_cartesian", "transverse",
     ]
 
+    def test_help_describes_always_saved_union_and_filter_checkpoints(self) -> None:
+        help_text = " ".join(build_lta_argparser().format_help().split())
+        self.assertIn("a complete NRRD checkpoint after each requested filter", help_text)
+        self.assertIn("Filter checkpoints precede hard-positive restoration", help_text)
+
     def test_complete_public_contract_is_resolved(self) -> None:
         config = parse_lta_args([
             "--input", "target",
@@ -71,6 +76,14 @@ class LtaConfigTests(unittest.TestCase):
         self.assertEqual(config.args.conf, 0.15)
         self.assertEqual(config.save.tokens, ())
         self.assertEqual(config.postprocessing.keep_objects, 0)
+
+    def test_explicit_empty_scratch_path_does_not_silently_use_output_storage(self) -> None:
+        for value in ('', '   '):
+            with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()) as error:
+                with self.assertRaises(SystemExit):
+                    parse_lta_args([*self.REQUIRED, '--temp', value])
+                self.assertIn('scratch environment variable', error.getvalue())
+        self.assertIsNone(parse_lta_args(self.REQUIRED).args.temp)
 
     def test_required_flags_and_parent_view_are_strict(self) -> None:
         parser = build_lta_argparser()

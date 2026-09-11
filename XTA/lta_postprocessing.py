@@ -28,6 +28,7 @@ import numpy as np
 
 from .lta_outputs import (
     LtaArtifactReceipt,
+    LtaCheckpointArtifact,
     LtaLayerRecord,
     LtaRecompositionOp,
 )
@@ -177,9 +178,14 @@ class LtaCompletedViewFillReceipt:
 
 def _default_binary_hole_fill(mask_bool: np.ndarray) -> np.ndarray:
     # Function-local import preserves the dependency-light LTA import boundary.
-    from .inference import _fill_holes_2d_opencv
+    from .inference import _fill_holes_2d_opencv_u8_inplace
 
-    return np.asarray(_fill_holes_2d_opencv(mask_bool), dtype=np.bool_)
+    # Reuse TTA's foreground-bbox plus exterior-halo implementation. Labeling
+    # the full tile for every small instance stalls the next tracker frame;
+    # the halo preserves the same four-connected outside-background domain.
+    binary_u8 = np.ascontiguousarray(mask_bool, dtype=np.uint8)
+    _fill_holes_2d_opencv_u8_inplace(binary_u8)
+    return binary_u8.view(np.bool_)
 
 
 def fill_binary_mask_holes_2d(
@@ -514,6 +520,9 @@ def finalize_lta_native_union(
     reserve_bytes: int = _DEFAULT_RESERVE_BYTES,
     workers: int = 1,
     operations: Optional[LtaFinalizationOperations] = None,
+    checkpoint_callback: Optional[
+        Callable[[str, np.ndarray, Mapping[str, object]], None]
+    ] = None,
 ) -> LtaFinalizationResult:
     """Compose native layers scalably and apply the exact TTA filter order.
 
@@ -521,10 +530,14 @@ def finalize_lta_native_union(
     normalization copy is created.  On success, the returned result is the sole
     owner of the final volume.  Any GPU ``keep_objects`` replacement is committed
     before the prior union is closed.  Protected foreground (for example exact
-    authoritative labels) is restored after every destructive filter so it
-    remains a hard-positive invariant of the published terminal union.
+    authoritative labels) is restored after the filter sequence so it remains
+    a hard-positive invariant of the published terminal union.  A synchronous
+    checkpoint callback receives a read-only view before filtering and after
+    each requested operation, before that final hard-positive restoration.
     """
 
+    if checkpoint_callback is not None and not callable(checkpoint_callback):
+        raise TypeError("checkpoint_callback must be callable or None")
     layer_values = tuple(layers)
     seen_ids: set[str] = set()
     expected_shape: Optional[tuple[int, int, int]] = None
@@ -599,6 +612,7 @@ def finalize_lta_native_union(
         "void_fill": None,
         "gaussian_smoothing": None,
         "keep_objects": None,
+        "checkpoint_stages": [],
         "protected_foreground": {
             "layer_ids": [layer.layer_id for layer in protected],
             "restore_stage": "after_terminal_filters",
@@ -606,6 +620,34 @@ def finalize_lta_native_union(
         },
     }
     active_volume: np.ndarray = terminal_union
+
+    def checkpoint(stage: str) -> None:
+        if checkpoint_callback is None:
+            return
+        # Writing finishes before a later filter mutates or closes this buffer.
+        # A read-only view prevents an ordinary sink from editing its input.
+        snapshot = np.asarray(active_volume).view()
+        snapshot.setflags(write=False)
+        foreground = int(np.count_nonzero(snapshot))
+        metadata = {
+            "stage_index": len(post_stats["checkpoint_stages"]),
+            "source_layer_ids": [layer.layer_id for layer, _operation in composable],
+            "execution_order": list(post_stats["execution_order"]),
+            "requested": resolved.manifest_record(),
+            "void_fill": post_stats["void_fill"],
+            "gaussian_smoothing": post_stats["gaussian_smoothing"],
+            "keep_objects": post_stats["keep_objects"],
+            "protected_foreground_restore_applied": False,
+            "protected_foreground_layer_ids": [layer.layer_id for layer in protected],
+        }
+        checkpoint_callback(stage, snapshot, metadata)
+        post_stats["checkpoint_stages"].append({  # type: ignore[union-attr]
+            "stage": stage,
+            "shape_tyx": list(expected_shape),
+            "foreground_voxels": foreground,
+            "protected_foreground_restore_applied": False,
+        })
+
     try:
         for layer, operation in composable:
             _parallel_apply_layer(
@@ -615,6 +657,8 @@ def finalize_lta_native_union(
                 workers=max(1, int(workers)),
                 layer_id=layer.layer_id,
             )
+
+        checkpoint("before_postprocessing")
 
         if resolved.enable_3d_void_fill:
             void_dir = scratch / "final_global_void_fill"
@@ -633,6 +677,7 @@ def finalize_lta_native_union(
                 "enabled": True,
                 "background_connectivity": void_connectivity,
             }
+            checkpoint("after_3d_void_fill")
 
         if resolved.gaussian_smoothing_enabled:
             gaussian_stats = ops.apply_gaussian_smoothing(
@@ -649,6 +694,7 @@ def finalize_lta_native_union(
             )
             post_stats["execution_order"].append("gaussian_smoothing")  # type: ignore[union-attr]
             post_stats["gaussian_smoothing"] = dict(gaussian_stats)
+            checkpoint("after_gaussian_smoothing")
 
         if resolved.keep_objects > 0:
             gpu_result = ops.try_gpu_keep_objects(
@@ -688,6 +734,7 @@ def finalize_lta_native_union(
                     ops.close_volume(prior)
             post_stats["execution_order"].append("keep_objects")  # type: ignore[union-attr]
             post_stats["keep_objects"] = keep_record
+            checkpoint("after_keep_objects")
 
         if protected:
             for layer in protected:
@@ -746,27 +793,31 @@ def _sha256_path(path: Path) -> str:
     return digest.hexdigest()
 
 
-def write_global_final_output_nrrd(
+def _write_native_checkpoint_nrrd(
     output_dir: Path,
     *,
     stem: str,
-    terminal_union: np.ndarray,
-    model_name: str = "sam3.1",
-    layer_id: str = "global_final_output",
-    writer: Optional[Callable[..., Path]] = None,
-) -> LtaFinalNrrdArtifact:
-    """Atomically write the always-representable final union, including all-zero volumes."""
+    volume: np.ndarray,
+    model_name: str,
+    layer_id: str,
+    suffix: str,
+    stage: str,
+    description: str,
+    writer: Optional[Callable[..., Path]],
+) -> tuple[LtaArtifactReceipt, tuple[int, int, int], int]:
+    """Synchronously serialize a live native checkpoint before it can mutate."""
 
     safe_stem = str(stem).strip()
     resolved_layer_id = str(layer_id).strip()
     if not safe_stem or not resolved_layer_id:
         raise ValueError("NRRD stem and layer_id must not be empty")
-    volume = np.asarray(terminal_union)
+    volume = np.asarray(volume)
     shape = tuple(int(value) for value in volume.shape)
     if volume.ndim != 3 or any(value < 1 for value in shape):
-        raise ValueError(f"final LTA NRRD requires positive 3D TYX shape; got {shape}")
+        raise ValueError(f"LTA NRRD requires positive 3D TYX shape; got {shape}")
     if volume.dtype != np.dtype(np.uint8):
-        raise TypeError(f"final LTA NRRD requires uint8 storage; got {volume.dtype}")
+        raise TypeError(f"LTA NRRD requires uint8 storage; got {volume.dtype}")
+    foreground = int(np.count_nonzero(volume))
     if writer is None:
         from .outputs import write_single_layer_nrrd_from_ref
 
@@ -775,7 +826,7 @@ def write_global_final_output_nrrd(
 
     destination_dir = Path(output_dir)
     destination_dir.mkdir(parents=True, exist_ok=True)
-    destination = destination_dir / f"{safe_stem}_Global_final_output.seg.nrrd"
+    destination = destination_dir / f"{safe_stem}_{suffix}.seg.nrrd"
     descriptor, stage_name = tempfile.mkstemp(
         prefix=f".{destination.name}.",
         suffix=".assembling",
@@ -784,7 +835,7 @@ def write_global_final_output_nrrd(
     os.close(descriptor)
     stage_path = Path(stage_name)
     stage_path.unlink(missing_ok=True)
-    segment_name = f"{safe_stem}_Global_final_output"
+    segment_name = f"{safe_stem}_{suffix}"
     ref = NrrdLayerRef(
         key=resolved_layer_id,
         name=segment_name,
@@ -797,11 +848,8 @@ def write_global_final_output_nrrd(
         view_family="global",
         source="global",
         mask_kind="union",
-        stage="final_output_after_all_postprocessing",
-        description=(
-            "Final recall-oriented LTA binary union after all selected terminal "
-            "postprocessing."
-        ),
+        stage=stage,
+        description=description,
         layer_role="checkpoint",
         recomposition_op="select",
         low_quality_recomposition_op="select",
@@ -819,7 +867,7 @@ def write_global_final_output_nrrd(
             segment_name=segment_name,
         )
         if not stage_path.is_file():
-            raise RuntimeError("final LTA NRRD writer did not create its staging file")
+            raise RuntimeError("LTA NRRD writer did not create its staging file")
         with stage_path.open("r+b") as handle:
             os.fsync(handle.fileno())
         os.replace(stage_path, destination)
@@ -834,20 +882,116 @@ def write_global_final_output_nrrd(
         path=destination,
         sha256=digest,
     )
+    return receipt, shape, foreground
+
+
+def write_global_final_output_nrrd(
+    output_dir: Path,
+    *,
+    stem: str,
+    terminal_union: np.ndarray,
+    model_name: str = "sam3.1",
+    layer_id: str = "global_final_output",
+    writer: Optional[Callable[..., Path]] = None,
+) -> LtaFinalNrrdArtifact:
+    """Atomically write the always-representable final union, including all-zero volumes."""
+
+    volume = np.asarray(terminal_union)
+    resolved_layer_id = str(layer_id).strip()
+    receipt, _shape, foreground = _write_native_checkpoint_nrrd(
+        output_dir,
+        stem=stem,
+        volume=volume,
+        model_name=model_name,
+        layer_id=resolved_layer_id,
+        suffix="Global_final_output",
+        stage="final_output_after_all_postprocessing",
+        description=(
+            "Final recall-oriented LTA binary union after all selected terminal "
+            "postprocessing and restoration of authoritative foreground."
+        ),
+        writer=writer,
+    )
     layer = LtaLayerRecord(
         layer_id=resolved_layer_id,
         recomposition_op=LtaRecompositionOp.SELECT,
         source_role="global_final_output",
         volume=volume,
         metadata={
-            "artifact_name": artifact_name,
-            "artifact_path": str(destination),
-            "artifact_sha256": digest,
-            "empty_union": not bool(np.any(volume)),
+            "artifact_name": receipt.name,
+            "artifact_path": str(receipt.path),
+            "artifact_sha256": receipt.sha256,
+            "empty_union": foreground == 0,
             "stage": "final_output_after_all_postprocessing",
         },
     )
     return LtaFinalNrrdArtifact(layer=layer, receipt=receipt)
+
+
+def write_lta_postprocessing_checkpoint(
+    output_dir: Path,
+    *,
+    stem: str,
+    stage: str,
+    volume: np.ndarray,
+    metadata: Optional[Mapping[str, object]] = None,
+    model_name: str = "sam3.1",
+    writer: Optional[Callable[..., Path]] = None,
+) -> LtaCheckpointArtifact:
+    """Save a complete filter checkpoint with TTA's independent-select semantics.
+
+    Filter results are captured before the final hard-positive restoration.
+    In particular, the keep_objects checkpoint shows the actual kept objects,
+    even when final restoration later adds another disconnected annotation.
+    """
+
+    stages = {
+        "before_postprocessing": (
+            "Global_union_before_postprocessing",
+            "Native LTA tile/view union before optional terminal filters.",
+        ),
+        "after_3d_void_fill": (
+            "Global_after_3d_void_fill",
+            "Complete native union after 3D void fill, before final hard-positive restoration.",
+        ),
+        "after_gaussian_smoothing": (
+            "Global_after_gaussian_smoothing",
+            "Complete native union after all requested Gaussian passes, before final hard-positive restoration.",
+        ),
+        "after_keep_objects": (
+            "Global_after_keep_objects",
+            "Complete native union after keep_objects, before final hard-positive restoration.",
+        ),
+    }
+    resolved_stage = str(stage).strip()
+    if resolved_stage not in stages:
+        raise ValueError(f"unsupported LTA postprocessing checkpoint stage {stage!r}")
+    suffix, description = stages[resolved_stage]
+    layer_id = f"global_{resolved_stage}"
+    receipt, shape, foreground = _write_native_checkpoint_nrrd(
+        output_dir,
+        stem=stem,
+        volume=volume,
+        model_name=model_name,
+        layer_id=layer_id,
+        suffix=suffix,
+        stage=resolved_stage,
+        description=description,
+        writer=writer,
+    )
+    return LtaCheckpointArtifact(
+        layer_id=layer_id,
+        stage=resolved_stage,
+        shape_tyx=shape,
+        foreground_voxels=foreground,
+        receipt=receipt,
+        metadata={
+            **dict(metadata or {}),
+            "description": description,
+            "protected_foreground_restore_applied": False,
+            "composition_policy": "complete checkpoint; select instead of ORing alternatives",
+        },
+    )
 
 
 __all__ = (
@@ -866,4 +1010,5 @@ __all__ = (
     "fill_prediction_mask_holes_2d",
     "finalize_lta_native_union",
     "write_global_final_output_nrrd",
+    "write_lta_postprocessing_checkpoint",
 )

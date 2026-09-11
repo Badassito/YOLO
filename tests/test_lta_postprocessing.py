@@ -391,6 +391,110 @@ class LtaNativeFinalizationTests(unittest.TestCase):
 
         self.assertEqual(len(closed), 1)
 
+    def test_checkpoints_capture_union_and_each_filter_before_positive_restoration(self) -> None:
+        source = np.zeros((1, 2, 4), dtype=np.uint8)
+        source[0, 1, 3] = 1
+        hard_positive = LtaLayerRecord("positive", "union", "annotation", source.copy())
+        kept = np.zeros_like(source)
+        kept[0, 0, 0] = 1
+        gpu_result = SimpleNamespace(volume=kept, stats={"kept_objects": 1})
+        events: list[str] = []
+        closed: list[object] = []
+        artifacts = []
+        observed_refs = []
+
+        def writer(ref, shape, path, **_kwargs):
+            self.assertEqual(ref.layer_role, "checkpoint")
+            self.assertEqual(ref.recomposition_op, "select")
+            self.assertFalse(ref.live_array.flags.writeable)
+            observed_refs.append((ref.stage, shape))
+            path.write_bytes(np.asarray(ref.live_array, dtype=np.uint8).tobytes())
+            return path
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+
+            def save(stage, volume, metadata):
+                artifacts.append(subject.write_lta_postprocessing_checkpoint(
+                    root / "checkpoints", stem="sample", stage=stage,
+                    volume=volume, metadata=metadata, writer=writer,
+                ))
+
+            result = subject.finalize_lta_native_union(
+                (hard_positive,), workspace_path=root / "union.raw", temp_dir=root,
+                protected_foreground_layers=(hard_positive,),
+                postprocessing={
+                    "enable_3d_void_fill": True,
+                    "gaussian_smoothing_enabled": True,
+                    "gaussian_passes": 2,
+                    "keep_objects": 1,
+                },
+                operations=_fake_operations(events, closed, gpu_result=gpu_result),
+                checkpoint_callback=save,
+            )
+            self.assertEqual([item.stage for item in artifacts], [
+                "before_postprocessing", "after_3d_void_fill",
+                "after_gaussian_smoothing", "after_keep_objects",
+            ])
+            snapshots = [
+                np.frombuffer(item.receipt.path.read_bytes(), dtype=np.uint8).reshape(source.shape)
+                for item in artifacts
+            ]
+            np.testing.assert_array_equal(snapshots[0], source)
+            expected_void = source.copy()
+            expected_void[0, 0, 0] = 1
+            np.testing.assert_array_equal(snapshots[1], expected_void)
+            expected_gaussian = expected_void.copy()
+            expected_gaussian[0, 0, 1] = 1
+            np.testing.assert_array_equal(snapshots[2], expected_gaussian)
+            expected_kept = np.zeros_like(source)
+            expected_kept[0, 0, 0] = 1
+            np.testing.assert_array_equal(snapshots[3], expected_kept)
+            np.testing.assert_array_equal(result.terminal_union, expected_kept | source)
+            self.assertEqual([item.foreground_voxels for item in artifacts], [1, 2, 3, 1])
+            self.assertEqual(artifacts[-1].metadata["keep_objects"]["kept_objects"], 1)
+            self.assertEqual(artifacts[2].metadata["requested"]["gaussian_passes"], 2)
+            self.assertEqual(
+                [item["stage"] for item in result.postprocessing["checkpoint_stages"]],
+                [item.stage for item in artifacts],
+            )
+            for artifact in artifacts:
+                self.assertFalse(hasattr(artifact, "volume"))
+                self.assertFalse(artifact.metadata["protected_foreground_restore_applied"])
+                artifact.receipt.validate()
+            result.close()
+
+    def test_no_filters_still_emit_prefilter_union_and_callback_failure_closes_owner(self) -> None:
+        source = np.ones((1, 2, 3), dtype=np.uint8)
+        stages = []
+        events: list[str] = []
+        closed: list[object] = []
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            result = subject.finalize_lta_native_union(
+                (LtaLayerRecord("source", "union", "sam", source),),
+                workspace_path=root / "union.raw", temp_dir=root,
+                operations=_fake_operations(events, closed),
+                checkpoint_callback=lambda stage, volume, metadata: stages.append(stage),
+            )
+            self.assertEqual(stages, ["before_postprocessing"])
+            result.close()
+            closed.clear()
+
+            def failed_checkpoint(_stage, _volume, _metadata):
+                raise RuntimeError("checkpoint save failed")
+
+            with self.assertRaisesRegex(RuntimeError, "checkpoint save failed"):
+                subject.finalize_lta_native_union(
+                    (LtaLayerRecord("source", "union", "sam", source),),
+                    workspace_path=root / "union.raw", temp_dir=root,
+                    postprocessing={"keep_objects": 1},
+                    operations=_fake_operations(events, closed),
+                    checkpoint_callback=failed_checkpoint,
+                )
+            self.assertEqual(len(closed), 1)
+            self.assertNotIn("gpu_keep", events)
+
     def test_detach_transfers_volume_and_prevents_result_cleanup(self) -> None:
         source = np.ones((1, 1, 2), dtype=np.uint8)
         events: list[str] = []
@@ -412,6 +516,29 @@ class LtaNativeFinalizationTests(unittest.TestCase):
 
 
 class LtaFinalNrrdTests(unittest.TestCase):
+    def test_empty_filter_checkpoint_uses_native_geometry_and_select_role(self) -> None:
+        volume = np.zeros((2, 3, 4), dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as folder:
+            artifact = subject.write_lta_postprocessing_checkpoint(
+                Path(folder), stem="empty", stage="after_keep_objects", volume=volume,
+                metadata={"requested": {"keep_objects": 1}},
+            )
+            header_bytes, compressed = artifact.receipt.path.read_bytes().split(b"\n\n", 1)
+            artifact.receipt.validate()
+            volume[:] = 1
+            record = artifact.manifest_record()
+
+        header = header_bytes.decode("ascii")
+        self.assertIn("sizes: 4 3 2", header)
+        self.assertIn("Segment0_Extent:=0 -1 0 -1 0 -1", header)
+        self.assertEqual(gzip.decompress(compressed), bytes(24))
+        self.assertEqual(artifact.receipt.path.name, "empty_Global_after_keep_objects.seg.nrrd")
+        self.assertEqual(record["recomposition_op"], "select")
+        self.assertEqual(record["layer_role"], "checkpoint")
+        self.assertEqual(record["foreground_voxels"], 0)
+        self.assertTrue(record["empty_union"])
+        self.assertEqual(record["metadata"]["artifact_path"], str(artifact.receipt.path))
+
     def test_default_writer_serializes_an_empty_global_checkpoint(self) -> None:
         volume = np.zeros((2, 3, 4), dtype=np.uint8)
         with tempfile.TemporaryDirectory() as folder:

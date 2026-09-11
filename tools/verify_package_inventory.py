@@ -32,6 +32,7 @@ REVIEWED_V21_0_3_SHA256 = '9d09663dab895ff2c9da78175b5e5acbf6a6bd96adfcff66a441a
 REVIEWED_V21_0_4_SHA256 = '8c8875883d5568194c7a709023ae50061b2a7b6c8a04f5fd48bc3fc5bd24cec7'
 REVIEWED_V21_0_5_SHA256 = '9078a719026147d7af6b990634090f78a0874ba1297f49f89e062700f791a9e3'
 REVIEWED_V21_0_6_SHA256 = 'fc3c2ca5ab0af6257ee9b4fd3b4bf9f66a9c669007a87377a9d7d47cb13858c7'
+REVIEWED_V21_1_SHA256 = '534ad7dabb3bccbbf95883fa7cad678081e85f4efa1b5e851781b173da017f37'
 # This method was previously covered by the immutable full Radial module and
 # class pins. Name its exact pre-v21.0.6 AST before reviewing the upload change.
 REVIEWED_PRESERVED_RADIAL_UPLOAD_SHA256 = '5f12562dafcb991f93b1702b8976e33a5117e4e01de357c3cb99c98afe52599a'
@@ -1291,6 +1292,17 @@ def reviewed_v21_0_6_contract(
     )
 
 
+def reviewed_v21_1_contract(
+    manifest: dict[str, object], v21: dict[str, object],
+    *earlier_patches: dict[str, object],
+) -> dict[str, object]:
+    return _reviewed_v21_patch_contract(
+        manifest, v21, key='v21_1_review', release='21.1.0',
+        expected_digest=REVIEWED_V21_1_SHA256, previous_digest=REVIEWED_V21_0_6_SHA256,
+        earlier_patches=earlier_patches,
+    )
+
+
 def reviewed_radial_module_hashes(v21, patches):
     """Require explicit authenticated successors for preserved full modules."""
     expected = {item['module']: item['sha256'] for item in v21['preserved_radial_modules']}
@@ -1348,6 +1360,8 @@ def main() -> None:
     fifth_patch = reviewed_v21_0_5_contract(manifest, v21, patch, second_patch, third_patch, fourth_patch)
     sixth_patch = reviewed_v21_0_6_contract(manifest, v21, patch, second_patch, third_patch, fourth_patch, fifth_patch)
     patches = (patch, second_patch, third_patch, fourth_patch, fifth_patch, sixth_patch)
+    lta_release = reviewed_v21_1_contract(manifest, v21, *patches)
+    patches = (*patches, lta_release)
     patch_definitions = {
         (item['module'], item['name']): item for review in patches for item in review['definitions']
     }

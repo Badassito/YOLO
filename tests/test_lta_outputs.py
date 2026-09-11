@@ -4,6 +4,7 @@ import json
 import hashlib
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +12,7 @@ import numpy as np
 from XTA.lta_outputs import (
     LTA_MANIFEST_SCHEMA,
     LtaArtifactReceipt,
+    LtaCheckpointArtifact,
     LtaLayerRecord,
     LtaPublicationReceipt,
     compose_terminal_union,
@@ -131,6 +133,39 @@ class LtaOutputTests(unittest.TestCase):
                     ),
                     payload={},
                 )
+
+    def test_manifest_accepts_stable_checkpoint_descriptors_with_published_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            staged = root / "stage.nrrd"
+            staged.write_bytes(b"complete checkpoint")
+            digest = hashlib.sha256(staged.read_bytes()).hexdigest()
+            artifact = LtaCheckpointArtifact(
+                layer_id="global_after_keep_objects", stage="after_keep_objects",
+                shape_tyx=(2, 3, 4), foreground_voxels=7,
+                receipt=LtaArtifactReceipt("keep.nrrd", staged, digest),
+                metadata={"requested": {"keep_objects": 1}},
+            )
+            published = root / "published.nrrd"
+            staged.replace(published)
+            artifact = replace(artifact, receipt=replace(artifact.receipt, path=published))
+            path = write_complete_lta_manifest(
+                root / "manifest.json", version="21.1.0", command=(),
+                layers=(artifact,),
+                publication_receipt=LtaPublicationReceipt(
+                    artifacts=(artifact.receipt,), terminal_union_shape_tyx=(2, 3, 4),
+                    terminal_union_foreground_voxels=7, source_revalidated=True,
+                    model_revalidated=True, layers_settled=True,
+                ), payload={},
+            )
+            layer = json.loads(path.read_text(encoding="utf-8"))["layers"][0]
+
+        self.assertEqual(layer["shape_tyx"], [2, 3, 4])
+        self.assertEqual(layer["recomposition_op"], "select")
+        self.assertEqual(layer["metadata"]["artifact_path"], str(published))
+        self.assertEqual(layer["metadata"]["artifact_sha256"], digest)
+        self.assertEqual(layer["metadata"]["requested"], {"keep_objects": 1})
+        self.assertFalse(hasattr(artifact, "volume"))
 
 
 if __name__ == "__main__":

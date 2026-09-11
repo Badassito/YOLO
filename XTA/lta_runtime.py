@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence, Tuple
 import uuid
+import time
 
 from .lta_config import LtaConfig
 from .lta_inputs import (
@@ -575,13 +576,16 @@ def run(config: LtaConfig, *, argv: Sequence[str] | None = None) -> object:
         command = launch.command
     else:
         command = mode_arguments
+    print("LTA phase: input discovery and run planning (GPU workers have not started)", flush=True)
+    planning_started = time.monotonic()
     plan = build_lta_run_plan(config, argv=command)
     runtime_view_count = sum(len(volume.runtime_views) for volume in plan.volumes)
     print(
         "LTA preflight complete: "
         f"volumes={len(plan.volumes)}, runtime_views={runtime_view_count}, "
         f"positive_exemplars={len(plan.discovery.positive_pool)}, "
-        f"devices={list(plan.device_ids)}"
+        f"devices={list(plan.device_ids)}, planning_seconds={time.monotonic() - planning_started:.3f}",
+        flush=True,
     )
     # Deferred import avoids a runtime/execution module cycle during CLI discovery.
     from .lta_execution import execute_lta_plan

@@ -3,7 +3,7 @@
 XTA provides test-time augmentation (TTA), pretraining augmentation (PTA), and
 label-time augmentation (LTA) for volumes. The implementation lives in the
 importable `XTA` package. The versioned launcher
-`GPT-6-Astra-Ultra_v21.0.6_SLURM.py`, installed `xta` command, and `python -m XTA`
+`GPT-6-Astra-Ultra_v21.1.0_SLURM.py`, installed `xta` command, and `python -m XTA`
 all enter `XTA.cli.run()`.
 
 This document describes implemented behavior, ownership, and operating controls.
@@ -54,8 +54,8 @@ All module names below are relative to `XTA`.
 | PTA execution | `pta_rendering`, `pta_workers`, `pta_publication`: render plans/caches, process/shared-memory ownership, and atomic image/label publication |
 | LTA planning | `lta_inputs`, `lta_runtime`, `lta_scheduler`: annotation discovery, prompt ranking, physical-view/device ownership, and session admission |
 | LTA model boundary | `lta_sam`, `lta_experimental`: local SAM provenance, runtime-neutral result contracts, and pinned authoritative-mask tracker integration |
-| LTA propagation | `lta_propagation`, `lta_windows`, `lta_tiles`, `lta_tile_tracking`, `lta_tracklets`: temporal windows, spatial relay, lineage matching, and authoritative handoff |
-| LTA execution/output | `lta_execution`, `lta_workers`, `lta_worker_adapter`, `lta_rendering`, `lta_postprocessing`, `lta_outputs`: persistent GPU workers, relay convergence, one-time backprojection, and final publication |
+| LTA propagation | `lta_propagation`, `lta_windows`, `lta_tiles`, `lta_tile_tracking`, `lta_relay_episodes`, `lta_tracklets`: temporal windows, spatial relay, lineage matching, and authoritative handoff |
+| LTA execution/output | `lta_execution`, `lta_workers`, `lta_worker_adapter`, `lta_cpu`, `lta_telemetry`, `lta_rendering`, `lta_union_artifacts`, `lta_postprocessing`, `lta_outputs`: persistent GPU workers, allocation-aware CPU budgets, phase traces, sparse mask transport, relay convergence, one-time backprojection, and final publication |
 | Optional accelerators | `experimental_features`, `intel_compression`, `intel_dsa`, `nvtiff_backend`: feature admission and hardware-specific lifecycle boundaries |
 
 ## Shared geometry and rendering
@@ -483,12 +483,80 @@ immutable rendered cache and sole backprojection ownership. Idle devices can
 assist unopened sessions using that cache; a live session stays on its original
 device. Results commit in plan order.
 
-Sessions span exactly 30 frames and admit at most 128 objects. Seed groups are
+Production helpers take the earliest ready windows. Each selected device keeps
+one task slot for a single existing SAM window of at most 30 frames. Verified
+boundary seeds unlock the next window; a center window unlocks backward and
+forward continuations independently. A live tracker session stays on one GPU;
+the next fresh session can run on another. Blocked dependencies stay outside
+ready queues. An empty boundary cancels only its dependent branch. Generation
+counts and an ordered commit cursor avoid rescanning the entire work history.
+
+Workers retain at most one window's dense union and publish only nonempty,
+tightly cropped frames as little-endian row-packed bits. Omitted frames mean
+zero. Hashing and consumption scale with stored support, not the full source
+depth. The coordinator verifies the packet, ORs only its indexed crops into the
+private view, removes it, and admits more work. Compact audit records still
+commit in plan order. Cross-window relay episodes merge at the original chain
+boundary; window seams do not create additional spatial seeds. Complete relay
+generation fan-in remains necessary because seeding merged arrivals and unioning
+separately propagated arrivals are not equivalent operations.
+
+Input discovery reports its active scan, probe, and exemplar identity stages.
+Video frame counts use declared metadata when available; FFV1 inputs without a
+declared count use a packet scan, while other codecs retain a decoded-frame
+fallback. Frame counts are never estimated from duration and rate. LTA verifies
+the count against EOF during source-cache decoding, rejecting both missing and
+extra frames, with concurrent stderr draining to prevent pipe deadlocks.
+
+Preflight checks scratch and output filesystem capacity,
+combining reservations when they share a filesystem, and includes the unfiltered,
+requested filter-stage, and final NRRDs. Relay growth and optional media remain
+additional storage consumers.
+
+CPU budgets intersect process affinity with Slurm CPU limits and divide native
+threads across selected GPU workers, capped at four per worker while respecting
+an inherited lower limit. Child environment limits apply before adapter imports;
+Torch and OpenCV limits are set before model construction. Parent native pools
+are scoped to one thread while explicit LTA CPU parallelism uses the effective
+allocation. Original parent settings are restored on exit. An explicitly empty
+`--temp` value is rejected so an unset scratch variable cannot select output
+storage unintentionally.
+The unique `lta_<run-id>` scratch directory is created after discovery, planning,
+and capacity preflight; its creation and resolved path are printed immediately.
+
+`lta_execution_identity.json` records the actual source fingerprint and execution
+contract, including the resolved scratch directory. Per-process JSONL traces under `lta_diagnostics` identify decode,
+planning, startup, queue waits, rendering, SAM sessions, sparse reduction, and
+relay work. The coordinator reports ready, blocked, and active window counts;
+an impossible blocked graph fails with diagnostics instead of spinning.
+`tools/lta_trace_summary.py` summarizes these host phases, including unfinished
+phases in an ongoing or interrupted run. Host phase time is not CUDA kernel time.
+
+Sessions span at most 30 frames and admit at most 128 objects. Seed groups are
 partitioned deterministically. Authoritative masks, temporal dogfood, and lineage
 identity travel through explicit session contracts. Tracker confidence uses the
 sigmoid framewise score; removal sentinels represent bookkeeping. Filled
-predictions stream into file-backed union and bit-packed relay reducers, while
+predictions stream into bounded window unions and bit-packed relay reducers, while
 boundary dogfood and compact audit state remain resident.
+
+The pinned single-rank SAM 3.1 mask tracker prepares visual features without
+running unused grounding detection. `lta_tracker_features` preserves both tracker
+necks, all six FPN levels, positional encodings, the original BF16 conversion
+before decoder projections, and the inherited autocast context. Unsupported
+custom or distributed model layouts retain their original preparation path;
+failures inside the supported path propagate. Per-session receipts and the final
+worker audit count direct feature preparations and fallbacks. Installed SAM source
+remains unchanged. Mask batches and score/sentinel/finite-check vectors cross to
+the CPU together, while masks retain independent ownership. LTA uses TTA's exact
+foreground-bbox plus halo hole fill to reduce per-instance CPU work.
+
+Every authoritative anchor starts a separate chain across the full physical-view
+frame range. Fixed-size center, backward, and forward windows preserve lineages
+across later partially annotated anchors; another annotation does not terminate
+an existing object. Initial chains combine by recall union. A temporal branch
+stops when its shared boundary has no eligible seed, so recovery through an empty
+dogfood boundary remains unsupported. Predictions must match their originating
+sequence, session, and seed raster dimensions before entering any reducer.
 
 Initial, relay, and temporal-dogfood seed groups use deterministic first-fit
 partitioning over their aggregate shared-pixel domain. Every mask must retain at
@@ -496,6 +564,15 @@ least 95% exclusive support within the 128-object session limit; the worker repe
 admission at each window boundary. Conflicting lineages remain distinct and retain
 complete seeds in separate sessions. Mask overlap alone does not establish object
 identity.
+
+Adjacent-anchor identity matching and confidence-based handoff are available in
+`lta_tracklets` and the `tools/lta_tracklet_pair.py` diagnostic. Conservative
+one-to-one assignment preserves unmatched tracklets; split/merge hypotheses are
+audit evidence. The diagnostic restores annotated foreground by OR so partially
+labeled anchor slices retain unmatched objects. Production currently uses recall
+union and records that cross-anchor identity reconciliation is not applied.
+Connecting handoff to production requires retaining per-instance masks and
+probabilities before union and planning spatial relays from the reconciled masks.
 
 SAM seed previews exclude pixels shared by simultaneously injected masks.
 Production validates each representable exclusive mask and its union exactly;
@@ -515,9 +592,17 @@ A bounded breadth-first fixed point settles cross-tile growth. A safety-cap hit
 with pending growth fails publication. Completed predictions collapse in
 physical-view space, receive final 2-D hole filling, backproject once, and enter
 ordered native-union postprocessing. Immutable hard-positive foreground is
-restored after destructive filters. `Global_final_output` and the complete
-manifest are unconditional LTA outputs. Explicit empty annotations are audited
-as known background.
+restored after destructive filters. LTA always saves `Global_union_before_postprocessing`,
+one `Global_after_<filter>` checkpoint for each requested postprocessing operation,
+and `Global_final_output` as NRRDs, even without `--save nrrd`. Full independent
+checkpoints use TTA's `checkpoint`/`select` metadata. The `after_keep_objects`
+checkpoint shows the exact filtered result; final output additionally restores
+original hard-positive annotations, which can reintroduce disconnected components.
+Checkpoint writes are atomic and durable after each stage. Their sidecar preserves
+filter settings and hashes if a later operation fails. Source/model identities are
+validated before the first checkpoint and again before final publication; only the
+complete run manifest marks overall success. Explicit empty annotations are
+audited as known background.
 
 SAM checkpoints and BPE assets are local. Workers verify the pinned distribution,
 commit/source tree, and BPE identity before model construction. The SAM 3.1
@@ -725,7 +810,10 @@ python -m unittest discover -s tests -p test_external_augmentation_examples.py -
 | Intel accelerators | `python tools/intel_accelerator_selftest.py --backend all` |
 | Multi-GPU finalization and IPC | `tools/hgx_selftest.py`, `tools/d1_ipc_selftest.py` |
 | Bounded SAM sessions | `tools/lta_gpu_smoke.py`, `tools/lta_mask_seed_smoke.py`, `tools/lta_tracklet_pair.py` |
-| LTA production execution | `tools/lta_full_volume.py` and LTA worker/execution tests |
+| LTA production execution | `tools/lta_production_smoke.py` and LTA worker/execution tests; `tools/lta_full_volume.py` is a separate diagnostic |
+| LTA worker profiling | `tools/lta_worker_profile.py`: heated GPU, repeated fixed cached fixtures, cProfile, utilization samples, phase times, and exact output hashes |
+| LTA tracker feature parity | `tools/lta_tracker_feature_smoke.py`: compares the original and direct visual-feature paths on the same real frames, requiring exact cached tensors and no fallback |
+| LTA full-depth transport and task graph | `tools/lta_host_io_profile.py`, `tools/lta_host_pipeline_smoke.py`, and `tools/lta_window_gpu_smoke.py`: full logical dimensions, spawned worker/relay protocols, and real single-GPU chain/window parity |
 
 Hardware-backed tests require the target runtime and representative data/models.
 Functional parity, numerical tolerances, and performance are separate checks.

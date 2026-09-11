@@ -40,6 +40,74 @@ def _work(
 
 
 class LtaViewAffinitySchedulerTests(unittest.TestCase):
+    def test_dependencies_unlock_on_completion_before_the_ordered_commit_frontier(self) -> None:
+        work = (
+            _work("slow-root", "alpha", 0),
+            replace(_work("slow-child", "alpha", 1), dependency_work_ids=("slow-root",)),
+            _work("fast-root", "alpha", 2),
+            replace(_work("fast-backward", "alpha", 3), dependency_work_ids=("fast-root",)),
+            replace(_work("fast-forward", "alpha", 4), dependency_work_ids=("fast-root",)),
+        )
+        scheduler = LtaViewAffinityScheduler(work, (0, 1, 2, 3), helper_queue_order="head")
+        scheduler.mark_projection_ready(work[0].view, device_id=0)
+        slow = scheduler.claim(0)
+        fast = scheduler.claim(1)
+        self.assertEqual(fast.work.work_id, "fast-root")
+        self.assertIsNone(scheduler.claim(2))
+        scheduler.complete(fast, "verified seeds")
+        self.assertIsNone(scheduler.claim_committable())
+        backward = scheduler.claim(1)
+        forward = scheduler.claim(2)
+        self.assertEqual((backward.work.work_id, forward.work.work_id), ("fast-backward", "fast-forward"))
+        scheduler.complete(backward, "backward")
+        scheduler.complete(forward, "forward")
+        scheduler.complete(slow, "empty boundary")
+        scheduler.skip_pending("slow-child", "skipped")
+        self.assertEqual([item.work_id for item, _result in scheduler.drain_committable()], [item.work_id for item in work])
+        self.assertTrue(scheduler.generation_settled(work[0].view, 0))
+
+    def test_large_window_graph_keeps_blocked_descendants_out_of_ready_queues(self) -> None:
+        work = []
+        for chain in range(100):
+            for window in range(70):
+                work_id = f"chain-{chain}-window-{window}"
+                item = _work(work_id, "alpha", len(work))
+                if window:
+                    item = replace(item, dependency_work_ids=(f"chain-{chain}-window-{window - 1}",))
+                work.append(item)
+        scheduler = LtaViewAffinityScheduler(work, (0, 1, 2, 3), helper_queue_order="head")
+        scheduler.mark_projection_ready(work[0].view, device_id=0)
+        self.assertEqual(scheduler.queue_counts(), {"ready": 100, "blocked": 6900, "active": 0, "completed_awaiting_commit": 0})
+        self.assertEqual(sum(len(queue) for queue in scheduler._queues.values()), 100)
+        first = scheduler.claim(0)
+        scheduler.complete(first, "boundary")
+        self.assertEqual(scheduler.queue_counts()["ready"], 100)
+        self.assertEqual(scheduler.queue_counts()["blocked"], 6899)
+        scheduler.drain_committable()
+        self.assertEqual(scheduler._commit_cursor, 1)
+
+    def test_invalid_window_dependency_graphs_fail_before_scheduling(self) -> None:
+        root = _work("root", "alpha", 0)
+        with self.assertRaisesRegex(ValueError, "unknown LTA work dependency"):
+            LtaViewAffinityScheduler((replace(root, dependency_work_ids=("missing",)),), (0,))
+        with self.assertRaisesRegex(ValueError, "must precede"):
+            LtaViewAffinityScheduler((replace(root, dependency_work_ids=("child",)), _work("child", "alpha", 1)), (0,))
+
+    def test_head_assistance_claims_the_next_prefix_without_changing_default_tail_order(self) -> None:
+        work = tuple(_work(f"work-{index}", "alpha", index) for index in range(8))
+        for helper_order, expected in (("head", [0, 1, 2, 3]), ("tail", [0, 7, 6, 5])):
+            with self.subTest(helper_order=helper_order):
+                scheduler = LtaViewAffinityScheduler(
+                    work, (0, 1, 2, 3), helper_queue_order=helper_order,
+                )
+                scheduler.mark_projection_ready(work[0].view, device_id=0)
+                claims = tuple(scheduler.claim(device) for device in (0, 1, 2, 3))
+                self.assertEqual([claim.work.plan_order for claim in claims], expected)
+                self.assertEqual([claim.tail_assist for claim in claims], [False, True, True, True])
+                self.assertTrue(all(claim.owner_device_id == 0 for claim in claims))
+        with self.assertRaisesRegex(ValueError, "helper_queue_order"):
+            LtaViewAffinityScheduler(work, (0,), helper_queue_order="random")
+
     def test_whole_view_ownership_is_balanced_and_deterministic(self) -> None:
         work = (
             _work("alpha-0", "alpha", 0, cost=4.0, session_index=0),

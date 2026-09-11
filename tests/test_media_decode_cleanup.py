@@ -30,7 +30,8 @@ class _Progress:
 
 
 class Gray8DecodeCleanupTests(unittest.TestCase):
-    def _run_decode(self, *, streaming, byte_count=12, exit_code=0, stderr_bytes=256 * 1024):
+    def _run_decode(self, *, streaming, byte_count=12, exit_code=0, stderr_bytes=256 * 1024,
+                    strict_frame_count=False):
         """Use the actual host subprocess pipe implementation without FFmpeg/files."""
         spawned = []
         thread_errors = []
@@ -38,7 +39,7 @@ class Gray8DecodeCleanupTests(unittest.TestCase):
         original_popen = subprocess.Popen
         child = (
             'import sys; '
-            f'sys.stdout.buffer.write(bytes(range({byte_count}))); sys.stdout.buffer.flush(); '
+            f'sys.stdout.buffer.write(bytes(i % 256 for i in range({byte_count}))); sys.stdout.buffer.flush(); '
             f'sys.stderr.buffer.write(b"decode-diagnostic:" + b"x" * {stderr_bytes}); '
             f'sys.stderr.buffer.flush(); sys.exit({exit_code})'
         )
@@ -46,6 +47,8 @@ class Gray8DecodeCleanupTests(unittest.TestCase):
         def spawn_ffmpeg_replacement(command, **kwargs):
             self.assertEqual(command[0], 'ffmpeg')
             self.assertEqual(command[-1], '-')
+            if strict_frame_count:
+                self.assertEqual(command[command.index('-map') + 1], '0:v:0')
             process = original_popen([sys.executable, '-B', '-c', child], **kwargs)
             spawned.append((process, process.stdout, process.stderr))
             return process
@@ -68,7 +71,8 @@ class Gray8DecodeCleanupTests(unittest.TestCase):
             decoder = media.decode_video_to_memmap_gray8_streaming if streaming else media.decode_video_to_memmap_gray8
             try:
                 result = decoder(Path('unused-input.mkv'), Path('unused-output.dat'),
-                                 num_frames=2, width=3, height=2, overwrite=True)
+                                 num_frames=2, width=3, height=2, overwrite=True,
+                                 **({'strict_frame_count': strict_frame_count} if not streaming else {}))
                 if streaming:
                     readiness = media.volume_readiness(result)
                     producer_targets[0]()
@@ -92,6 +96,30 @@ class Gray8DecodeCleanupTests(unittest.TestCase):
         self.assertTrue(stdout.closed)
         self.assertTrue(stderr.closed)
         return result, error, readiness, process.returncode
+
+    def test_strict_count_reaches_eof_while_draining_large_stderr(self):
+        result, error, _, code = self._run_decode(streaming=False, strict_frame_count=True)
+        self.assertIsNone(error)
+        self.assertEqual(code, 0)
+        np.testing.assert_array_equal(result, np.arange(12, dtype=np.uint8).reshape(2, 2, 3))
+
+    def test_strict_count_rejects_extra_output_even_when_ffmpeg_exits_successfully(self):
+        _, error, _, code = self._run_decode(
+            streaming=False, strict_frame_count=True, byte_count=18)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn('Frame count mismatch', str(error))
+
+    def test_strict_count_preserves_mismatch_when_broken_pipe_terminates_decoder(self):
+        _, error, _, code = self._run_decode(
+            streaming=False, strict_frame_count=True, byte_count=1024 * 1024)
+        self.assertNotEqual(code, 0)
+        self.assertIn('Frame count mismatch', str(error))
+
+    def test_strict_count_rejects_short_output(self):
+        _, error, _, _ = self._run_decode(
+            streaming=False, strict_frame_count=True, byte_count=6)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn('Unexpected EOF', str(error))
 
     def test_plain_and_streaming_decode_preserve_gray8_bytes_and_drain_large_stderr(self):
         for streaming in (False, True):

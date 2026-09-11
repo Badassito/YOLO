@@ -37,6 +37,7 @@ from pathlib import Path
 # Captured at module import, rather than at factory execution, so tests prove
 # the worker narrowed visibility before it imported the adapter.
 IMPORTED_VISIBLE_DEVICE = os.environ.get("CUDA_VISIBLE_DEVICES")
+IMPORTED_OMP_THREADS = os.environ.get("OMP_NUM_THREADS")
 
 
 def _append_log(path, value):
@@ -61,6 +62,8 @@ def build_predictor(config):
             "pid": state["pid"],
             "import_visible": IMPORTED_VISIBLE_DEVICE,
             "current_visible": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "import_omp_threads": IMPORTED_OMP_THREADS,
+            "current_mkl_threads": os.environ.get("MKL_NUM_THREADS"),
         },
     )
     return state
@@ -180,6 +183,26 @@ def _read_log(path: Path) -> list[dict[str, object]]:
 
 
 class LtaWorkerContractTests(unittest.TestCase):
+    def test_cpu_budget_is_bound_before_import_without_modifying_parent_environment(self) -> None:
+        with _fake_adapter() as (module_name, root, log_path):
+            with mock.patch.dict(os.environ, {
+                "SLURM_CPUS_PER_TASK": "8", "OMP_NUM_THREADS": "64", "MKL_NUM_THREADS": "64",
+            }):
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                before = dict(os.environ)
+                pool = LtaWorkerPool((0, 1, 2, 3), _init(module_name, log_path), startup_timeout=10)
+                try:
+                    self.assertEqual(dict(os.environ), before)
+                    self.assertEqual(pool.cpu_budget["effective_cpu_count"], 8)
+                    self.assertEqual(pool.cpu_budget["threads_per_worker"], 1)
+                    self.assertTrue(all(event.metadata["cpu_budget"] == pool.cpu_budget for event in pool.ready_events))
+                finally:
+                    pool.shutdown(timeout=5)
+            factories = [item for item in _read_log(log_path) if item["event"] == "factory"]
+            self.assertEqual(len(factories), 4)
+            self.assertTrue(all(item["import_omp_threads"] == "1" for item in factories))
+            self.assertTrue(all(item["current_mkl_threads"] == "1" for item in factories))
+
     def test_init_and_task_are_detached_primitive_spawn_payloads(self) -> None:
         config = {"nested": {"values": [1, 2]}}
         payload = {"box": [1, 2, 3, 4]}

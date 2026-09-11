@@ -11659,5 +11659,73 @@
       }
     ],
     "complete_modules": []
+  },
+  "v21_1_review": {
+    "release": "21.1.0",
+    "previous_review_sha256": "fc3c2ca5ab0af6257ee9b4fd3b4bf9f66a9c669007a87377a9d7d47cb13858c7",
+    "definitions": [
+      {
+        "module": "lta_config",
+        "name": "build_lta_argparser",
+        "previous_sha256": "02b48d5eaef8be07beebf7811de90390c69df4b0239b7df6a4c551d5b35ee758",
+        "sha256": "c732b6f3386a50c69814b7abbd4f07b43da9970229efb3d21d6eccd67c80b976",
+        "reason": "Document mandatory durable LTA tile-union and requested postprocessing NRRD checkpoints, distinguishing filter snapshots from final hard-positive restoration."
+      },
+      {
+        "module": "lta_config",
+        "name": "resolve_lta_config",
+        "previous_sha256": "3aee2bd37416d62277a1f84999a8a6fd9aa6a633c2c50e95c99339fa524146ee",
+        "sha256": "00c1d012e263eb8c4ebb3d50411ea72146b67a2a79c5f2b6cfefa041b55c1384",
+        "reason": "Reject explicitly empty LTA scratch paths so an unset scheduler environment variable cannot silently select output storage."
+      },
+      {
+        "module": "media",
+        "name": "decode_video_to_memmap_gray8",
+        "previous_sha256": "db9759b60298cd9f89ae3ccb11e6279f4b714ce63a0e542a195c19623d5c34d6",
+        "sha256": "1f3f1266971d335337fd0254f7e1ccc863949dc55fef6c0fe129babb0fba06e9",
+        "reason": "Verify the exact LTA frame count at decode EOF, select the probed video stream, drain stderr concurrently, and close failed scratch mappings; strict validation remains opt-in for shared callers."
+      }
+    ],
+    "statements": [
+      {
+        "module": "__init__",
+        "label": "Assign:7",
+        "previous_sha256": "941ba461fa8a41e1db48716bc935c87acea8b0ee04b6f4206bc996e4ba3555fc",
+        "sha256": "167b89be9283bae80a83ce63513d38a2a7e1341a653e98cad2569ac531904c84",
+        "reason": "Align runtime and sole launcher identity with the v21.1.0 LTA development release."
+      },
+      {
+        "module": "cli",
+        "label": "Assign:13",
+        "previous_sha256": "15e5ca720145a87aa609471697f026f1fb92d8cbdd2b96f0f3a3db207f58530e",
+        "sha256": "1ebf99fca86110c093618350b1a4ccb0ffad27d2f49ed774298af1ba810b6632",
+        "reason": "Align runtime and sole launcher identity with the v21.1.0 LTA development release."
+      },
+      {
+        "module": "cli",
+        "label": "Assign:14",
+        "previous_sha256": "48a1a4ab3b932b76e7326224ac34e6486073a353b1cf86b13deb618a2d6eda41",
+        "sha256": "09032c9a55caf906ab5901004d6e0ac2727392897d80fd5a1be78af11070afd8",
+        "reason": "Align runtime and sole launcher identity with the v21.1.0 LTA development release."
+      },
+      {
+        "module": "config",
+        "label": "Assign:22",
+        "previous_sha256": "15e5ca720145a87aa609471697f026f1fb92d8cbdd2b96f0f3a3db207f58530e",
+        "sha256": "1ebf99fca86110c093618350b1a4ccb0ffad27d2f49ed774298af1ba810b6632",
+        "reason": "Align runtime and sole launcher identity with the v21.1.0 LTA development release."
+      },
+      {
+        "module": "config",
+        "label": "Assign:24",
+        "previous_sha256": "44fdf7a07789747409f4a5be074b800429276e1b95eea3c09448783604ec266d",
+        "sha256": "3592ee891eba7742f9a99c1fe588607e2846e3006506bfbc34bb74bb023d716e",
+        "reason": "Align runtime and sole launcher identity with the v21.1.0 LTA development release."
+      }
+    ],
+    "local_import_seam_updates": [],
+    "preserved_radial_definition_updates": [],
+    "preserved_radial_module_updates": [],
+    "complete_modules": []
   }
 }

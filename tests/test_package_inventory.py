@@ -31,6 +31,31 @@ def inspect_seams(source: str):
 
 
 class PackageInventoryTests(unittest.TestCase):
+    def test_lta_release_authenticates_runtime_version_bindings(self) -> None:
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        manifest['v21_1_review']['statements'][0]['sha256'] = '0' * 64
+        with self.assertRaisesRegex(RuntimeError, 'v21.1.0 review digest mismatch'):
+            inventory.reviewed_v21_1_contract(
+                manifest, manifest['v21_review'],
+                *(manifest[f'v21_0_{i}_review'] for i in range(1, 7)),
+            )
+
+    def test_lta_release_requires_latest_version_predecessor(self) -> None:
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        review = manifest['v21_1_review']
+        review['statements'][0]['previous_sha256'] = '0' * 64
+        authenticated = hashlib.sha256(json.dumps(
+            review, sort_keys=True, separators=(',', ':'),
+        ).encode()).hexdigest()
+        with mock.patch.object(inventory, 'REVIEWED_V21_1_SHA256', authenticated):
+            with self.assertRaisesRegex(
+                RuntimeError, 'v21.1.0 supersession does not match its historical pin',
+            ):
+                inventory.reviewed_v21_1_contract(
+                    manifest, manifest['v21_review'],
+                    *(manifest[f'v21_0_{i}_review'] for i in range(1, 7)),
+                )
+
     def test_release_authenticates_upload_and_observability(self) -> None:
         for category, target in (
             ('definitions', 'RadialCudaProjector'),

@@ -16,7 +16,7 @@ from XTA.unification.context import current_unified_launch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LAUNCHER = ROOT / "GPT-6-Astra-Ultra_v21.0.6_SLURM.py"
+LAUNCHER = ROOT / "GPT-6-Astra-Ultra_v21.1.0_SLURM.py"
 
 
 class CliTests(unittest.TestCase):
@@ -40,7 +40,7 @@ class CliTests(unittest.TestCase):
 
         completed = self.run_python(str(LAUNCHER), "--version")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("21.0.6", completed.stdout)
+        self.assertIn("21.1.0", completed.stdout)
 
         for mode in ("tta", "pta", "lta"):
             with self.subTest(mode_version=mode):
@@ -48,7 +48,7 @@ class CliTests(unittest.TestCase):
                     str(LAUNCHER), "--mode", mode, "--version"
                 )
                 self.assertEqual(completed.returncode, 0, completed.stdout)
-                self.assertIn("21.0.6", completed.stdout)
+                self.assertIn("21.1.0", completed.stdout)
 
         program = (
             "import sys; import XTA.cli; "

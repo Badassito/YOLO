@@ -276,6 +276,10 @@ class LtaExperimentalTrackerTests(unittest.TestCase):
             float64 = np.float64
 
             @staticmethod
+            def stack(values):
+                return Tensor(np.stack([value.values for value in values]))
+
+            @staticmethod
             def is_floating_point(value):
                 return np.issubdtype(value.values.dtype, np.floating)
 

@@ -12,6 +12,7 @@ import gc
 import hashlib
 import json
 import os
+import time
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -25,6 +26,8 @@ class LtaSamWorkerContext:
     torch_module: object
     restore_sdpa: object | None
     constrained_batches: Mapping[str, object] | None
+    cpu_budget: Mapping[str, object] | None = None
+    trace_root: str | None = None
 
 
 def _sha256_file(path: Path) -> str:
@@ -62,6 +65,11 @@ def build_worker_predictor(config: Mapping[str, object]) -> LtaSamWorkerContext:
     """Build SAM 3.1 exactly once after worker-local CUDA binding."""
 
     import torch
+    import cv2
+
+    from .lta_cpu import configure_worker_runtime_threads
+
+    cpu_budget = configure_worker_runtime_threads(torch, cv2_module=cv2)
 
     from .lta_sam import (
         LTA_MAX_NUM_OBJECTS,
@@ -113,6 +121,8 @@ def build_worker_predictor(config: Mapping[str, object]) -> LtaSamWorkerContext:
         torch_module=torch,
         restore_sdpa=restore_sdpa,
         constrained_batches=constrained,
+        cpu_budget=cpu_budget,
+        trace_root=(None if config.get("worker_trace_root") is None else str(config["worker_trace_root"])),
     )
 
 
@@ -421,7 +431,27 @@ def execute_worker_task(
     kind: str,
     payload: Mapping[str, object],
 ) -> Mapping[str, object]:
-    if str(kind) != "propagation_chain":
+    from .lta_telemetry import LtaExecutionTrace
+
+    trace = LtaExecutionTrace(
+        payload.get("worker_trace_root", getattr(context, "trace_root", None)),
+        f"adapter_gpu{os.environ.get('LTA_EXECUTION_DEVICE_ID', 'unknown')}",
+    )
+    try:
+        return _execute_worker_task_impl(context, kind, payload, trace=trace)
+    finally:
+        trace.close()
+
+
+def _execute_worker_task_impl(
+    context: LtaSamWorkerContext,
+    kind: str,
+    payload: Mapping[str, object],
+    *,
+    trace: object,
+) -> Mapping[str, object]:
+    window_task = str(kind) == "propagation_window"
+    if str(kind) not in {"propagation_chain", "propagation_window"}:
         raise ValueError(f"unsupported production LTA worker task kind {kind!r}")
 
     import numpy as np
@@ -433,10 +463,13 @@ def execute_worker_task(
         partition_mask_seed_sessions,
         read_seed_artifact,
         run_mask_injected_session,
+        write_seed_artifact,
     )
+    from .lta_relay_episodes import write_relay_observations
     from .lta_rendering import LtaPhysicalViewCacheRef, render_native_tile_window
     from .lta_sam import LTA_MAX_NUM_OBJECTS, SamSessionPlan
     from .lta_windows import owned_frame_range
+    from .lta_union_artifacts import LtaUnionWriter
 
     output_dir = Path(str(payload["output_dir"])).resolve(strict=False)
     output_dir.mkdir(parents=True, exist_ok=False)
@@ -460,6 +493,13 @@ def execute_worker_task(
     )
     if not windows:
         raise ValueError("a propagation-chain task requires at least one window")
+    if window_task:
+        if len(windows) != 1:
+            raise ValueError("a propagation-window task requires exactly one window")
+        if (frame_start, frame_stop) != owned_frame_range(windows[0]):
+            raise ValueError("a propagation-window output range must match its owned frames")
+        if not str(payload.get("chain_work_id", "")).strip():
+            raise ValueError("a propagation-window task requires its original chain_work_id")
     initial_seeds = read_seed_artifact(
         str(payload["seed_artifact_path"]),
         expected_sha256=str(payload["seed_artifact_sha256"]),
@@ -474,19 +514,15 @@ def execute_worker_task(
         for item in payload.get("neighbors", ())  # type: ignore[union-attr]
     )
     union_shape = (frame_stop - frame_start, source_tile.size, source_tile.size)
-    union_path = output_dir / "union.uint8.raw"
-    union_stage = output_dir / ".union.uint8.raw.partial"
-    union = np.memmap(
-        union_stage,
-        dtype=np.uint8,
-        mode="w+",
-        shape=union_shape,
+    union_writer = LtaUnionWriter(
+        output_dir / "union.pack", shape=union_shape, frame_start=frame_start,
     )
     try:
         seed_by_lineage = {seed.lineage: seed for seed in initial_seeds}
         boundary_seeds: dict[int, tuple[object, ...]] = {
             int(initial_seeds[0].frame_index): tuple(initial_seeds)
         }
+        outbound_dogfood: dict[int, list[object]] = {}
         observations: dict[tuple[str, int], dict[str, object]] = {}
         active_frames_by_lineage: dict[str, set[int]] = {}
         receipts: list[dict[str, object]] = []
@@ -512,18 +548,25 @@ def execute_worker_task(
             # The production wrapper hole-fills immediately before injection.
             # Partition on that same geometry so filling cannot introduce an
             # overlap conflict after the planning-time check.
-            seed_partitions = partition_mask_seed_sessions(
-                seeds,
-                mask_transform=fill_binary_mask_holes_2d,
-            )
-            resource = render_native_tile_window(
-                cache_ref,
-                frame_start=window.frame_start,
-                frame_stop=window.frame_stop,
-                tile_xyxy=source_tile.xyxy,
-            )
+            with trace.phase("seed_partition", work_id=str(payload["work_id"]), window_index=window_index):
+                seed_partitions = partition_mask_seed_sessions(
+                    seeds,
+                    mask_transform=fill_binary_mask_holes_2d,
+                )
+            with trace.phase("render_window", work_id=str(payload["work_id"]), window_index=window_index):
+                resource = render_native_tile_window(
+                    cache_ref,
+                    frame_start=window.frame_start,
+                    frame_stop=window.frame_stop,
+                    tile_xyxy=source_tile.xyxy,
+                )
             seed_by_lineage.update({seed.lineage: seed for seed in seeds})
             reduced_prediction_keys: set[tuple[str, int, int]] = set()
+            owned_start, owned_stop = owned_frame_range(window)
+            window_union = np.zeros(
+                (owned_stop - owned_start, source_tile.size, source_tile.size),
+                dtype=np.uint8,
+            )
 
             def reduce_prediction(item: Any) -> None:
                 prediction = item.prediction
@@ -538,7 +581,7 @@ def execute_worker_task(
                 if bool(np.asarray(prediction.binary_mask, dtype=np.bool_).any()):
                     active_frames_by_lineage.setdefault(key[0], set()).add(key[1])
                 if owned_start <= prediction.frame_index < owned_stop:
-                    union[prediction.frame_index - frame_start] |= np.asarray(
+                    window_union[prediction.frame_index - owned_start] |= np.asarray(
                         prediction.binary_mask,
                         dtype=np.uint8,
                     )
@@ -552,7 +595,6 @@ def execute_worker_task(
                     min_probability=relay_min_probability,
                 )
 
-            owned_start, owned_stop = owned_frame_range(window)
             partition_count = len(seed_partitions)
             for partition_index, partition_seeds in enumerate(seed_partitions):
                 current_session_index = tracker_session_index
@@ -580,14 +622,23 @@ def execute_worker_task(
                     relay_generation=generation,
                 )
                 try:
-                    result = run_mask_injected_session(
-                        context.predictor,
-                        context.predictor,
-                        resource=resource,
-                        request=request,
-                        prediction_callback=reduce_prediction,
-                        retain_predictions=False,
-                    )
+                    session_started = time.monotonic()
+                    with trace.phase(
+                        "sam_session", work_id=str(payload["work_id"]),
+                        window_index=window_index, partition_index=partition_index,
+                        frame_start=window.frame_start, frame_stop=window.frame_stop,
+                        prompt_frame=window.prompt_frame, direction=window.direction,
+                        seed_count=len(partition_seeds),
+                    ):
+                        result = run_mask_injected_session(
+                            context.predictor,
+                            context.predictor,
+                            resource=resource,
+                            request=request,
+                            prediction_callback=reduce_prediction,
+                            retain_predictions=False,
+                        )
+                    session_wall_seconds = time.monotonic() - session_started
                 except RuntimeError as exc:
                     seed_context = [
                         {
@@ -628,6 +679,8 @@ def execute_worker_task(
                         seed,
                     )
                     seed_by_lineage[seed.lineage] = seed
+                    if window_task:
+                        outbound_dogfood.setdefault(seed.frame_index, []).append(seed)
                 receipts.append(
                     {
                         "window": _jsonable(asdict(window)),
@@ -635,6 +688,8 @@ def execute_worker_task(
                         "seed_partition_index": partition_index,
                         "seed_partition_count": partition_count,
                         "seed_count": len(partition_seeds),
+                        "wall_seconds": session_wall_seconds,
+                        "wall_time_semantics": "host wall time including tracker and synchronous prediction reduction",
                         "prediction_count": int(
                             result.adapter_receipt.get(
                                 "canonical_prediction_count",
@@ -647,39 +702,46 @@ def execute_worker_task(
                         "adapter": _jsonable(result.adapter_receipt),
                     }
                 )
+            with trace.phase("union_chunk_pack", work_id=str(payload["work_id"]), window_index=window_index):
+                union_writer.append_chunk(owned_start, window_union)
+            window_union = None
             resource = None
             gc.collect()
     except BaseException:
-        try:
-            union.flush()
-        finally:
-            mmap_obj = getattr(union, "_mmap", None)
-            if mmap_obj is not None:
-                mmap_obj.close()
-            union_stage.unlink(missing_ok=True)
+        union_writer.abort()
         raise
 
-    union.flush()
-    foreground_pixels = int(np.count_nonzero(union))
-    mmap_obj = getattr(union, "_mmap", None)
-    if mmap_obj is not None:
-        mmap_obj.close()
-    os.replace(union_stage, union_path)
-    union_receipt = {
-        "path": str(union_path.resolve()),
-        "sha256": _sha256_file(union_path),
-        "size_bytes": int(union_path.stat().st_size),
-        "shape": list(union_shape),
-        "dtype": "uint8",
-    }
-    relay_records = _write_relay_artifacts(
-        observations,
-        output_dir=output_dir,
-        source_tile_index=tile_index,
-        generation=generation,
-    )
+    with trace.phase("union_finish", work_id=str(payload["work_id"])):
+        union_receipt = union_writer.finish()
+    foreground_pixels = int(union_receipt["foreground_pixels"])
+    dogfood_seed_artifacts = []
+    if window_task:
+        relay_records = []
+        with trace.phase("relay_observation_artifact", work_id=str(payload["work_id"])):
+            observation_artifact = write_relay_observations(output_dir, observations)
+        with trace.phase("dogfood_seed_artifacts", work_id=str(payload["work_id"])):
+            for frame_index, seeds in sorted(outbound_dogfood.items()):
+                artifact = write_seed_artifact(
+                    output_dir / "dogfood" / f"frame-{frame_index:06d}.npz",
+                    tuple(sorted(seeds, key=lambda seed: seed.object_id)),
+                )
+                dogfood_seed_artifacts.append({
+                    "frame_index": int(frame_index), "path": str(artifact.path),
+                    "sha256": artifact.sha256, "seed_count": artifact.seed_count,
+                })
+    else:
+        with trace.phase("spatial_relay_artifacts", work_id=str(payload["work_id"])):
+            relay_records = _write_relay_artifacts(
+                observations,
+                output_dir=output_dir,
+                source_tile_index=tile_index,
+                generation=generation,
+            )
+        observation_artifact = None
     manifest = {
         "schema": "lta.propagation-chain/1",
+        "task_granularity": "window" if window_task else "chain",
+        "chain_work_id": str(payload.get("chain_work_id", payload["work_id"])),
         "status": "complete",
         "work_id": str(payload["work_id"]),
         "sequence_id": str(payload["sequence_id"]),
@@ -689,6 +751,8 @@ def execute_worker_task(
         "output_frame_range": [frame_start, frame_stop],
         "union": union_receipt,
         "relays": relay_records,
+        "dogfood_seed_artifacts": dogfood_seed_artifacts,
+        "relay_observation_artifact": observation_artifact,
         "lineage_active_frame_ranges": {
             lineage: _half_open_frame_ranges(frames)
             for lineage, frames in sorted(active_frames_by_lineage.items())
@@ -708,8 +772,11 @@ def execute_worker_task(
         "profile": _jsonable(context.profile),
         "sam_runtime": _jsonable(context.sam_runtime),
         "constrained_batches": _jsonable(context.constrained_batches),
+        "cpu_budget": _jsonable(getattr(context, "cpu_budget", None)),
         "foreground_pixels": foreground_pixels,
     }
+    if window_task:
+        manifest["window"] = _jsonable(asdict(windows[0]))
     from .lta_outputs import write_json_atomically
 
     manifest_path = write_json_atomically(output_dir / "manifest.json", manifest)

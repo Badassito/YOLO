@@ -57,6 +57,65 @@ class LtaArtifactReceipt:
 
 
 @dataclass(frozen=True)
+class LtaCheckpointArtifact:
+    """Immutable publication metadata for a saved, complete NRRD checkpoint.
+
+    The serialized artifact owns its snapshot.  No reference to the mutable
+    filter workspace is retained after the synchronous writer returns.
+    """
+
+    layer_id: str
+    stage: str
+    shape_tyx: tuple[int, int, int]
+    foreground_voxels: int
+    receipt: LtaArtifactReceipt
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        shape = tuple(int(value) for value in self.shape_tyx)
+        if len(shape) != 3 or any(value < 1 for value in shape):
+            raise ValueError("checkpoint shape_tyx must contain three positive dimensions")
+        foreground = int(self.foreground_voxels)
+        if foreground < 0 or foreground > shape[0] * shape[1] * shape[2]:
+            raise ValueError("checkpoint foreground count is outside its shape")
+        for name in ("layer_id", "stage"):
+            value = str(getattr(self, name)).strip()
+            if not value:
+                raise ValueError(f"checkpoint {name} must not be empty")
+            object.__setattr__(self, name, value)
+        if not isinstance(self.receipt, LtaArtifactReceipt):
+            raise TypeError("checkpoint receipt must be an LtaArtifactReceipt")
+        object.__setattr__(self, "shape_tyx", shape)
+        object.__setattr__(self, "foreground_voxels", foreground)
+        object.__setattr__(self, "metadata", dict(self.metadata))
+
+    def manifest_record(self) -> dict[str, object]:
+        return {
+            "layer_id": self.layer_id,
+            "source_role": "global_postprocessing_checkpoint",
+            "layer_role": "checkpoint",
+            "recomposition_op": "select",
+            "stage": self.stage,
+            "shape_tyx": list(self.shape_tyx),
+            "foreground_voxels": self.foreground_voxels,
+            "empty_union": self.foreground_voxels == 0,
+            "artifact_name": self.receipt.name,
+            "path": str(self.receipt.path),
+            "sha256": self.receipt.sha256,
+            "metadata": {
+                **dict(self.metadata),
+                "artifact_name": self.receipt.name,
+                "artifact_path": str(self.receipt.path),
+                "artifact_sha256": self.receipt.sha256,
+                "stage": self.stage,
+                "layer_role": "checkpoint",
+                "foreground_voxels": self.foreground_voxels,
+                "empty_union": self.foreground_voxels == 0,
+            },
+        }
+
+
+@dataclass(frozen=True)
 class LtaPublicationReceipt:
     """Fail-closed evidence required to claim one LTA publication complete."""
 
@@ -275,7 +334,7 @@ def write_complete_lta_manifest(
     *,
     version: str,
     command: Sequence[str],
-    layers: Sequence[LtaLayerRecord],
+    layers: Sequence[LtaLayerRecord | LtaCheckpointArtifact],
     publication_receipt: LtaPublicationReceipt,
     payload: Mapping[str, object],
 ) -> Path:
@@ -313,6 +372,7 @@ def write_complete_lta_manifest(
 __all__ = (
     "LTA_MANIFEST_SCHEMA",
     "LtaArtifactReceipt",
+    "LtaCheckpointArtifact",
     "LtaLayerRecord",
     "LtaPublicationReceipt",
     "LtaRecompositionOp",

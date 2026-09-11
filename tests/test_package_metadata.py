@@ -8,9 +8,9 @@ from XTA import cli, config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRENT_VERSION = "21.0.6"
-CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v21.0.6_SLURM.py"
-PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v21.0.5_SLURM.py"
+CURRENT_VERSION = "21.1.0"
+CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v21.1.0_SLURM.py"
+PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v21.0.6_SLURM.py"
 
 
 def _toml_section(source: str, name: str) -> str:
@@ -25,7 +25,7 @@ class PackageMetadataTests(unittest.TestCase):
     def test_runtime_version_constants_are_aligned(self) -> None:
         self.assertEqual(XTA.__version__, CURRENT_VERSION)
         self.assertEqual(config.SCRIPT_VERSION, CURRENT_VERSION)
-        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2106")
+        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2110")
         self.assertEqual(config.SCRIPT_BASENAME, CURRENT_LAUNCHER)
         self.assertEqual(cli.SCRIPT_VERSION, CURRENT_VERSION)
         self.assertEqual(cli.SCRIPT_BASENAME, CURRENT_LAUNCHER)
@@ -55,6 +55,11 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertIn('"tools/lta_mask_seed_smoke.py"', data_files)
         self.assertIn('"tools/lta_full_volume.py"', data_files)
         self.assertIn('"tools/lta_tracklet_pair.py"', data_files)
+        self.assertIn('"tools/lta_production_smoke.py"', data_files)
+        self.assertIn('"tools/lta_worker_profile.py"', data_files)
+        self.assertIn('"tools/lta_tracker_feature_smoke.py"', data_files)
+        for tool in ("lta_trace_summary", "lta_host_io_profile", "lta_host_pipeline_smoke", "lta_window_gpu_smoke"):
+            self.assertIn(f'"tools/{tool}.py"', data_files)
         self.assertNotIn('GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py', data_files)
         self.assertNotIn('GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py', data_files)
         self.assertNotIn(PREVIOUS_LAUNCHER, data_files)
@@ -82,6 +87,11 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertTrue((ROOT / "tools" / "lta_mask_seed_smoke.py").is_file())
         self.assertTrue((ROOT / "tools" / "lta_full_volume.py").is_file())
         self.assertTrue((ROOT / "tools" / "lta_tracklet_pair.py").is_file())
+        self.assertTrue((ROOT / "tools" / "lta_production_smoke.py").is_file())
+        self.assertTrue((ROOT / "tools" / "lta_worker_profile.py").is_file())
+        self.assertTrue((ROOT / "tools" / "lta_tracker_feature_smoke.py").is_file())
+        for tool in ("lta_trace_summary", "lta_host_io_profile", "lta_host_pipeline_smoke", "lta_window_gpu_smoke"):
+            self.assertTrue((ROOT / "tools" / f"{tool}.py").is_file())
         self.assertTrue((ROOT / CURRENT_LAUNCHER).is_file())
         self.assertEqual(
             sorted(path.name for path in ROOT.glob('*_SLURM.py')),

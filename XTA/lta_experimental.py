@@ -157,17 +157,25 @@ def _sigmoid_tracker_score_logits(
             "tracker-only object_score_logits must have a real floating dtype; "
             f"got {flattened.dtype}"
         )
-    if not bool(torch_module.isfinite(flattened).all().item()):
-        raise RuntimeError("tracker-only object_score_logits contains a non-finite value")
     # The pinned SAM tracker names and stores this tensor as object_score_logits
     # (shape N x 1, with 10.0 documented as sigmoid(10) ~= 1).  Persist a
     # probability because SamFramePrediction deliberately accepts only [0, 1].
     removed = flattened == float(_REMOVED_OBJECT_SCORE_LOGIT)
     probabilities = torch_module.sigmoid(flattened.to(dtype=torch_module.float64))
+    # Preserve the exact GPU float64 sigmoid and sentinel checks while
+    # transferring the three small vectors together. An early .item() plus
+    # two separate .cpu() calls serializes three host/device boundaries.
+    host_values = torch_module.stack((
+        probabilities,
+        removed.to(dtype=torch_module.float64),
+        torch_module.isfinite(flattened).to(dtype=torch_module.float64),
+    )).detach().cpu().tolist()
+    if not all(bool(value) for value in host_values[2]):
+        raise RuntimeError("tracker-only object_score_logits contains a non-finite value")
     probability_values = tuple(
-        float(value) for value in probabilities.detach().cpu().tolist()
+        float(value) for value in host_values[0]
     )
-    removed_values = tuple(bool(value) for value in removed.detach().cpu().tolist())
+    removed_values = tuple(bool(value) for value in host_values[1])
     normalized = tuple(
         None if is_removed else probability
         for probability, is_removed in zip(probability_values, removed_values)
@@ -182,6 +190,24 @@ def _sigmoid_tracker_score_logits(
     ):
         raise RuntimeError("could not normalize tracker-only object_score_logits")
     return normalized
+
+
+def _binary_mask_batch_to_host(masks: Any, *, expected_count: int) -> tuple[Any, ...]:
+    """Threshold and transfer one object batch, retaining independent CPU masks."""
+    shape = tuple(int(value) for value in masks.shape)
+    if (
+        len(shape) not in (3, 4)
+        or shape[0] < int(expected_count)
+        or any(value < 1 for value in shape)
+        or (len(shape) == 4 and shape[1] != 1)
+    ):
+        raise RuntimeError(f"tracker mask batch has incompatible shape {shape}")
+    host = (masks[:int(expected_count)] > 0).detach().cpu().numpy()
+    if host.ndim == 4:
+        host = host[:, 0]
+    # Independent copies preserve the retained diagnostic path's ownership:
+    # keeping one active object must not pin all suppressed objects' masks.
+    return tuple(host[index].copy() for index in range(int(expected_count)))
 
 
 def run_mask_seed_session(
@@ -224,6 +250,10 @@ def run_mask_seed_session(
         raise ValueError("seed_roundtrip_policy must be 'exact' or 'overlap-aware'")
     import numpy as np
     import torch
+    from .lta_tracker_features import (
+        TRACKER_FEATURE_AUDIT_KEY,
+        prepare_tracker_frame_features,
+    )
 
     local_prompt = int(prompt_frame) - int(session.frame_start)
     started = measured.handle_request(
@@ -249,6 +279,7 @@ def run_mask_seed_session(
     removed_object_observations: list[dict[str, Any]] = []
     tracker_state = None
     inference_state = None
+    tracker_feature_preparation: dict[str, object] = {}
     feature = None
     video_masks = None
     active_error: BaseException | None = None
@@ -324,7 +355,7 @@ def run_mask_seed_session(
             if not callable(prepare_anchor):
                 raise RuntimeError("pinned SAM model exposes no shared anchor feature bridge")
             with torch.inference_mode():
-                prepare_anchor(inference_state, local_prompt, reverse=False)
+                prepare_tracker_frame_features(model, inference_state, local_prompt, reverse=False)
             expected_ids = tuple(range(len(object_masks)))
             mask_tensor = torch.from_numpy(
                 np.stack([np.asarray(mask, dtype=np.float32) for mask in object_masks])
@@ -360,9 +391,8 @@ def run_mask_seed_session(
                 "mask seeding requires every expected object mask to contain "
                 f"foreground; empty object ids={empty_expected_ids}"
             )
-        seeded_arrays = tuple(
-            seeded_masks[index].squeeze().detach().cpu().numpy().astype(bool)
-            for index in range(len(expected_ids))
+        seeded_arrays = _binary_mask_batch_to_host(
+            seeded_masks, expected_count=len(expected_ids),
         )
         seed_object_metrics = tuple(
             mask_metrics(expected_mask, seeded_array)
@@ -519,7 +549,9 @@ def run_mask_seed_session(
                 empty_streak_start = None
                 for requested_frame in order:
                     with torch.inference_mode():
-                        prepare_features(inference_state, requested_frame, reverse=reverse)
+                        prepare_tracker_frame_features(
+                            model, inference_state, requested_frame, reverse=reverse,
+                        )
                         feature = inference_state["feature_cache"].get(requested_frame)
                         if feature is None:
                             raise RuntimeError(
@@ -561,13 +593,8 @@ def run_mask_seed_session(
                         expected_count=len(expected_ids),
                         torch_module=torch,
                     )
-                    frame_masks = tuple(
-                        (video_masks[index].squeeze() > 0)
-                        .detach()
-                        .cpu()
-                        .numpy()
-                        .astype(bool)
-                        for index in range(len(expected_ids))
+                    frame_masks = _binary_mask_batch_to_host(
+                        video_masks, expected_count=len(expected_ids),
                     )
                     removed_ids = tuple(
                         object_id
@@ -691,6 +718,10 @@ def run_mask_seed_session(
         anchor_masks_by_object.clear()
         raise
     finally:
+        if isinstance(inference_state, dict):
+            tracker_feature_preparation = dict(
+                inference_state.get(TRACKER_FEATURE_AUDIT_KEY, {})
+            )
         cleanup_errors: list[tuple[str, Exception]] = []
         close_stream = getattr(stream, "close", None)
         if callable(close_stream):
@@ -851,6 +882,7 @@ def run_mask_seed_session(
         "anchor_returned_object_ids": anchor_ids,
         "propagation_mode": str(propagation_mode),
         "propagation_direction": direction,
+        "tracker_feature_preparation": tracker_feature_preparation,
         "frame_tracker_score_semantics": {
             "source": (
                 "tracker.propagate_in_video fifth return value: object_score_logits"

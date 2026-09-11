@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest import mock
 
@@ -33,7 +34,7 @@ class LtaInputDiscoveryTests(unittest.TestCase):
         )
         self.assertEqual(lta_inputs.split_indexed_stem(label), lta_inputs.split_indexed_stem(image))
 
-    def test_default_video_probe_counts_decoded_frames_not_packets(self) -> None:
+    def test_unknown_codec_without_frame_metadata_counts_decoded_frames_not_packets(self) -> None:
         completed = mock.Mock(
             stdout=(
                 '{"streams":[{"width":80,"height":64,'
@@ -47,11 +48,96 @@ class LtaInputDiscoveryTests(unittest.TestCase):
         ):
             metadata = lta_inputs.probe_video_with_ffprobe(Path("sample.mp4"))
 
-        command = run.call_args.args[0]
+        self.assertEqual(run.call_count, 2)
+        self.assertNotIn("-count_frames", run.call_args_list[0].args[0])
+        command = run.call_args_list[1].args[0]
         self.assertIn("-count_frames", command)
         self.assertTrue(any("nb_read_frames" in token for token in command))
         self.assertNotIn("-count_packets", command)
         self.assertEqual(metadata.frame_count, 17)
+
+    def test_video_probe_uses_metadata_count_without_scanning_video(self) -> None:
+        completed = mock.Mock(stdout=json.dumps({"streams": [{
+            "width": 80, "height": 64, "codec_name": "h264",
+            "nb_frames": "17", "avg_frame_rate": "30/1",
+        }]}))
+        with (
+            mock.patch.object(lta_inputs.shutil, "which", return_value="ffprobe"),
+            mock.patch.object(lta_inputs.subprocess, "run", return_value=completed) as run,
+        ):
+            metadata = lta_inputs.probe_video_with_ffprobe(Path("sample.mp4"))
+        self.assertEqual(metadata.frame_count, 17)
+        self.assertEqual(run.call_count, 1)
+        self.assertNotIn("-count_frames", run.call_args.args[0])
+        self.assertNotIn("-count_packets", run.call_args.args[0])
+
+    def test_ffv1_without_metadata_count_uses_packet_count(self) -> None:
+        responses = [
+            mock.Mock(stdout=json.dumps({"streams": [{"width": 80, "height": 64, "codec_name": "ffv1", "avg_frame_rate": "60/1"}]})),
+            mock.Mock(stdout=json.dumps({"streams": [{"nb_read_packets": "1929"}]})),
+        ]
+        with (
+            mock.patch.object(lta_inputs.shutil, "which", return_value="ffprobe"),
+            mock.patch.object(lta_inputs.subprocess, "run", side_effect=responses) as run,
+            mock.patch("builtins.print") as output,
+        ):
+            metadata = lta_inputs.probe_video_with_ffprobe(Path("sample.mkv"))
+        self.assertEqual(metadata.frame_count, 1929)
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("-count_packets", run.call_args_list[1].args[0])
+        self.assertTrue(all("-count_frames" not in call.args[0] for call in run.call_args_list))
+        self.assertTrue(any("ffv1_packet_count" in call.args[0] for call in output.call_args_list))
+        self.assertTrue(all(call.kwargs.get("flush") for call in output.call_args_list))
+
+    def test_unavailable_ffv1_packet_count_falls_back_to_decoded_frames(self) -> None:
+        for packet_response in (
+            mock.Mock(stdout='{"streams":[{"nb_read_packets":"N/A"}]}'),
+            lta_inputs.subprocess.CalledProcessError(1, ["ffprobe"]),
+        ):
+            with self.subTest(packet_response=type(packet_response).__name__):
+                responses = [
+                    mock.Mock(stdout='{"streams":[{"width":80,"height":64,"codec_name":"ffv1"}]}'),
+                    packet_response,
+                    mock.Mock(stdout='{"streams":[{"nb_read_frames":"17"}]}'),
+                ]
+                with (
+                    mock.patch.object(lta_inputs.shutil, "which", return_value="ffprobe"),
+                    mock.patch.object(lta_inputs.subprocess, "run", side_effect=responses) as run,
+                ):
+                    metadata = lta_inputs.probe_video_with_ffprobe(Path("sample.mkv"))
+                self.assertEqual(metadata.frame_count, 17)
+                self.assertIn("-count_frames", run.call_args_list[-1].args[0])
+
+    def test_video_probe_never_estimates_count_from_duration_times_fps(self) -> None:
+        for nb_frames in (None, "N/A", "0", "-1", "17.5", True):
+            with self.subTest(nb_frames=nb_frames):
+                responses = [
+                    mock.Mock(stdout=json.dumps({"streams": [{
+                        "width": 80, "height": 64, "codec_name": "h264", "nb_frames": nb_frames,
+                        "duration": "100", "avg_frame_rate": "30/1",
+                    }]})),
+                    mock.Mock(stdout='{"streams":[{"nb_read_frames":"17"}]}'),
+                ]
+                with (
+                    mock.patch.object(lta_inputs.shutil, "which", return_value="ffprobe"),
+                    mock.patch.object(lta_inputs.subprocess, "run", side_effect=responses) as run,
+                ):
+                    metadata = lta_inputs.probe_video_with_ffprobe(Path("sample.mkv"))
+                self.assertEqual(metadata.frame_count, 17)
+                self.assertEqual(run.call_count, 2)
+                self.assertIn("-count_frames", run.call_args_list[-1].args[0])
+
+    def test_video_probe_rejects_missing_exact_count(self) -> None:
+        responses = [
+            mock.Mock(stdout='{"streams":[{"width":80,"height":64,"codec_name":"h264"}]}'),
+            mock.Mock(stdout='{"streams":[{"nb_read_frames":"N/A"}]}'),
+        ]
+        with (
+            mock.patch.object(lta_inputs.shutil, "which", return_value="ffprobe"),
+            mock.patch.object(lta_inputs.subprocess, "run", side_effect=responses),
+            self.assertRaisesRegex(lta_inputs.LtaInputError, "no positive decoded-frame count"),
+        ):
+            lta_inputs.probe_video_with_ffprobe(Path("sample.mkv"))
 
     def test_direct_image_input_builds_positive_and_warns_when_fully_labeled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

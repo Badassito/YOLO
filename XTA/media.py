@@ -367,12 +367,13 @@ def decode_video_to_memmap_gray8(
     prefer_memory: bool = True,
     prefer_memfd: bool = False,
     reserve_bytes: int = 32 * GIB,
+    strict_frame_count: bool = False,
 ) -> np.ndarray:
-    """Decode the input video to a contiguous ``(T, H, W)`` uint8 luma workspace."""
+    """Decode gray8 frames, optionally verifying the declared count against EOF."""
     _require_bin("ffmpeg")
 
     shape = (int(num_frames), int(height), int(width))
-    reuse_existing = bool(not overwrite and out_dat.exists() and not prefer_memory and not prefer_memfd)
+    reuse_existing = bool(not strict_frame_count and not overwrite and out_dat.exists() and not prefer_memory and not prefer_memfd)
     arr = allocate_workspace_array(
         shape=shape,
         dtype=np.uint8,
@@ -400,6 +401,7 @@ def decode_video_to_memmap_gray8(
         "-v", "error",
         "-threads", str(ffmpeg_decode_threads()),
         "-i", str(input_video),
+        *(["-map", "0:v:0"] if strict_frame_count else []),
         "-f", "rawvideo",
         "-pix_fmt", "gray",
         "-vsync", "0",
@@ -412,6 +414,30 @@ def decode_video_to_memmap_gray8(
     )
     assert proc.stdout is not None
 
+    stderr_tail = bytearray()
+    stderr_errors = []
+    stderr_reader = None
+    if strict_frame_count:
+        # EOF verification waits for ffmpeg to exit. Drain diagnostics concurrently
+        # so a full stderr pipe cannot prevent stdout from reaching EOF.
+        stderr_pipe = proc.stderr
+        assert stderr_pipe is not None
+
+        def _drain_stderr() -> None:
+            try:
+                with stderr_pipe:
+                    while chunk := stderr_pipe.read(65536):
+                        stderr_tail.extend(chunk)
+                        del stderr_tail[:-256 * 1024]
+            except BaseException as exc:
+                stderr_errors.append(exc)
+
+        stderr_reader = threading.Thread(target=_drain_stderr, name='gray8-decode-stderr', daemon=True)
+        stderr_reader.start()
+        proc.stderr = None  # communicate must not race the dedicated reader.
+
+    decode_error = None
+    view = None
     try:
         with tqdm(total=num_frames, desc='Decoding input volume (gray8)') as pbar:
             for start in range(0, num_frames, chunk_frames):
@@ -426,15 +452,40 @@ def decode_video_to_memmap_gray8(
                         raise RuntimeError(f'Unexpected EOF while decoding frames starting at {start}/{num_frames}')
                     filled += int(nread)
                 pbar.update(int(nframes))
+        if strict_frame_count and proc.stdout.read(1):
+            raise RuntimeError(
+                f'Frame count mismatch: decoded more than the declared {num_frames} frames from {input_video}'
+            )
+    except BaseException as exc:
+        decode_error = exc
+        if strict_frame_count and proc.poll() is None:
+            proc.kill()
+        raise
     finally:
-        if proc.stdout:
-            proc.stdout.close()
-            # Windows communicate() otherwise starts a reader for this closed pipe.
-            proc.stdout = None
-        _, err = proc.communicate()
-        if proc.returncode not in (0, None):
-            msg = err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
-            raise RuntimeError(f"ffmpeg decode failed: {msg}")
+        process_verified = False
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+                # Windows communicate() otherwise starts a reader for this closed pipe.
+                proc.stdout = None
+            _, err = proc.communicate()
+            if stderr_reader is not None:
+                stderr_reader.join()
+                err = bytes(stderr_tail)
+                if stderr_errors and decode_error is None:
+                    raise RuntimeError('Could not read ffmpeg decode diagnostics') from stderr_errors[0]
+            if proc.returncode not in (0, None) and decode_error is None:
+                msg = err.decode("utf-8", errors="ignore") if isinstance(err, (bytes, bytearray)) else str(err)
+                raise RuntimeError(f"ffmpeg decode failed: {msg}")
+            process_verified = True
+        finally:
+            if strict_frame_count and (decode_error is not None or not process_verified):
+                # Tracebacks retain these views, which otherwise lock failed
+                # scratch mappings on Windows until the exception is discarded.
+                if view is not None:
+                    view.release()
+                raw_bytes.release()
+                close_memmap_array(arr)
     return arr
 
 def decode_video_to_memmap_gray8_streaming(

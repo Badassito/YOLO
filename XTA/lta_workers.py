@@ -32,6 +32,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence, Tuple, Union
 
+from .lta_cpu import bind_worker_cpu_environment, resolve_worker_cpu_budget
+from .lta_telemetry import LtaExecutionTrace
+
 
 _SCHEMA = "lta.worker/1"
 _EVENT_POLL_SECONDS = 0.05
@@ -460,6 +463,7 @@ def _worker_main(
     init: LtaWorkerInit,
     task_queue: object,
     event_queue: object,
+    cpu_budget: Optional[Mapping[str, object]] = None,
 ) -> None:
     """Child entry point; keep imports above dependency-free and CUDA-neutral."""
 
@@ -469,6 +473,11 @@ def _worker_main(
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = str(visible_device_token)
     os.environ["LTA_EXECUTION_DEVICE_ID"] = str(resolved_device)
+    budget = dict(cpu_budget or resolve_worker_cpu_budget(1))
+    bind_worker_cpu_environment(budget)
+    trace = LtaExecutionTrace(init.adapter_config.get("trace_dir"), f"worker_{resolved_device}")
+    trace.event("process_start", device_id=resolved_device, visible_device=visible_device_token,
+                cpu_budget=budget)
 
     predictor: object = _UNSET
     shutdown: Optional[Callable[..., object]] = None
@@ -489,7 +498,10 @@ def _worker_main(
                 "CUDA-sensitive modules were imported before the LTA worker "
                 f"bound CUDA_VISIBLE_DEVICES: {examples}"
             )
-        predictor, execute, shutdown = _load_adapter_once(init)
+        with trace.phase("adapter_startup", device_id=resolved_device):
+            predictor, execute, shutdown = _load_adapter_once(init)
+        trace.event("process_ready", device_id=resolved_device,
+                    cpu_runtime=getattr(predictor, "cpu_budget", {}))
         event_queue.put(
             LtaWorkerReady(
                 execution_device_id=resolved_device,
@@ -498,6 +510,8 @@ def _worker_main(
                 metadata={
                     "profile": getattr(predictor, "profile", {}),
                     "sam_runtime": getattr(predictor, "sam_runtime", {}),
+                    "cpu_budget": budget,
+                    "cpu_runtime": getattr(predictor, "cpu_budget", {}),
                     "constrained_batches": getattr(
                         predictor,
                         "constrained_batches",
@@ -507,16 +521,19 @@ def _worker_main(
             )
         )
     except Exception as exc:
+        trace.event("process_failed", phase="startup", error_type=type(exc).__name__, message=str(exc))
         event_queue.put(
             _error_event(
                 resolved_device, phase="startup", exc=exc, fatal=True
             )
         )
+        trace.close()
         return
 
     try:
         while True:
-            message = task_queue.get()
+            with trace.phase("queue_wait", device_id=resolved_device):
+                message = task_queue.get()
             if isinstance(message, _StopWorker):
                 break
             if not isinstance(message, LtaWorkerTask):
@@ -530,14 +547,18 @@ def _worker_main(
                 )
                 continue
             try:
-                output = execute(predictor, message.kind, dict(message.payload))
+                with trace.phase("execute", device_id=resolved_device, work_id=message.work_id,
+                                 task_kind=message.kind):
+                    output = execute(predictor, message.kind, dict(message.payload))
                 path_text, metrics, metadata = _normalize_adapter_output(output)
                 artifact = Path(path_text).expanduser().resolve()
                 if not artifact.is_file():
                     raise FileNotFoundError(
                         f"LTA adapter artifact is not a regular file: {artifact}"
                     )
-                digest, size = _sha256_file(artifact)
+                with trace.phase("manifest_hash", work_id=message.work_id) as details:
+                    digest, size = _sha256_file(artifact)
+                    details["stored_bytes"] = size
                 event_queue.put(
                     LtaWorkerResult(
                         work_id=message.work_id,
@@ -553,6 +574,8 @@ def _worker_main(
                     )
                 )
             except Exception as exc:
+                trace.event("task_failed", work_id=message.work_id, error_type=type(exc).__name__,
+                            message=str(exc))
                 event_queue.put(
                     _error_event(
                         resolved_device,
@@ -565,7 +588,8 @@ def _worker_main(
     finally:
         if shutdown is not None and predictor is not _UNSET:
             try:
-                shutdown(predictor)
+                with trace.phase("adapter_shutdown", device_id=resolved_device):
+                    shutdown(predictor)
             except Exception as exc:
                 event_queue.put(
                     _error_event(
@@ -575,6 +599,8 @@ def _worker_main(
                         fatal=True,
                     )
                 )
+        trace.event("process_stopped", device_id=resolved_device, trace_write_errors=trace.write_errors)
+        trace.close()
 
 
 class LtaWorkerPool:
@@ -601,6 +627,7 @@ class LtaWorkerPool:
         if len(devices) != len(set(devices)):
             raise ValueError("device_ids must be unique")
         self.device_ids = devices
+        self.cpu_budget = resolve_worker_cpu_budget(len(devices))
         self.visible_device_tokens = _resolve_visible_device_tokens(devices)
         # Detach the exposed mapping again at the actual spawn boundary in
         # case a caller mutated the (necessarily pickleable) dataclass mapping
@@ -614,6 +641,13 @@ class LtaWorkerPool:
             schema=init.schema,
         )
         self.init = safe_init
+        if safe_init.adapter_config.get("trace_dir"):
+            print(
+                "LTA worker CPU allocation: "
+                f"devices={list(devices)} allocated_cpus={self.cpu_budget['effective_cpu_count']} "
+                f"native_threads_per_worker={self.cpu_budget['threads_per_worker']}",
+                flush=True,
+            )
         self.start_method = "spawn"
         self._context = multiprocessing.get_context(self.start_method)
         self._event_queue = self._context.Queue()
@@ -637,6 +671,7 @@ class LtaWorkerPool:
                         safe_init,
                         self._task_queues[device],
                         self._event_queue,
+                        self.cpu_budget,
                     ),
                     name=f"lta-gpu-{device}",
                     # SAM adapters remain free to create their own decoder or

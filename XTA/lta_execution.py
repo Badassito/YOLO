@@ -17,12 +17,15 @@ import os
 import shutil
 import time
 import uuid
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath
 from typing import Any, Mapping, Sequence
 
+from .lta_cpu import bounded_lta_host_threads, host_native_thread_counts
 from .lta_outputs import (
     LtaArtifactReceipt,
+    LtaCheckpointArtifact,
     LtaLayerRecord,
     LtaPublicationReceipt,
     LtaRecompositionOp,
@@ -34,6 +37,7 @@ from .lta_postprocessing import (
     fill_merged_seed_mask_holes_2d,
     finalize_lta_native_union,
     write_global_final_output_nrrd,
+    write_lta_postprocessing_checkpoint,
 )
 from .lta_propagation import (
     LtaMaskSeed,
@@ -48,7 +52,7 @@ from .lta_rendering import (
     union_tile_chunk_into_view,
 )
 from .lta_runtime import LtaRunPlan, LtaRuntimeViewPlan, LtaTileGridPlan
-from .lta_sam import revalidate_local_sam_bundle
+from .lta_sam import LTA_SESSION_FRAMES, revalidate_local_sam_bundle
 from .lta_scheduler import (
     LtaSessionWork,
     LtaSpatialRelayKey,
@@ -65,7 +69,9 @@ from .lta_tiles import (
     transform_polygon_to_tile,
 )
 from .lta_windows import (
-    plan_anchor_domains,
+    AnchorDomain,
+    WindowPlan,
+    owned_frame_range,
     plan_directional_windows,
     plan_domain_windows,
 )
@@ -93,11 +99,20 @@ def _relay_generation_bound(view_plan: LtaRuntimeViewPlan) -> int:
     return 2 * int(view_plan.frame_count) * int(total_tiles)
 
 
+def _storage_capacity_probe(path: Path) -> tuple[Path, int, int]:
+    """Resolve an existing filesystem probe without creating the target tree."""
+
+    probe = Path(path).resolve(strict=False)
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    return probe, int(probe.stat().st_dev), int(shutil.disk_usage(probe).free)
+
+
 def _preflight_lta_storage(
     plan: LtaRunPlan,
     view_plan: LtaRuntimeViewPlan,
 ) -> dict[str, object]:
-    """Reject a clearly undersized scratch filesystem before source decode."""
+    """Reserve scratch and persistent NRRD capacity before source decode."""
 
     voxel_bytes = math.prod(int(value) for value in plan.volumes[0].source_shape_tyx)
     base_uint8_volumes = 4 * voxel_bytes
@@ -110,46 +125,93 @@ def _preflight_lta_storage(
     keep_replacement = (
         voxel_bytes if int(plan.postprocessing.get("keep_objects", 0)) > 0 else 0
     )
-    initial_chain_upper_bound = sum(
-        int(view_plan.frame_count) * int(tile.size) * int(tile.size)
-        for grid in view_plan.tile_grids
-        for tile in grid.tiles
+    largest_worker_union = max(
+        (
+            min(int(view_plan.frame_count), LTA_SESSION_FRAMES) * int(tile.size) * int(tile.size)
+            for grid in view_plan.tile_grids
+            for tile in grid.tiles
+        ),
+        default=0,
     )
-    estimated = (
+    # Each completed dense union is reduced and removed before its device is
+    # reused; only compact manifests wait for ordered logical commits.
+    worker_union_reserve = len(plan.device_ids) * largest_worker_union
+    checkpoint_count = (
+        1
+        + int(bool(plan.postprocessing.get("enable_3d_void_fill", False)))
+        + int(bool(plan.postprocessing.get("gaussian_smoothing_enabled", False)))
+        + int(int(plan.postprocessing.get("keep_objects", 0)) > 0)
+    )
+    output_nrrd_count = checkpoint_count + 1
+    public_nrrd_reserve = output_nrrd_count * (
+        int(math.ceil(voxel_bytes * 1.01)) + 64 * 1024
+    )
+    scratch_estimated = (
         base_uint8_volumes
         + filter_workspace
         + keep_replacement
-        + initial_chain_upper_bound
+        + worker_union_reserve
     )
-    headroom = max(1 * _GIB, int(math.ceil(estimated * 0.10)))
-    required = estimated + headroom
-    capacity_probe = Path(plan.temp_root)
-    while not capacity_probe.exists() and capacity_probe != capacity_probe.parent:
-        capacity_probe = capacity_probe.parent
-    usage = shutil.disk_usage(capacity_probe)
-    if int(usage.free) < required:
-        raise RuntimeError(
-            "LTA scratch capacity preflight failed before decode: "
-            f"need at least {required / _GIB:.1f} GiB including headroom, "
-            f"but {usage.free / _GIB:.1f} GiB is free at {plan.temp_root}. "
-            "Select fast node-local storage with --temp (for Slurm, usually "
-            "$SLURM_TMPDIR). Relay growth and public output staging may require more."
+    scratch_probe, scratch_filesystem, scratch_free = _storage_capacity_probe(plan.temp_root)
+    output_probe, output_filesystem, output_free = _storage_capacity_probe(plan.output_root)
+    shared_filesystem = scratch_filesystem == output_filesystem
+
+    def reservation(role: str, probe: Path, free: int, estimated: int) -> dict[str, object]:
+        headroom = max(1 * _GIB, int(math.ceil(estimated * 0.10)))
+        required = estimated + headroom
+        if free < required:
+            raise RuntimeError(
+                f"LTA {role} capacity preflight failed before decode: "
+                f"need at least {required / _GIB:.1f} GiB including headroom, "
+                f"but {free / _GIB:.1f} GiB is free at {probe}. "
+                "Select sufficient storage with --temp and --output. "
+                "Relay artifacts, labels, and overlays may require more."
+            )
+        return {
+            "role": role,
+            "capacity_probe_path": str(probe),
+            "free_bytes_at_preflight": free,
+            "estimated_bytes_before_headroom": estimated,
+            "headroom": headroom,
+            "required_bytes_with_headroom": required,
+        }
+
+    if shared_filesystem:
+        scratch_reservation = output_reservation = reservation(
+            "scratch and output", scratch_probe, min(scratch_free, output_free),
+            scratch_estimated + public_nrrd_reserve,
         )
+        reservations = [scratch_reservation]
+    else:
+        scratch_reservation = reservation("scratch", scratch_probe, scratch_free, scratch_estimated)
+        output_reservation = reservation("output", output_probe, output_free, public_nrrd_reserve)
+        reservations = [scratch_reservation, output_reservation]
     return {
         "scratch_root": str(plan.temp_root),
-        "capacity_probe_path": str(capacity_probe),
-        "lifecycle": "ephemeral_removed_before_manifest_publication",
-        "free_bytes_at_preflight": int(usage.free),
-        "estimated_bytes_before_headroom": int(estimated),
-        "required_bytes_with_headroom": int(required),
+        "output_root": str(plan.output_root),
+        "capacity_probe_path": str(scratch_probe),
+        "output_capacity_probe_path": str(output_probe),
+        "lifecycle": "scratch_ephemeral_output_persistent",
+        "scratch_and_output_share_filesystem": shared_filesystem,
+        "filesystem_reservations": reservations,
+        "free_bytes_at_preflight": scratch_reservation["free_bytes_at_preflight"],
+        "estimated_bytes_before_headroom": scratch_reservation["estimated_bytes_before_headroom"],
+        "required_bytes_with_headroom": scratch_reservation["required_bytes_with_headroom"],
+        "output_required_bytes_with_headroom": output_reservation["required_bytes_with_headroom"],
         "components": {
             "four_full_uint8_volumes": int(base_uint8_volumes),
             "largest_selected_dense_filter_workspace": int(filter_workspace),
             "keep_objects_replacement": int(keep_replacement),
-            "all_tile_initial_chain_upper_bound": int(initial_chain_upper_bound),
-            "headroom": int(headroom),
+            "bounded_worker_union_reserve": int(worker_union_reserve),
+            "compressed_public_nrrd_upper_bound": int(public_nrrd_reserve),
+            "headroom": scratch_reservation["headroom"],
         },
-        "relay_growth_and_public_output_staging_included": False,
+        "maximum_uncommitted_worker_unions": len(plan.device_ids),
+        "postprocessing_checkpoint_count": checkpoint_count,
+        "output_nrrd_count_including_final": output_nrrd_count,
+        "compressed_postprocessing_checkpoints_included": True,
+        "compressed_final_nrrd_included": True,
+        "relay_artifacts_labels_and_overlays_included": False,
     }
 
 
@@ -299,6 +361,27 @@ def _verified_artifact_path(
     return resolved
 
 
+def _artifact_ownership_path(path: PurePath) -> PurePath:
+    """Compare resolved Windows paths without DOS/UNC namespace spelling differences.
+
+    Only standard extended DOS and UNC prefixes are equivalent here. Device
+    namespaces and volume GUID paths retain their spelling and fail closed
+    against a normal filesystem root. This never changes the path used for I/O.
+    """
+
+    if not isinstance(path, PureWindowsPath):
+        return path
+    value = str(path)
+    if value[:8].casefold() == "\\\\?\\unc\\":
+        return PureWindowsPath("\\\\" + value[8:])
+    if (
+        value.startswith("\\\\?\\") and len(value) >= 7
+        and value[4].isascii() and value[4].isalpha() and value[5:7] == ":\\"
+    ):
+        return PureWindowsPath(value[4:])
+    return path
+
+
 def _unlink_consumed_temp_artifacts(
     paths: Sequence[str | Path],
     *,
@@ -307,20 +390,22 @@ def _unlink_consumed_temp_artifacts(
     """Unlink exact, already-consumed files only after validating their scope."""
 
     root = Path(temp_root).resolve(strict=True)
+    ownership_root = _artifact_ownership_path(root)
     resolved: list[Path] = []
-    seen: set[Path] = set()
+    seen: set[PurePath] = set()
     for path in paths:
         candidate = Path(path).resolve(strict=True)
+        ownership_candidate = _artifact_ownership_path(candidate)
         try:
-            candidate.relative_to(root)
+            ownership_candidate.relative_to(ownership_root)
         except ValueError as exc:
             raise RuntimeError(
                 f"refusing to delete consumed LTA artifact outside temp root: {candidate}"
             ) from exc
         if not candidate.is_file():
             raise RuntimeError(f"consumed LTA artifact is not a regular file: {candidate}")
-        if candidate not in seen:
-            seen.add(candidate)
+        if ownership_candidate not in seen:
+            seen.add(ownership_candidate)
             resolved.append(candidate)
     for candidate in resolved:
         candidate.unlink()
@@ -347,7 +432,7 @@ def _execution_run_plan_manifest_record(plan: LtaRunPlan) -> dict[str, object]:
         "status": "superseded",
         "superseded_by": "execution.device_schedule",
         "reason": (
-            "production execution replans work from authoritative anchor domains "
+            "production execution replans full-view chains for each authoritative anchor "
             "and dynamically admitted spatial relays"
         ),
     }
@@ -565,6 +650,7 @@ def _prepare_output_roots(plan: LtaRunPlan) -> None:
         raise ValueError(f"LTA output must be new or empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
     plan.temp_root.mkdir(parents=True, exist_ok=False)
+    print(f"LTA scratch directory created: {plan.temp_root}", flush=True)
 
 
 def _materialize_source_volume(source: object, *, path: Path):
@@ -583,6 +669,7 @@ def _materialize_source_volume(source: object, *, path: Path):
             overwrite=True,
             prefer_memory=False,
             reserve_bytes=0,
+            strict_frame_count=True,
         )
     media = tuple(sorted(source.media, key=lambda item: int(item.frame_position)))
     if len(media) != shape[0]:
@@ -869,12 +956,16 @@ def _plan_initial_chains(
             )
             for frame, seeds in by_frame.items():
                 seed_inventory[(grid.config_id, tile_index, frame)] = seeds
-            domains = plan_anchor_domains(
-                by_frame,
-                frame_start=0,
-                frame_stop=view_plan.frame_count,
-            )
-            for domain in domains:
+            # An unrelated positive annotation is not evidence that an existing
+            # lineage ended. Until production integrates cross-anchor identity
+            # reconciliation, let every anchor propagate over the full view and
+            # union its evidence with the other independently seeded lineages.
+            for anchor_frame in sorted(by_frame):
+                domain = AnchorDomain(
+                    anchor_frame=anchor_frame,
+                    frame_start=0,
+                    frame_stop=view_plan.frame_count,
+                )
                 windows = plan_domain_windows(domain)
                 batches = _seed_batches(by_frame[domain.anchor_frame])
                 batch_count = len(batches)
@@ -941,6 +1032,57 @@ def _plan_initial_chains(
     if not chains:
         raise ValueError("no production LTA tile contains a directly addressable mask seed")
     return tuple(chains), seed_inventory
+
+
+def _plan_window_tasks(
+    chains: Sequence[_PlannedChain],
+    *,
+    first_plan_order: int = 0,
+) -> tuple[_PlannedChain, ...]:
+    """Expand fresh tracker resets into a dependency graph of bounded tasks."""
+
+    tasks: list[_PlannedChain] = []
+    for chain in chains:
+        windows = tuple(WindowPlan(**record) for record in chain.payload["windows"])
+        previous_by_branch: dict[str, str] = {}
+        root_id = f"{chain.work.work_id}::window-0000"
+        for index, window in enumerate(windows):
+            work_id = f"{chain.work.work_id}::window-{index:04d}"
+            predecessor = None if index == 0 else previous_by_branch.get(window.branch, root_id)
+            previous_by_branch[window.branch] = work_id
+            start, stop = owned_frame_range(window)
+            work = replace(
+                chain.work,
+                work_id=work_id,
+                session_index=first_plan_order + len(tasks),
+                plan_order=first_plan_order + len(tasks),
+                frame_start=window.frame_start,
+                frame_stop=window.frame_stop,
+                estimated_cost=chain.work.estimated_cost * window.frame_count / chain.work.frame_count,
+                dependency_work_ids=() if predecessor is None else (predecessor,),
+            )
+            payload = {
+                **dict(chain.payload),
+                "work_id": work_id,
+                "chain_work_id": chain.work.work_id,
+                "chain_window_count": len(windows),
+                "window_index": index,
+                "window": dict(asdict(window)),
+                "windows": [dict(asdict(window))],
+                "predecessor_work_id": predecessor,
+                "output_frame_start": start,
+                "output_frame_stop": stop,
+            }
+            if predecessor is not None:
+                payload["seed_artifact_path"] = None
+                payload["seed_artifact_sha256"] = None
+            tasks.append(_PlannedChain(work=work, payload=payload))
+    return tuple(tasks)
+
+
+@dataclass(frozen=True)
+class _SkippedWindow:
+    reason: str = "halted_empty_dogfood_boundary"
 
 
 def _authoritative_seed_audit(
@@ -1025,42 +1167,28 @@ def _consume_chain_manifest(
     *,
     view_union: object,
 ) -> tuple[tuple[dict[str, object], ...], Path]:
-    import numpy as np
+    from .lta_union_artifacts import reduce_union_artifact_into_view
 
-    union = manifest["union"]
-    union_path = _verified_artifact_path(
-        str(union["path"]),  # type: ignore[index]
-        expected_sha256=union["sha256"],  # type: ignore[index]
-        description="worker union artifact",
+    tile = manifest["tile"]
+    tile_xyxy = (
+        int(tile["left"]), int(tile["top"]),
+        int(tile["left"]) + int(tile["size"]),
+        int(tile["top"]) + int(tile["size"]),
     )
-    shape = tuple(int(value) for value in union["shape"])  # type: ignore[index]
-    source = np.memmap(union_path, dtype=np.uint8, mode="r", shape=shape)
-    try:
-        tile = manifest["tile"]
-        tile_xyxy = (
-            int(tile["left"]),  # type: ignore[index]
-            int(tile["top"]),  # type: ignore[index]
-            int(tile["left"]) + int(tile["size"]),  # type: ignore[index]
-            int(tile["top"]) + int(tile["size"]),  # type: ignore[index]
-        )
-        frame_range = tuple(int(value) for value in manifest["output_frame_range"])
-        union_tile_chunk_into_view(
-            view_union,
-            source,
-            frame_start=frame_range[0],
-            tile_xyxy=tile_xyxy,
-        )
-    finally:
-        mmap_obj = getattr(source, "_mmap", None)
-        if mmap_obj is not None:
-            mmap_obj.close()
-    return tuple(dict(item) for item in manifest.get("relays", ())), union_path
+    start, stop = (int(value) for value in manifest["output_frame_range"])
+    receipt = reduce_union_artifact_into_view(
+        manifest["union"], view_union=view_union, tile_xyxy=tile_xyxy,
+        frame_start=start, frame_stop=stop,
+    )
+    return tuple(dict(item) for item in manifest.get("relays", ())), Path(receipt["path"])
 
 
 def _new_worker_audit() -> dict[str, object]:
     return {
         "ready_worker_count": 0,
         "chain_count": 0,
+        "task_count": 0,
+        "skipped_window_count": 0,
         "window_count": 0,
         "planned_window_count": 0,
         "tracker_session_count": 0,
@@ -1068,6 +1196,8 @@ def _new_worker_audit() -> dict[str, object]:
         "halted_window_count": 0,
         "prediction_count": 0,
         "retained_prediction_count": 0,
+        "tracker_feature_only_preparations": 0,
+        "tracker_feature_fallback_preparations": 0,
         "dogfood_seed_count": 0,
         "hole_fill_added_pixels": 0,
         "injection_hole_fill_added_pixels": 0,
@@ -1082,6 +1212,8 @@ def _new_worker_audit() -> dict[str, object]:
         "sam_runtime_by_device": {},
         "constrained_batches_by_device": {},
         "visible_devices_by_device": {},
+        "cpu_budgets_by_device": {},
+        "cpu_runtime_by_device": {},
         "relay_gate": None,
     }
 
@@ -1117,6 +1249,11 @@ def _accumulate_worker_ready_audit(
         else json.loads(json.dumps(dict(constrained), sort_keys=True))
     )
     visible[device] = str(ready.visible_device)
+    for key, target in (("cpu_budget", "cpu_budgets_by_device"), ("cpu_runtime", "cpu_runtime_by_device")):
+        if key in metadata:
+            if not isinstance(metadata[key], Mapping):
+                raise RuntimeError(f"worker {key} metadata is not a mapping")
+            audit[target][device] = json.loads(json.dumps(dict(metadata[key]), sort_keys=True))
     audit["ready_worker_count"] = int(audit["ready_worker_count"]) + 1
 
 
@@ -1170,7 +1307,9 @@ def _accumulate_worker_audit(
     elif audit["relay_gate"] != normalized_gate:
         raise RuntimeError("worker tasks used inconsistent spatial relay gates")
 
-    add("chain_count", 1)
+    add("task_count", 1)
+    if manifest.get("task_granularity") != "window":
+        add("chain_count", 1)
     add("relay_artifact_count", len(tuple(manifest.get("relays", ()))))
     add("foreground_pixels_across_chain_unions", manifest.get("foreground_pixels", 0))
     windows = tuple(manifest.get("windows", ()))
@@ -1207,6 +1346,11 @@ def _accumulate_worker_audit(
         adapter = window.get("adapter", {})
         if not isinstance(adapter, Mapping):
             raise RuntimeError("worker window omitted its adapter audit mapping")
+        feature_preparation = adapter.get("tracker_feature_preparation", {})
+        if not isinstance(feature_preparation, Mapping):
+            raise RuntimeError("worker tracker-feature audit is not a mapping")
+        add("tracker_feature_only_preparations", feature_preparation.get("feature_only_preparations", 0))
+        add("tracker_feature_fallback_preparations", feature_preparation.get("fallback_preparations", 0))
         add(
             "injection_hole_fill_added_pixels",
             adapter.get("seed_hole_fill_added_pixels", 0),
@@ -1537,6 +1681,7 @@ def _dispatch_available(
     dispatched: list[dict[str, object]],
     *,
     tasks_root: Path,
+    trace: object | None = None,
 ) -> None:
     for device_id in scheduler.device_ids:
         if any(
@@ -1561,7 +1706,7 @@ def _dispatch_available(
         task = LtaWorkerTask(
             work_id=claim.work.work_id,
             attempt_token=attempt,
-            kind="propagation_chain",
+            kind="propagation_window" if "chain_work_id" in payload else "propagation_chain",
             payload=payload,
         )
         try:
@@ -1574,6 +1719,8 @@ def _dispatch_available(
         dispatched.append(
             {
                 "work_id": claim.work.work_id,
+                "chain_work_id": payload.get("chain_work_id", claim.work.work_id),
+                "dependency_work_ids": list(claim.work.dependency_work_ids),
                 "attempt_token": attempt,
                 "volume_id": claim.work.view.volume_id,
                 "physical_view_id": claim.work.view.physical_view_id,
@@ -1589,6 +1736,43 @@ def _dispatch_available(
                 "tail_assist": claim.tail_assist,
             }
         )
+        if trace is not None:
+            trace.event("window_dispatch", **dispatched[-1])
+
+
+def _verified_dogfood_artifacts(
+    manifest: Mapping[str, object],
+    payload: Mapping[str, object],
+) -> dict[int, dict[str, object]]:
+    """Admit immutable continuation seeds before unblocking a dependent task."""
+
+    records = tuple(manifest.get("dogfood_seed_artifacts", ()))
+    if not records:
+        return {}
+    incoming = read_seed_artifact(
+        str(payload["seed_artifact_path"]),
+        expected_sha256=str(payload["seed_artifact_sha256"]),
+    )
+    allowed_lineages = {seed.lineage for seed in incoming}
+    expected_shape = tuple(incoming[0].mask.shape)
+    result: dict[int, dict[str, object]] = {}
+    for raw in records:
+        record = dict(raw)
+        frame = int(record["frame_index"])
+        if frame in result:
+            raise RuntimeError("worker emitted duplicate dogfood frame artifacts")
+        seeds = read_seed_artifact(str(record["path"]), expected_sha256=str(record["sha256"]))
+        if len(seeds) != int(record["seed_count"]):
+            raise RuntimeError("worker dogfood artifact seed count changed")
+        if any(
+            seed.frame_index != frame or seed.lineage not in allowed_lineages
+            or tuple(seed.mask.shape) != expected_shape
+            or seed.provenance is not LtaSeedProvenance.TEMPORAL_DOGFOOD
+            for seed in seeds
+        ):
+            raise RuntimeError("worker dogfood artifact does not match its parent window")
+        result[frame] = record
+    return result
 
 
 def _drive_workers_to_fixed_point(
@@ -1604,19 +1788,47 @@ def _drive_workers_to_fixed_point(
     conf: float,
     empty_frame_limit: int | None,
     worker_task_timeout: float,
+    trace: object | None = None,
 ) -> tuple[
     int,
     Mapping[int, int],
     tuple[Mapping[str, object], ...],
     Mapping[str, object],
 ]:
+    if scheduler.helper_queue_order != "head":
+        raise ValueError("bounded production dispatch requires helper_queue_order='head'")
     payload_by_work: dict[str, Mapping[str, object]] = {
         chain.work.work_id: chain.payload for chain in initial
     }
+    work_by_id: dict[str, LtaSessionWork] = {}
+    children: dict[str, list[str]] = {}
+    chain_state: dict[str, dict[str, object]] = {}
+    windowed = bool(initial and "chain_work_id" in initial[0].payload)
+
+    def register_tasks(tasks: Sequence[_PlannedChain]) -> None:
+        for task in tasks:
+            work_by_id[task.work.work_id] = task.work
+            payload_by_work[task.work.work_id] = dict(task.payload)
+            trace_path = getattr(trace, "path", None)
+            if trace_path is not None:
+                payload_by_work[task.work.work_id]["worker_trace_root"] = str(Path(trace_path).parent)
+            chain_id = str(task.payload.get("chain_work_id", task.work.work_id))
+            state = chain_state.setdefault(chain_id, {
+                "remaining": 0, "observations": {}, "legacy_relays": [],
+                "windowed": "chain_work_id" in task.payload,
+            })
+            state["remaining"] = int(state["remaining"]) + 1
+            for predecessor in task.work.dependency_work_ids:
+                children.setdefault(predecessor, []).append(task.work.work_id)
+
+    register_tasks(initial)
     active: dict[str, object] = {}
     active_started: dict[str, float] = {}
+    reduced_work_ids: set[str] = set()
     dispatched: list[dict[str, object]] = []
     worker_audit = _new_worker_audit()
+    worker_audit["task_count"] = 0
+    worker_audit["skipped_window_count"] = 0
     for ready in tuple(getattr(pool, "ready_events", ())):
         _accumulate_worker_ready_audit(worker_audit, ready)
     authoritative_active_coverage: dict[
@@ -1631,8 +1843,60 @@ def _drive_workers_to_fixed_point(
         device_id=scheduler.owner_for_view(view_key),
     )
     tasks_root = temp_root / "tasks"
+    last_progress = time.monotonic()
+
+    def progress(*, force: bool = False) -> None:
+        nonlocal last_progress
+        now = time.monotonic()
+        if not force and now - last_progress < 10.0:
+            return
+        counts = scheduler.queue_counts()
+        reason = "waiting_for_window_results" if counts["active"] else "ready_work" if counts["ready"] else "generation_fan_in"
+        if trace is not None:
+            trace.event("scheduler_state", generation=generation, reason=reason, **counts)
+            trace.flush()
+            print(f"LTA window DAG: generation={generation} ready={counts['ready']} blocked={counts['blocked']} active={counts['active']} reason={reason}", flush=True)
+        last_progress = now
+
+    def skip_branch(work_id: str) -> None:
+        pending = [work_id]
+        while pending:
+            skipped_id = pending.pop()
+            scheduler.skip_pending(skipped_id, _SkippedWindow())
+            if trace is not None:
+                trace.event("window_skipped", work_id=skipped_id, reason="empty_dogfood_boundary")
+            pending.extend(children.get(skipped_id, ()))
+
+    def complete_chain_window(work: LtaSessionWork) -> None:
+        payload = payload_by_work[work.work_id]
+        chain_id = str(payload.get("chain_work_id", work.work_id))
+        state = chain_state[chain_id]
+        state["remaining"] = int(state["remaining"]) - 1
+        if state["remaining"]:
+            return
+        from .lta_worker_adapter import _write_relay_artifacts
+        phase = trace.phase("chain_relay_emission", chain_work_id=chain_id) if trace is not None else nullcontext()
+        with phase:
+            emitted = _write_relay_artifacts(
+                state["observations"],
+                output_dir=temp_root / "chain-relays" / hashlib.sha256(chain_id.encode()).hexdigest()[:20],
+                source_tile_index=int(work.tile_index), generation=work.relay_generation,
+            )
+        relay_records.setdefault(work.relay_generation, []).extend((*state["legacy_relays"], *emitted))
+        if state["windowed"]:
+            worker_audit["chain_count"] = int(worker_audit["chain_count"]) + 1
+        worker_audit["relay_artifact_count"] = int(worker_audit["relay_artifact_count"]) + len(emitted)
+        if trace is not None:
+            trace.event("chain_settled", chain_work_id=chain_id, relay_count=len(emitted))
+        del chain_state[chain_id]
+
+    def plan_relays(records, **kwargs):
+        phase = trace.phase("relay_planning", generation=kwargs["generation"], relay_record_count=len(records)) if trace is not None else nullcontext()
+        with phase:
+            return _plan_relay_generation(records, **kwargs)
 
     while True:
+        progress()
         _dispatch_available(
             scheduler,
             pool,
@@ -1641,6 +1905,7 @@ def _drive_workers_to_fixed_point(
             active_started,
             dispatched,
             tasks_root=tasks_root,
+            trace=trace,
         )
         if active:
             oldest_work_id = min(
@@ -1656,20 +1921,62 @@ def _drive_workers_to_fixed_point(
                     f"LTA worker task {oldest_work_id!r} exceeded its "
                     f"{float(worker_task_timeout):.1f}-second lease"
                 )
-            try:
-                worker_result = pool.wait_result(timeout=remaining)
-            except TimeoutError as exc:
-                raise TimeoutError(
-                    f"LTA worker task {oldest_work_id!r} exceeded its "
-                    f"{float(worker_task_timeout):.1f}-second lease"
-                ) from exc
+            wait_phase = trace.phase("wait_for_window_result", **scheduler.queue_counts()) if trace is not None else nullcontext({})
+            with wait_phase as wait_details:
+                try:
+                    worker_result = pool.wait_result(timeout=min(remaining, 10.0))
+                except TimeoutError:
+                    worker_result = None
+                    wait_details["poll_timeout"] = True
+            if worker_result is None:
+                progress(force=True)
+                if time.monotonic() - active_started[oldest_work_id] >= float(worker_task_timeout):
+                    raise TimeoutError(f"LTA worker task {oldest_work_id!r} exceeded its {float(worker_task_timeout):.1f}-second lease")
+                continue
             claim = active.pop(worker_result.work_id, None)
             active_started.pop(worker_result.work_id, None)
             if claim is None:
                 raise RuntimeError(
                     f"worker returned unclaimed LTA work {worker_result.work_id}"
                 )
+            # Dense OR into the private view is associative and commutative.
+            # Reduce completed work immediately so a slow earlier chain cannot
+            # hold every helper idle or retain a full-view file per later task.
+            # Audit/relay acknowledgment remains in deterministic plan order.
+            phase = trace.phase("window_result_reduction", work_id=worker_result.work_id) if trace is not None else nullcontext()
+            with phase:
+                manifest = _load_chain_manifest(worker_result)
+                parent_payload = payload_by_work[worker_result.work_id]
+                if list(manifest["output_frame_range"]) != [parent_payload["output_frame_start"], parent_payload["output_frame_stop"]]:
+                    raise RuntimeError("worker result changed its owned window frame range")
+                _relays, union_artifact = _consume_chain_manifest(manifest, view_union=view_union)
+                outgoing = _verified_dogfood_artifacts(manifest, parent_payload)
+            _unlink_consumed_temp_artifacts((union_artifact,), temp_root=temp_root)
+            reduced_work_ids.add(worker_result.work_id)
+            empty_children: list[str] = []
+            used_seed_paths: set[str] = set()
+            for child_id in children.get(worker_result.work_id, ()):
+                child_payload = dict(payload_by_work[child_id])
+                prompt = int(child_payload["window"]["prompt_frame"])
+                artifact = outgoing.get(prompt)
+                if artifact is None:
+                    empty_children.append(child_id)
+                    continue
+                child_payload["seed_artifact_path"] = str(artifact["path"])
+                child_payload["seed_artifact_sha256"] = str(artifact["sha256"])
+                payload_by_work[child_id] = child_payload
+                used_seed_paths.add(str(artifact["path"]))
             scheduler.complete(claim, worker_result)
+            for child_id in empty_children:
+                skip_branch(child_id)
+            unused_seeds = [str(record["path"]) for record in outgoing.values() if str(record["path"]) not in used_seed_paths]
+            _unlink_consumed_temp_artifacts(unused_seeds, temp_root=temp_root)
+            # Overlap ordered receipt work with the next GPU session instead
+            # of waiting until all committable manifests have been processed.
+            _dispatch_available(
+                scheduler, pool, payload_by_work, active, active_started,
+                dispatched, tasks_root=tasks_root, trace=trace,
+            )
 
         while True:
             commit = scheduler.claim_committable()
@@ -1678,21 +1985,35 @@ def _drive_workers_to_fixed_point(
             consumed_artifacts: list[Path] = []
             try:
                 for _work, result in commit.entries:
+                    task_payload = payload_by_work[_work.work_id]
+                    if isinstance(result, _SkippedWindow):
+                        worker_audit["skipped_window_count"] = int(worker_audit["skipped_window_count"]) + 1
+                        worker_audit["planned_window_count"] = int(worker_audit["planned_window_count"]) + 1
+                        worker_audit["halted_window_count"] = int(worker_audit["halted_window_count"]) + 1
+                        complete_chain_window(_work)
+                        continue
+                    if _work.work_id not in reduced_work_ids:
+                        raise RuntimeError("LTA work reached commit before dense union reduction")
                     manifest = _load_chain_manifest(result)
+                    if "chain_work_id" in task_payload:
+                        manifest = {**manifest, "task_granularity": "window"}
                     _accumulate_worker_audit(worker_audit, manifest, result)
                     _accumulate_authoritative_active_coverage(
                         authoritative_active_coverage,
                         _work,
                         manifest,
                     )
-                    relays, union_artifact = _consume_chain_manifest(
-                        manifest,
-                        view_union=view_union,
-                    )
-                    relay_records.setdefault(_work.relay_generation, []).extend(
-                        relays
-                    )
-                    task_payload = payload_by_work[_work.work_id]
+                    chain_id = str(task_payload.get("chain_work_id", _work.work_id))
+                    state = chain_state[chain_id]
+                    state["legacy_relays"].extend(dict(item) for item in manifest.get("relays", ()))
+                    observation_artifact = manifest.get("relay_observation_artifact")
+                    if observation_artifact is not None:
+                        from .lta_relay_episodes import read_relay_observations, merge_relay_observations
+                        phase = trace.phase("relay_episode_merge", work_id=_work.work_id) if trace is not None else nullcontext()
+                        with phase:
+                            observations = read_relay_observations(observation_artifact)
+                            merge_relay_observations(state["observations"], observations)
+                        consumed_artifacts.append(Path(observation_artifact["path"]))
                     input_seed = _verified_artifact_path(
                         str(task_payload["seed_artifact_path"]),
                         expected_sha256=task_payload["seed_artifact_sha256"],
@@ -1700,11 +2021,11 @@ def _drive_workers_to_fixed_point(
                     )
                     consumed_artifacts.extend(
                         (
-                            union_artifact,
                             Path(result.artifact_path).resolve(strict=True),
                             input_seed,
                         )
                     )
+                    complete_chain_window(_work)
             except BaseException:
                 scheduler.fail_commit(commit)
                 raise
@@ -1713,19 +2034,24 @@ def _drive_workers_to_fixed_point(
                 consumed_artifacts,
                 temp_root=temp_root,
             )
+            reduced_work_ids.difference_update(work.work_id for work, _result in commit.entries)
 
         if not scheduler.generation_settled(view_key, generation):
             if not active:
                 pool.check_liveness()
-                snapshot = scheduler.snapshot()
-                if not snapshot.pending_work_ids:
+                counts = scheduler.queue_counts()
+                if counts["ready"] == 0:
+                    if trace is not None:
+                        trace.event("scheduler_stalled", generation=generation, **counts)
                     raise RuntimeError(
-                        f"LTA relay generation {generation} stalled before settlement"
+                        f"LTA relay generation {generation} stalled before settlement: "
+                        f"no active or ready windows; blocked={counts['blocked']}, "
+                        f"completed_awaiting_commit={counts['completed_awaiting_commit']}"
                     )
             continue
 
         if generation >= scheduler.max_relay_generation:
-            overflow = _plan_relay_generation(
+            overflow = plan_relays(
                 relay_records.get(generation, ()),
                 generation=generation + 1,
                 view_plan=view_plan,
@@ -1745,7 +2071,7 @@ def _drive_workers_to_fixed_point(
             scheduler.seal_view(view_key)
             break
         next_generation = generation + 1
-        planned = _plan_relay_generation(
+        planned = plan_relays(
             relay_records.get(generation, ()),
             generation=next_generation,
             view_plan=view_plan,
@@ -1760,15 +2086,15 @@ def _drive_workers_to_fixed_point(
         if not planned:
             scheduler.seal_view(view_key)
             break
+        if windowed:
+            planned = _plan_window_tasks(planned, first_plan_order=next_plan_order)
         scheduler.register_generation(
             view_key,
             next_generation,
             (chain.work for chain in planned),
         )
         scheduler.seal_generation(view_key, next_generation)
-        payload_by_work.update(
-            {chain.work.work_id: chain.payload for chain in planned}
-        )
+        register_tasks(planned)
         relay_records[next_generation] = []
         next_plan_order += len(planned)
         generation = next_generation
@@ -1781,6 +2107,13 @@ def _drive_workers_to_fixed_point(
     worker_audit["authoritative_active_range_count"] = sum(
         len(ranges) for ranges in authoritative_active_coverage.values()
     )
+    worker_audit["window_graph"] = {
+        "planned_work_count": len(scheduler.work),
+        "dispatched_work_count": len(dispatched),
+        "skipped_work_count": int(worker_audit["skipped_window_count"]),
+        "dependency_readiness": "verified_window_completion",
+        "relay_fan_in": "original_chain_then_generation",
+    }
     return (
         generation,
         dict(pool.pids),
@@ -1912,6 +2245,7 @@ def _publish_selected_transverse_outputs(
     return receipts
 
 
+@bounded_lta_host_threads
 def execute_lta_plan(
     plan: LtaRunPlan,
     *,
@@ -1937,9 +2271,33 @@ def execute_lta_plan(
         raise ValueError("empty_frame_limit must be a positive integer or None")
     storage_preflight = _preflight_lta_storage(plan, view_plan)
     _prepare_output_roots(plan)
-    from .workspace import _cpu_count
-
-    worker_count = max(1, int(_cpu_count() if workers is None else workers))
+    from . import __version__
+    from .lta_telemetry import LtaExecutionTrace, lta_source_fingerprint
+    trace_dir = plan.output_root / "lta_diagnostics"
+    trace = LtaExecutionTrace(trace_dir, "coordinator")
+    try:
+        fingerprint = lta_source_fingerprint()
+        write_json_atomically(plan.output_root / "lta_execution_identity.json", {
+            "schema": "lta.execution-identity/1",
+            "contract": "lta.window_dag/1",
+            "pipeline_version": __version__,
+            "source_fingerprint": fingerprint,
+            "run_id": plan.run_id,
+            "requested_devices": list(plan.device_ids),
+            "scratch_root": str(plan.temp_root),
+            "run_completion_marker": "manifest.json",
+        })
+    except BaseException:
+        trace.close()
+        raise
+    trace.event("run_contract", version=__version__, contract="lta.window_dag/1", source_fingerprint=fingerprint, devices=list(plan.device_ids), scratch_root=str(plan.temp_root))
+    trace.flush()
+    print(f"LTA v{__version__}: contract=lta.window_dag/1 max_window_frames=30 devices={list(plan.device_ids)} source_sha256={fingerprint['sha256']} diagnostics={trace_dir}", flush=True)
+    from .lta_cpu import resolve_worker_cpu_budget
+    parent_cpu_budget = resolve_worker_cpu_budget(len(plan.device_ids))
+    effective_cpu_count = int(parent_cpu_budget["effective_cpu_count"])
+    worker_count = max(1, min(effective_cpu_count, int(effective_cpu_count if workers is None else workers)))
+    trace.event("parent_cpu_budget", budget=parent_cpu_budget, finalization_workers=worker_count, native_thread_counts=host_native_thread_counts())
     source_volume = None
     hard_positive = None
     view_union = None
@@ -1962,15 +2320,12 @@ def execute_lta_plan(
             aligned_annotations,
         )
         source_cache_path = plan.temp_root / "source.gray8.dat"
-        source_volume = _materialize_source_volume(
-            source,
-            path=source_cache_path,
-        )
-        hard_positive = _hard_positive_volume(
-            source,
-            aligned_annotations,
-            path=plan.temp_root / "hard_positive.uint8.raw",
-        )
+        with trace.phase("decode_source_cache", shape_tyx=list(volume_plan.source_shape_tyx)):
+            source_volume = _materialize_source_volume(source, path=source_cache_path)
+        with trace.phase("prepare_authoritative_volume", annotation_count=len(aligned_annotations)):
+            hard_positive = _hard_positive_volume(
+                source, aligned_annotations, path=plan.temp_root / "hard_positive.uint8.raw",
+            )
         source_mmap = getattr(source_volume, "_mmap", None)
         if source_mmap is not None:
             source_mmap.close()
@@ -1982,19 +2337,20 @@ def execute_lta_plan(
             source_identity=_source_identity(source),
         )
 
-        initial, seed_inventory = _plan_initial_chains(
-            source,
-            aligned_annotations,
-            view_plan,
-            cache_ref,
-            temp_root=plan.temp_root,
-            conf=plan.conf,
-            empty_frame_limit=empty_frame_limit,
-        )
+        with trace.phase("plan_seed_window_graph") as planning:
+            initial, seed_inventory = _plan_initial_chains(
+                source, aligned_annotations, view_plan, cache_ref,
+                temp_root=plan.temp_root, conf=plan.conf, empty_frame_limit=empty_frame_limit,
+            )
+            planning["chain_count"] = len(initial)
+            initial = _plan_window_tasks(initial)
+            initial = tuple(_PlannedChain(task.work, {**task.payload, "worker_trace_root": str(trace_dir)}) for task in initial)
+            planning["window_count"] = len(initial)
         authoritative_seed_audit = _authoritative_seed_audit(seed_inventory)
         scheduler = LtaViewAffinityScheduler(
             (chain.work for chain in initial),
             plan.device_ids,
+            helper_queue_order="head",
             max_relay_generation=_relay_generation_bound(view_plan),
         )
         relay_mask_revisions: dict[LtaSpatialRelayKey, _RelayMaskRevision] = {}
@@ -2008,21 +2364,21 @@ def execute_lta_plan(
             view_plan,
             plan.temp_root / "views" / "transverse_union.uint8.raw",
         )
-        pool = LtaWorkerPool(
-            plan.device_ids,
-            LtaWorkerInit(
-                adapter_module="XTA.lta_worker_adapter",
-                adapter_factory="build_worker_predictor",
-                adapter_execute="execute_worker_task",
-                adapter_shutdown="close_worker_predictor",
-                adapter_config={
-                    "model_path": str(plan.bundle.root),
-                    "conf": float(plan.conf),
-                    "profile": PRODUCTION_LTA_PROFILE,
-                },
-            ),
-            startup_timeout=float(worker_startup_timeout),
-        )
+        with trace.phase("worker_pool_startup", devices=list(plan.device_ids)):
+            pool = LtaWorkerPool(
+                plan.device_ids,
+                LtaWorkerInit(
+                    adapter_module="XTA.lta_worker_adapter",
+                    adapter_factory="build_worker_predictor",
+                    adapter_execute="execute_worker_task",
+                    adapter_shutdown="close_worker_predictor",
+                    adapter_config={
+                        "model_path": str(plan.bundle.root), "conf": float(plan.conf),
+                        "profile": PRODUCTION_LTA_PROFILE, "trace_dir": str(trace_dir),
+                    },
+                ),
+                startup_timeout=float(worker_startup_timeout),
+            )
         worker_error: BaseException | None = None
         try:
             relay_generation, worker_pids, execution_schedule, worker_audit = (
@@ -2038,8 +2394,19 @@ def execute_lta_plan(
                     conf=plan.conf,
                     empty_frame_limit=empty_frame_limit,
                     worker_task_timeout=float(worker_task_timeout),
+                    trace=trace,
                 )
             )
+            worker_audit = {
+                **worker_audit,
+                "execution_contract": "lta.window_dag/1",
+                "source_fingerprint": fingerprint,
+                "diagnostics_root": str(trace_dir),
+                "diagnostic_write_errors_before_postprocessing": trace.write_errors,
+                "parent_cpu_budget": parent_cpu_budget,
+                "parent_finalization_workers": worker_count,
+                "parent_native_threads_during_tracking": host_native_thread_counts(),
+            }
         except BaseException as exc:
             worker_error = exc
             raise
@@ -2131,6 +2498,56 @@ def execute_lta_plan(
         configure_gpu_slice_labeling_devices(
             tuple(f"cuda:{device_id}" for device_id in plan.device_ids)
         )
+        # Validate identities before the first durable checkpoint. Each finished
+        # stage survives a later filter failure; only the final manifest marks
+        # the entire run complete.
+        from . import __version__
+        from .lta_inputs import revalidate_lta_input_identities
+
+        revalidate_lta_input_identities(plan.discovery)
+        revalidate_local_sam_bundle(plan.bundle)
+        checkpoints: list[LtaCheckpointArtifact] = []
+
+        def write_checkpoint_index(*, sequence_complete: bool) -> LtaArtifactReceipt:
+            return _write_small_json_artifact(
+                plan.output_root / f"{volume_plan.stem}_Postprocessing_checkpoints.json",
+                name="postprocessing_checkpoints",
+                payload={
+                    "schema": "lta.postprocessing-checkpoints/1",
+                    "checkpoint_sequence_complete": bool(sequence_complete),
+                    "run_completion_marker": "manifest.json",
+                    "run_id": plan.run_id,
+                    "pipeline_version": __version__,
+                    "command": list(plan.command),
+                    "source_identity_sha256": _source_identity(source),
+                    "model_identity_sha256": plan.bundle.checkpoint_identity_sha256,
+                    "annotations": [
+                        {
+                            "frame_index": int(annotation.frame_position),
+                            "label_sha256": annotation.label_sha256,
+                        }
+                        for annotation in aligned_annotations
+                    ],
+                    "requested_postprocessing": dict(plan.postprocessing),
+                    "checkpoints": [item.manifest_record() for item in checkpoints],
+                },
+            )
+
+        def save_postprocessing_checkpoint(
+            stage: str,
+            volume: object,
+            metadata: Mapping[str, object],
+        ) -> None:
+            checkpoints.append(write_lta_postprocessing_checkpoint(
+                plan.output_root,
+                stem=str(volume_plan.stem),
+                stage=stage,
+                volume=volume,
+                metadata=metadata,
+                model_name="sam3.1",
+            ))
+            write_checkpoint_index(sequence_complete=False)
+
         finalization = finalize_lta_native_union(
             contributor_layers,
             workspace_path=plan.temp_root / "terminal_union.uint8.raw",
@@ -2140,18 +2557,16 @@ def execute_lta_plan(
             prefer_memory=False,
             reserve_bytes=0,
             workers=worker_count,
+            checkpoint_callback=save_postprocessing_checkpoint,
         )
+        checkpoint_index = write_checkpoint_index(sequence_complete=True)
         known_background_audit = _known_background_audit(
             finalization.terminal_union,
             known_background_frames,
         )
 
-        # Revalidate every selected input before creating any public artifact.
-        # A mutation can therefore fail the run while all generated state is
-        # still confined to the scratch tree.
-        from . import __version__
-        from .lta_inputs import revalidate_lta_input_identities
-
+        # Revalidate once more after filtering, before final output/manifest
+        # publication. Earlier independently completed checkpoints are retained.
         revalidate_lta_input_identities(plan.discovery)
         revalidate_local_sam_bundle(plan.bundle)
 
@@ -2161,7 +2576,11 @@ def execute_lta_plan(
             terminal_union=finalization.terminal_union,
             model_name="sam3.1",
         )
-        artifact_receipts: list[LtaArtifactReceipt] = [final_nrrd.receipt]
+        artifact_receipts: list[LtaArtifactReceipt] = [
+            *(checkpoint.receipt for checkpoint in checkpoints),
+            checkpoint_index,
+            final_nrrd.receipt,
+        ]
         artifact_receipts.extend(
             _publish_selected_transverse_outputs(
                 plan=plan,
@@ -2201,6 +2620,9 @@ def execute_lta_plan(
                         "known_background_audit": dict(known_background_audit),
                         "worker_audit": dict(worker_audit),
                         "postprocessing": dict(finalization.postprocessing),
+                        "postprocessing_checkpoints": [
+                            checkpoint.manifest_record() for checkpoint in checkpoints
+                        ],
                         "foreground_voxels": finalization.terminal_union_foreground_voxels,
                         "final_nrrd": final_nrrd.manifest_record(),
                     },
@@ -2239,7 +2661,7 @@ def execute_lta_plan(
             plan.output_root / "manifest.json",
             version=__version__,
             command=plan.command,
-            layers=(*contributor_layers, final_nrrd.layer),
+            layers=(*contributor_layers, *checkpoints, final_nrrd.layer),
             publication_receipt=publication,
             payload={
                 "run_plan": _execution_run_plan_manifest_record(plan),
@@ -2251,6 +2673,14 @@ def execute_lta_plan(
                     "relay_generations": relay_generation,
                     "cross_tile_tracking": "eight_neighbor_fixed_point",
                     "authoritative_tile_seeding": dict(authoritative_seed_audit),
+                    "temporal_propagation": {
+                        "policy": "full_view_per_anchor_recall_union",
+                        "per_anchor_frame_range": [0, view_plan.frame_count],
+                        "cross_anchor_identity_reconciliation": False,
+                        "output_combination": "union",
+                        "missing_at_other_anchors": "does_not_terminate_lineage",
+                        "continuation": "nonempty_directional_dogfood_boundaries",
+                    },
                     "storage_preflight": dict(storage_preflight),
                     "known_background_audit": dict(known_background_audit),
                     "worker_audit": dict(worker_audit),
@@ -2259,7 +2689,11 @@ def execute_lta_plan(
                     "postprocessing": dict(finalization.postprocessing),
                     "device_schedule": {
                         "status": "settled",
-                        "policy": "physical_view_affinity_with_atomic_tail_assist",
+                        "policy": "physical_view_affinity_with_bounded_head_assist",
+                        "helper_queue_order": scheduler.helper_queue_order,
+                        "maximum_uncommitted_worker_unions": len(plan.device_ids),
+                        "dense_union_reduction_order": "completion",
+                        "logical_commit_order": "plan",
                         "coordinator_selected": True,
                         "view_owner_device_id": scheduler.owner_for_view(
                             initial[0].work.view
@@ -2270,6 +2704,9 @@ def execute_lta_plan(
                     },
                 },
                 "final_nrrd": final_nrrd.manifest_record(),
+                "postprocessing_checkpoints": [
+                    checkpoint.manifest_record() for checkpoint in checkpoints
+                ],
             },
         )
         result = LtaProductionResult(
@@ -2288,6 +2725,8 @@ def execute_lta_plan(
         from .runtime import close_memmap_array
         from .topology import configure_gpu_slice_labeling_devices
 
+        trace.event("coordinator_complete" if completed else "coordinator_failed")
+        trace.close()
         configure_gpu_slice_labeling_devices(())
 
         if finalization is not None and not finalization.closed:

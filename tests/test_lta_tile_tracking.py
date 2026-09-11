@@ -162,7 +162,7 @@ class LtaTileTrackingTests(unittest.TestCase):
         )
         self.assertEqual(cross_tile_overlap(tracklet, right, tiles).iou, 0.5)
 
-    def test_first_entry_relays_backward_and_last_exit_relays_forward(self) -> None:
+    def test_overlap_episode_seeds_forward_first_and_backward_last(self) -> None:
         tiles = plan_tile_grid(
             source_width=10,
             source_height=6,
@@ -174,7 +174,7 @@ class LtaTileTrackingTests(unittest.TestCase):
             (
                 (1, _mask((2, 1)), 0.99),
                 (2, _mask((1, 4)), 0.75),
-                (4, _mask((3, 5)), 0.90),
+                (3, _mask((3, 5)), 0.90),
             ),
         )
 
@@ -182,18 +182,68 @@ class LtaTileTrackingTests(unittest.TestCase):
 
         self.assertEqual(
             [(relay.temporal_direction, relay.frame_index) for relay in relays],
-            [("backward", 2), ("forward", 4)],
+            [("backward", 3), ("forward", 2)],
         )
         backward, forward = relays
         self.assertEqual(backward.neighbor_direction, "east")
         self.assertEqual(backward.overlap_xyxy, (4, 0, 6, 6))
         self.assertEqual(backward.tile_path, (0, 1))
-        self.assertEqual(backward.tracker_probability, 0.75)
-        self.assertTrue(backward.destination_mask[1, 0])
+        self.assertEqual(backward.tracker_probability, 0.90)
+        self.assertTrue(backward.destination_mask[3, 1])
         self.assertEqual(int(np.count_nonzero(backward.destination_mask)), 1)
-        self.assertEqual(forward.tracker_probability, 0.90)
-        self.assertTrue(forward.destination_mask[3, 1])
+        self.assertEqual(forward.tracker_probability, 0.75)
+        self.assertTrue(forward.destination_mask[1, 0])
         self.assertEqual(int(np.count_nonzero(forward.destination_mask)), 1)
+
+    def test_disjoint_overlap_episodes_keep_each_neighbor_handoff(self) -> None:
+        tiles = plan_tile_grid(
+            source_width=10,
+            source_height=6,
+            tile_size=6,
+            tile_stride=4,
+        )
+        eligible = _mask((1, 4), (1, 5))
+        # Missing observations and each kind of ineligible observation must
+        # preserve the exit/re-entry boundary instead of joining two episodes.
+        interruptions = {
+            "missing": (),
+            "inactive": ((3, eligible, 0.5),),
+            "empty": ((3, _mask(), 0.9),),
+            "outside_overlap": ((3, _mask((1, 0), (1, 1)), 0.9),),
+            "below_pixel_gate": ((3, _mask((1, 4)), 0.9),),
+        }
+        for reason, interruption in interruptions.items():
+            with self.subTest(reason=reason):
+                frames = (
+                    (1, eligible, 0.75),
+                    (2, _mask((2, 4), (2, 5)), 0.80),
+                    *interruption,
+                    (4, _mask((3, 4), (3, 5)), 0.85),
+                    (5, _mask((4, 4), (4, 5)), 0.90),
+                )
+                relays = plan_spatial_relays(
+                    self.lineage,
+                    _tracklet(0, frames),
+                    tiles,
+                    min_seed_pixels=2,
+                )
+
+                by_event = {
+                    (relay.temporal_direction, relay.frame_index): relay
+                    for relay in relays
+                }
+                self.assertEqual(
+                    set(by_event),
+                    {("forward", 1), ("backward", 2), ("forward", 4), ("backward", 5)},
+                )
+                for direction, frame_index in by_event:
+                    relay = by_event[direction, frame_index]
+                    source_frame = next(frame for frame in frames if frame[0] == frame_index)
+                    np.testing.assert_array_equal(
+                        relay.destination_mask,
+                        rebase_tile_mask(source_frame[1], tiles[0], tiles[1]),
+                    )
+                    self.assertEqual(relay.tracker_probability, source_frame[2])
 
     def test_two_neighbor_arrivals_merge_into_one_unseeded_destination_seed(self) -> None:
         tiles = plan_tile_grid(

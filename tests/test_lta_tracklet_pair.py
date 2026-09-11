@@ -282,21 +282,65 @@ class LtaTrackletPairTests(unittest.TestCase):
             finally:
                 self.tool._close_work_volume(volume)
 
-    def test_force_anchor_exactly_overwrites_instead_of_oring(self) -> None:
+    def test_hard_positive_restoration_preserves_other_object_foreground(self) -> None:
         first = self._mask(1, 1, 3, 3)
         second = self._mask(3, 3, 5, 5)
-        expected = first | second
-        volume = np.full((4, 6, 6), 9, dtype=np.uint8)
+        for name, unmatched in (
+            ("disjoint", self._mask(0, 4, 2, 6)),
+            ("overlapping", self._mask(2, 2, 6, 6)),
+        ):
+            with self.subTest(name=name):
+                volume = np.zeros((4, 6, 6), dtype=np.uint8)
+                volume[1] = first
+                volume[2] = unmatched
 
-        self.tool._force_anchor(
-            volume,
-            anchor_frame=12,
-            frame_start=10,
-            masks=(first, second),
+                self.tool._restore_anchor_positives(
+                    volume,
+                    anchor_frame=12,
+                    frame_start=10,
+                    masks=(first, second),
+                )
+
+                np.testing.assert_array_equal(volume[2], first | second | unmatched)
+                np.testing.assert_array_equal(volume[1], first)
+                self.assertFalse(volume[0].any())
+                self.assertFalse(volume[3].any())
+
+    def test_reconciled_partial_anchor_keeps_overlapping_unmatched_object(self) -> None:
+        frames = [10, 11, 12, 13, 14]
+        known = self._mask(1, 1, 3, 3)
+        unmatched = self._mask(2, 2, 5, 5)
+        left = (
+            self._tracklet(anchor=10, object_id=0, frames=frames, mask=known),
+            self._tracklet(anchor=10, object_id=1, frames=frames, mask=unmatched),
+        )
+        # The later annotation labels only the first object.  The second object
+        # overlaps it but still has independent support outside the label.
+        right = (
+            self._tracklet(anchor=14, object_id=0, frames=frames, mask=known),
+        )
+        matching = self.tool.match_tracklets(left, right)
+        self.assertEqual(len(matching.matches), 1)
+        self.assertEqual(matching.unmatched_left_keys, (left[1].key,))
+        composition = self.tool.compose_binary(left, right, matching)
+        matched = next(item for item in composition.lineages if item.status == "matched")
+        own_anchor = next(item for item in matched.frames if item.frame_index == 14)
+        self.assertTrue(own_anchor.authoritative)
+        np.testing.assert_array_equal(own_anchor.mask, known)
+
+        volume = np.zeros((len(frames), 6, 6), dtype=np.uint8)
+        for frame in composition.union_frames:
+            volume[frame.frame_index - 10] = frame.mask
+        self.tool._restore_anchor_positives(
+            volume, anchor_frame=10, frame_start=10, masks=(known, unmatched)
+        )
+        self.tool._restore_anchor_positives(
+            volume, anchor_frame=14, frame_start=10, masks=(known,)
         )
 
-        self.assertTrue(np.array_equal(volume[2], expected.astype(np.uint8)))
-        self.assertTrue(np.all(volume[1] == 9))
+        for frame in volume:
+            np.testing.assert_array_equal(frame, known | unmatched)
+        self.assertTrue(np.any(volume[-1].astype(bool) & ~known))
 
     def test_matching_composition_and_session_receipts_are_strict_json(self) -> None:
         mask = self._mask()
@@ -714,6 +758,20 @@ class LtaTrackletPairTests(unittest.TestCase):
                 "exactly [left_anchor,right_anchor+1)",
             )
             self.assertEqual(plan["empty_frame_limit"], 30)
+            self.assertIn("hard-positive OR", plan["authoritative_anchor_policy"])
+            self.assertIn("unmatched", plan["seed_integrity_policy"]["output_anchor"])
+            self.assertIn(
+                "every unmatched proposal",
+                plan["diagnostic_product_policies"]["reconciled"],
+            )
+            self.assertIn(
+                "not added to this reference",
+                plan["diagnostic_product_policies"]["nearest_anchor_reference"],
+            )
+            self.assertIn(
+                "not added to disagreement",
+                plan["diagnostic_product_policies"]["opposing_disagreement"],
+            )
             self.assertTrue(
                 {
                     "tools/lta_tracklet_pair.py",

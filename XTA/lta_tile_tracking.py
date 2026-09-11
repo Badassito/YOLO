@@ -319,10 +319,11 @@ def plan_spatial_relays(
 ) -> tuple[SpatialRelay, ...]:
     """Plan symmetric entry/exit relays from one tracklet to all eight neighbors.
 
-    The last shared active frame seeds forward continuation (an object leaving
-    this tile).  The first shared active frame seeds backward continuation (an
-    object that entered this tile).  A visited tile path prevents recursive
-    relay waves from bouncing indefinitely.
+    Each contiguous overlap episode seeds forward continuation from its first
+    active frame and backward continuation from its last.  This covers the
+    entire overlap interval and both destination-only tails, including later
+    re-entry episodes.  A visited tile path prevents recursive relay waves
+    from bouncing indefinitely in this standalone planner.
     """
 
     import numpy as np
@@ -358,37 +359,42 @@ def plan_spatial_relays(
         if destination_index in visited:
             continue
         destination = _tile_by_index(tiles, destination_index)
-        candidates: list[tuple[TrackletFrame, Any]] = []
+        episodes: list[
+            tuple[tuple[TrackletFrame, Any], tuple[TrackletFrame, Any]]
+        ] = []
         for frame in tracklet.frames:
             if not frame.active:
                 continue
             translated = rebase_tile_mask(frame.mask, source, destination)
-            if int(np.count_nonzero(translated)) >= minimum:
-                candidates.append((frame, translated))
-        if not candidates:
-            continue
-        choices = (
-            ("backward", candidates[0]),
-            ("forward", candidates[-1]),
-        )
-        for temporal_direction, (frame, translated) in choices:
-            relays.append(
-                SpatialRelay(
-                    lineage=lineage,
-                    source_key=tracklet.key,
-                    source_tile_index=source_index,
-                    destination_tile_index=destination_index,
-                    frame_index=frame.frame_index,
-                    temporal_direction=temporal_direction,
-                    neighbor_direction=edge.direction,
-                    overlap_xyxy=edge.overlap_xyxy,
-                    destination_mask=translated,
-                    tracker_probability=frame.tracker_probability,
-                    generation=int(generation),
-                    tile_path=path + (destination_index,),
-                    visited_tile_indices=tuple(sorted(visited | {destination_index})),
+            if int(np.count_nonzero(translated)) < minimum:
+                continue
+            candidate = (frame, translated)
+            if episodes and frame.frame_index == episodes[-1][1][0].frame_index + 1:
+                episodes[-1] = (episodes[-1][0], candidate)
+            else:
+                episodes.append((candidate, candidate))
+        for first, last in episodes:
+            for temporal_direction, (frame, translated) in (
+                ("forward", first),
+                ("backward", last),
+            ):
+                relays.append(
+                    SpatialRelay(
+                        lineage=lineage,
+                        source_key=tracklet.key,
+                        source_tile_index=source_index,
+                        destination_tile_index=destination_index,
+                        frame_index=frame.frame_index,
+                        temporal_direction=temporal_direction,
+                        neighbor_direction=edge.direction,
+                        overlap_xyxy=edge.overlap_xyxy,
+                        destination_mask=translated,
+                        tracker_probability=frame.tracker_probability,
+                        generation=int(generation),
+                        tile_path=path + (destination_index,),
+                        visited_tile_indices=tuple(sorted(visited | {destination_index})),
+                    )
                 )
-            )
     return tuple(
         sorted(
             relays,

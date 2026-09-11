@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xta"
-version = "21.0.6"
+version = "21.1.0"
 description = "Volume test-time, pretraining, and label-time augmentation"
 requires-python = ">=3.10"
 dependencies = [
@@ -38,7 +38,7 @@ include = ["XTA*"]
 [tool.setuptools.data-files]
 "share/xta" = [
   "ARCHITECTURE.md",
-  "GPT-6-Astra-Ultra_v21.0.6_SLURM.py",
+  "GPT-6-Astra-Ultra_v21.1.0_SLURM.py",
 ]
 "share/xta/tools" = [
   "tools/replay_component_projection.py",
@@ -50,4 +50,11 @@ include = ["XTA*"]
   "tools/lta_mask_seed_smoke.py",
   "tools/lta_full_volume.py",
   "tools/lta_tracklet_pair.py",
+  "tools/lta_production_smoke.py",
+  "tools/lta_worker_profile.py",
+  "tools/lta_tracker_feature_smoke.py",
+  "tools/lta_trace_summary.py",
+  "tools/lta_host_io_profile.py",
+  "tools/lta_host_pipeline_smoke.py",
+  "tools/lta_window_gpu_smoke.py",
 ]
