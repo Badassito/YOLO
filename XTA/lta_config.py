@@ -158,6 +158,11 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
         help="One or more logical CUDA indexes into CUDA_VISIBLE_DEVICES; no default",
     )
     parser.add_argument(
+        "--lta_workers_per_gpu", type=int, choices=(1, 2, 3, 4), default=1,
+        help=("Independent tracking workers per selected GPU; 2 overlaps session preparation "
+              "and inference using additional VRAM. Start with 1 on memory-limited GPUs."),
+    )
+    parser.add_argument(
         "--exemplar",
         nargs="+",
         default=None,
@@ -285,6 +290,9 @@ def build_lta_argparser(*, prog: Optional[str] = None) -> argparse.ArgumentParse
 
 
 def resolve_lta_config(args: argparse.Namespace) -> LtaConfig:
+    workers_per_gpu = getattr(args, "lta_workers_per_gpu", 1)
+    if type(workers_per_gpu) is not int or not 1 <= workers_per_gpu <= 4:
+        raise ValueError("--lta_workers_per_gpu must be an integer in [1,4]")
     for field_name in ("input", "output", "model"):
         if not str(getattr(args, field_name)).strip():
             raise ValueError(f"--{field_name} must not be empty")

@@ -12,6 +12,7 @@ import gc
 import hashlib
 import json
 import os
+import operator
 import time
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
@@ -356,13 +357,48 @@ def _write_relay_artifacts(
                 | {int(source_tile_index), destination}
             )
         )
-        for episode_index, episode in enumerate(observation.get("episodes", ())):
-            first, last = episode
-            # Forward from the first shared frame captures the complete exit
-            # into the neighbor. Backward from the last shared frame captures
-            # the complete entry from that neighbor. Together they cover the
-            # overlap interval as well as both destination-only tails.
-            for direction, value in (("forward", first), ("backward", last)):
+        if "endpoint_candidates" in observation:
+            raw_candidates = observation["endpoint_candidates"]
+            if not isinstance(raw_candidates, (tuple, list)):
+                raise ValueError("relay endpoint candidates must be a list")
+            candidates = []
+            for candidate in raw_candidates:
+                if not isinstance(candidate, (tuple, list)) or len(candidate) != 3:
+                    raise ValueError("relay endpoint candidates require direction, value, and range")
+                direction, value, raw_range = candidate
+                if direction not in {"forward", "backward"}:
+                    raise ValueError("relay endpoint candidate direction is invalid")
+                if not isinstance(value, (tuple, list)) or len(value) != 4:
+                    raise ValueError("relay endpoint candidate value is invalid")
+                if not isinstance(raw_range, (tuple, list)) or len(raw_range) != 2:
+                    raise ValueError("relay endpoint candidate range is invalid")
+                try:
+                    if any(isinstance(item, bool) for item in (*raw_range, value[0])):
+                        raise TypeError("boolean frame index")
+                    first_frame, stop_frame = (int(operator.index(item)) for item in raw_range)
+                    candidate_frame = int(operator.index(value[0]))
+                except TypeError as exc:
+                    raise ValueError("relay endpoint candidate frame indices must be integers") from exc
+                if (not 0 <= first_frame <= candidate_frame < stop_frame
+                        or direction == "forward" and candidate_frame != first_frame
+                        or direction == "backward" and candidate_frame != stop_frame - 1):
+                    raise ValueError("relay endpoint candidate frame does not match its episode range")
+                candidates.append((direction, value, (first_frame, stop_frame)))
+            indices = {value: index for index, value in enumerate(sorted({row[2] for row in candidates}))}
+            groups = [
+                (indices[frame_range], frame_range, ((direction, value),))
+                for direction, value, frame_range in sorted(
+                    candidates, key=lambda row: (int(row[1][0]), 0 if row[0] == "forward" else 1, row[2])
+                )
+            ]
+        else:
+            # Keep legacy episode and forward/backward ordering byte-identical.
+            groups = [
+                (index, (int(first[0]), int(last[0]) + 1), (("forward", first), ("backward", last)))
+                for index, (first, last) in enumerate(observation.get("episodes", ()))
+            ]
+        for episode_index, episode_frame_range, endpoints in groups:
+            for direction, value in endpoints:
                 frame_index, packed_mask, mask_shape, probability = value
                 mask = np.unpackbits(
                     np.asarray(packed_mask, dtype=np.uint8),
@@ -382,10 +418,7 @@ def _write_relay_artifacts(
                         "destination_tile_index": destination,
                         "temporal_direction": direction,
                         "overlap_episode_index": int(episode_index),
-                        "overlap_episode_frame_range": [
-                            int(first[0]),
-                            int(last[0]) + 1,
-                        ],
+                        "overlap_episode_frame_range": list(episode_frame_range),
                         "source_generation": int(generation),
                     },
                 )
@@ -413,10 +446,7 @@ def _write_relay_artifacts(
                         "frame_index": int(frame_index),
                         "temporal_direction": direction,
                         "overlap_episode_index": int(episode_index),
-                        "overlap_episode_frame_range": [
-                            int(first[0]),
-                            int(last[0]) + 1,
-                        ],
+                        "overlap_episode_frame_range": list(episode_frame_range),
                         "generation": int(generation) + 1,
                         "visited_tile_indices": list(visited),
                         "seed_artifact_path": str(artifact.path),
@@ -443,6 +473,62 @@ def execute_worker_task(
         trace.close()
 
 
+def _mark_completed_coverage(coverage: object, *, request: object, adapter_receipt: Mapping[str, object]) -> None:
+    """Record only visited directed intervals, retaining gaps and prompt sides."""
+    lineages = tuple(seed.lineage for seed in request.seeds)
+    context_start = request.session.frame_start
+    context_stop = request.session.frame_stop
+    prompt = request.prompt_frame
+    if "model_visited_frame_ranges" not in adapter_receipt:
+        if request.empty_frame_limit is None or request.empty_frame_limit >= context_stop - context_start:
+            coverage.mark_observed(lineages, frame_start=context_start, frame_stop=context_stop,
+                                   prompt_frame=prompt, direction=request.direction)
+        else:
+            # Custom adapters may omit visit receipts. The injected prompt is
+            # known, but a short empty-frame limit leaves every edge uncertain.
+            coverage.mark_observed(lineages, frame_start=prompt, frame_stop=prompt + 1,
+                                   prompt_frame=prompt, direction=request.direction)
+        return
+
+    raw_ranges = adapter_receipt["model_visited_frame_ranges"]
+    if not isinstance(raw_ranges, (tuple, list)):
+        raise RuntimeError("model-visited frame ranges must be an ordered list")
+    ranges = []
+    previous_stop = context_start
+    for pair in raw_ranges:
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            raise RuntimeError("model-visited frame ranges require start/stop pairs")
+        try:
+            if any(isinstance(value, bool) for value in pair):
+                raise TypeError("boolean frame index")
+            first, last = (int(operator.index(value)) for value in pair)
+        except TypeError as exc:
+            raise RuntimeError("model-visited frame range endpoints must be integers") from exc
+        if not context_start <= first < last <= context_stop or first < previous_stop:
+            raise RuntimeError("model-visited frame ranges must be sorted, nonoverlapping, and inside the session")
+        ranges.append((first, last))
+        previous_stop = last
+
+    # Validate every range before mutating the coverage builder. Separate
+    # intervals stay separate, including adjacent intervals with no shared
+    # frame; joining them would invent an unobserved transition.
+    for first, last in ranges:
+        if request.direction == "both" and first <= prompt < last:
+            coverage.mark_observed(lineages, frame_start=first, frame_stop=last,
+                                   prompt_frame=prompt, direction="both")
+            continue
+        if request.direction in {"both", "forward"}:
+            forward_start = max(first, prompt)
+            if forward_start < last:
+                coverage.mark_observed(lineages, frame_start=forward_start, frame_stop=last,
+                                       prompt_frame=forward_start, direction="forward")
+        if request.direction in {"both", "backward"}:
+            backward_stop = min(last, prompt + 1)
+            if first < backward_stop:
+                coverage.mark_observed(lineages, frame_start=first, frame_stop=backward_stop,
+                                       prompt_frame=backward_stop - 1, direction="backward")
+
+
 def _execute_worker_task_impl(
     context: LtaSamWorkerContext,
     kind: str,
@@ -456,6 +542,7 @@ def _execute_worker_task_impl(
 
     import numpy as np
 
+    from .lta_coverage import LtaCoverageBuilder
     from .lta_experimental import MASK_SEED_MIN_EXCLUSIVE_FRACTION
     from .lta_postprocessing import fill_binary_mask_holes_2d
     from .lta_propagation import (
@@ -508,12 +595,18 @@ def _execute_worker_task_impl(
         raise ValueError("initial seed artifact does not match the first prompt frame")
     if any(tuple(seed.mask.shape) != (source_tile.size, source_tile.size) for seed in initial_seeds):
         raise ValueError("seed mask shape does not match the task tile")
+    if not initial_seeds:
+        raise ValueError("a propagation task requires at least one mask seed")
+    tile_config_id = str(payload.get("tile_config_id", initial_seeds[0].lineage.tile_config_id))
+    if any(seed.lineage.tile_config_id != tile_config_id for seed in initial_seeds):
+        raise ValueError("seed lineage tile configuration does not match the task")
 
     neighbors = tuple(
         (int(item["tile_index"]), _tile_from_payload(item["tile"]))
         for item in payload.get("neighbors", ())  # type: ignore[union-attr]
     )
     union_shape = (frame_stop - frame_start, source_tile.size, source_tile.size)
+    coverage = LtaCoverageBuilder((source_tile.size, source_tile.size))
     union_writer = LtaUnionWriter(
         output_dir / "union.pack", shape=union_shape, frame_start=frame_start,
     )
@@ -578,6 +671,7 @@ def _execute_worker_task_impl(
                 if key in reduced_prediction_keys:
                     raise RuntimeError(f"worker received duplicate streamed prediction {key}")
                 reduced_prediction_keys.add(key)
+                coverage.add_prediction(item.lineage, key[1], prediction.binary_mask)
                 if bool(np.asarray(prediction.binary_mask, dtype=np.bool_).any()):
                     active_frames_by_lineage.setdefault(key[0], set()).add(key[1])
                 if owned_start <= prediction.frame_index < owned_stop:
@@ -672,6 +766,11 @@ def _execute_worker_task_impl(
                     )
                     if key not in reduced_prediction_keys:
                         reduce_prediction(item)
+                # A failed session may have streamed partial predictions, but
+                # it must never publish a completed observation interval. The
+                # coverage packet itself is written only after every session
+                # in this task has completed successfully.
+                _mark_completed_coverage(coverage, request=request, adapter_receipt=result.adapter_receipt)
                 for seed in result.dogfood_seeds:
                     boundary_seeds.setdefault(seed.frame_index, tuple())
                     boundary_seeds[seed.frame_index] = (
@@ -715,10 +814,10 @@ def _execute_worker_task_impl(
         union_receipt = union_writer.finish()
     foreground_pixels = int(union_receipt["foreground_pixels"])
     dogfood_seed_artifacts = []
+    with trace.phase("relay_observation_artifact", work_id=str(payload["work_id"])):
+        observation_artifact = write_relay_observations(output_dir, observations)
     if window_task:
         relay_records = []
-        with trace.phase("relay_observation_artifact", work_id=str(payload["work_id"])):
-            observation_artifact = write_relay_observations(output_dir, observations)
         with trace.phase("dogfood_seed_artifacts", work_id=str(payload["work_id"])):
             for frame_index, seeds in sorted(outbound_dogfood.items()):
                 artifact = write_seed_artifact(
@@ -737,7 +836,11 @@ def _execute_worker_task_impl(
                 source_tile_index=tile_index,
                 generation=generation,
             )
-        observation_artifact = None
+    with trace.phase("lineage_coverage_artifact", work_id=str(payload["work_id"])):
+        coverage_artifact = coverage.write(
+            output_dir, work_id=str(payload["work_id"]), tile_index=tile_index,
+            tile_config_id=tile_config_id,
+        )
     manifest = {
         "schema": "lta.propagation-chain/1",
         "task_granularity": "window" if window_task else "chain",
@@ -753,6 +856,7 @@ def _execute_worker_task_impl(
         "relays": relay_records,
         "dogfood_seed_artifacts": dogfood_seed_artifacts,
         "relay_observation_artifact": observation_artifact,
+        "lineage_coverage": _jsonable(coverage_artifact),
         "lineage_active_frame_ranges": {
             lineage: _half_open_frame_ranges(frames)
             for lineage, frames in sorted(active_frames_by_lineage.items())

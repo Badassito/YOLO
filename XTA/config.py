@@ -19,9 +19,9 @@ GIB = 1024 ** 3
 
 NRRD_SPACE = "left-posterior-superior"
 
-SCRIPT_VERSION = '21.1.0'
+SCRIPT_VERSION = '21.1.1'
 
-SCRIPT_VERSION_COMPACT = '2110'
+SCRIPT_VERSION_COMPACT = '2111'
 
 SCRIPT_BASENAME = f'GPT-6-Astra-Ultra_v{SCRIPT_VERSION}_SLURM.py'
 
@@ -877,6 +877,27 @@ def resolve_auto_positive_int(value: object, *, flag_name: str) -> Optional[int]
         raise ValueError(f'{flag_name} must be >= 1; got {resolved}')
     return int(resolved)
 
+def _bounded_number(number_type, *, minimum=None, maximum=None, exclusive=False):
+    """Build an argparse converter for a finite scalar within its valid range."""
+    def parse(value):
+        try:
+            number = number_type(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            kind = "integer" if number_type is int else "number"
+            raise argparse.ArgumentTypeError(f"must be a valid {kind}") from exc
+        if number_type is float and not math.isfinite(number):
+            raise argparse.ArgumentTypeError("must be finite")
+        if minimum is not None and (number <= minimum if exclusive else number < minimum):
+            comparison = ">" if exclusive else ">="
+            raise argparse.ArgumentTypeError(f"must be {comparison} {minimum:g}")
+        if maximum is not None and (number >= maximum if exclusive else number > maximum):
+            comparison = "<" if exclusive else "<="
+            raise argparse.ArgumentTypeError(f"must be {comparison} {maximum:g}")
+        return number
+
+    return parse
+
+
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="YOLO segmentation TTA for large cylindrical video volumes.",
@@ -915,7 +936,7 @@ def build_argparser() -> argparse.ArgumentParser:
             "Tagged model artifacts. Supply gpu:/path/to/engine, cpu:/path/to/openvino, "
             "or both. The CPU artifact must be an ordinary raw-head OpenVINO segmentation "
             "IR, not an end-to-end/NMS-embedded export. Hybrid inference requires both "
-            "entries; CPU and GPU artifacts are not verified to originate from identical weights"
+            "entries"
         ),
     )
     p.add_argument(
@@ -935,7 +956,8 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
 
-    p.add_argument("--imgsz", default=3072, type=int, help="Square input size used for inference")
+    p.add_argument("--imgsz", default=3072, type=_bounded_number(int, minimum=1),
+                   help="Positive square input size used for inference")
     p.add_argument(
         "--batch", nargs="+", default=None, type=str, metavar="[{gpu,cpu}:]N",
         help=(
@@ -946,8 +968,9 @@ def build_argparser() -> argparse.ArgumentParser:
             "after odd seam crossings, and merge each prediction into its wrapped destination"
         ),
     )
-    p.add_argument("--conf", default=0.15, type=float, help="Passed to YOLO predict")
-    p.add_argument("--min_conf", default=0.30, type=float,
+    p.add_argument("--conf", default=0.15, type=_bounded_number(float, minimum=0, maximum=1),
+                   help="Prediction confidence threshold in [0,1]")
+    p.add_argument("--min_conf", default=0.30, type=_bounded_number(float, minimum=0, maximum=1),
                    help="Remove prediction-set objects whose combined confidence is below this threshold. 0 disables the check")
     p.add_argument(
         "--quantize", nargs="+", default=None, type=str, metavar="[{gpu,cpu}:]PRECISION",
@@ -985,7 +1008,7 @@ def build_argparser() -> argparse.ArgumentParser:
             "and mixed forms are accepted"
         ),
     )
-    p.add_argument("--min_radius", default=0.0, type=float,
+    p.add_argument("--min_radius", default=0.0, type=_bounded_number(float, minimum=0),
                    help="Remove objects whose radius is smaller than this value, measured on the YOLO output masks "
                         "in each prediction set's own native 2D slice plane, before backprojection, independently "
                         "per active view. 0 disables the check")
@@ -1120,37 +1143,40 @@ def build_argparser() -> argparse.ArgumentParser:
             "(defaults sigma=3 and passes=1). No postprocessing operation is enabled by default"
         ),
     )
-    p.add_argument("--centerline_filter_passes", default=0, type=int,
+    p.add_argument("--centerline_filter_passes", default=0, type=_bounded_number(int, minimum=0),
                    help="Maximum centerline-guided post-union passes. Pass 0 is the untouched audit checkpoint; 0 disables filtering and its audit NRRDs")
     p.add_argument("--centerline_auto_remove", action="store_true",
                    help="Opt in to removing whole unprotected 2D components that satisfy every centerline, temporal, and backend-reliability guard. Protected connected foreground remains marker-only; this flag never subtracts a watershed partition")
-    p.add_argument("--centerline_radius_factor", default=2.5, type=float, metavar="X",
+    p.add_argument("--centerline_radius_factor", default=2.5,
+                   type=_bounded_number(float, minimum=1, exclusive=True), metavar="X",
                    help="Flag foreground that reaches the circle of radius X times the local EDT medial-ridge radius in the strict tangent-normal 2D plane")
-    p.add_argument("--centerline_temporal_context", default=8, type=int,
+    p.add_argument("--centerline_temporal_context", default=8, type=_bounded_number(int, minimum=0),
                    help="Clean source slices required on each side before an unprotected 2D component may be removed. Centerline anomaly runs themselves have no duration cap")
-    p.add_argument("--centerline_surface_max_dim", default=512, type=int,
+    p.add_argument("--centerline_surface_max_dim", default=512, type=_bounded_number(int, minimum=64),
                    help="Maximum axis of the block-max-pooled foreground crop supplied to the centerline backend; bounds extraction without striding away thin branches")
-    p.add_argument("--centerline_surface_points", default=5000, type=int,
+    p.add_argument("--centerline_surface_points", default=5000, type=_bounded_number(int, minimum=1000),
                    help="Centerline complexity budget. The embedded backend permits up to approximately 4x this many raw ridge samples before its global safety cap")
-    p.add_argument("--centerline_timeout", default=900.0, type=float,
+    p.add_argument("--centerline_timeout", default=900.0,
+                   type=_bounded_number(float, minimum=0, exclusive=True),
                    help="Seconds allowed for each isolated embedded-centerline attempt before preserving the current union and using safe pass-through behavior")
-    p.add_argument("--interpolation_distance", default=15, type=int,
+    p.add_argument("--interpolation_distance", default=15, type=_bounded_number(int, minimum=0),
                    help="Maximum view-native slice/frame distance used to search for interpolation candidates. Azimuthal interpolation wraps around frame order. 0 disables interpolation")
-    p.add_argument("--interpolation_walk_back", default=1, type=int,
+    p.add_argument("--interpolation_walk_back", default=1, type=_bounded_number(int, minimum=0),
                    help="Additional source slices to bridge before the endpoint slice. The endpoint and first walked-back origin share output layer 1, preserving exactly N x --interpolation_candidates component NRRDs. 0 disables walk-back bridges but retains endpoint bridges")
-    p.add_argument("--interpolation_candidates", default=1, type=int,
+    p.add_argument("--interpolation_candidates", default=1, type=_bounded_number(int, minimum=1),
                    help="Accept up to the Nth nearest interpolation candidate per endpoint projection")
-    p.add_argument("--interpolation_passes", default=1, type=int,
+    p.add_argument("--interpolation_passes", default=1, type=_bounded_number(int, minimum=1),
                    help="Run the interpolation process this many passes, treating the previous pass as real")
-    p.add_argument("--interpolation_min_radius", default=3, type=float,
+    p.add_argument("--interpolation_min_radius", default=3, type=_bounded_number(float, minimum=0),
                    help="Reject a candidate connection if the bridge radius is equal to, or smaller than, this value. 0 disables the check")
-    p.add_argument("--interpolation_search_angle", default=15.0, type=float,
+    p.add_argument("--interpolation_search_angle", default=15.0,
+                   type=_bounded_number(float, minimum=-90, maximum=90, exclusive=True),
                    help="Projection growth angle in degrees. Must be greater than -90 and less than 90")
     p.add_argument("--capture_component_replay", default=None, type=str, metavar="PERSISTENT_DIR",
                    help="Copy a bounded sample of view-native Azimuthal bridge components for isolated projection replay; must survive job completion")
     p.add_argument("--capture_component_views", nargs='+', default=None, metavar="VIEW_GLOB",
                    help="Replay capture view names/globs; default selects vertical +30 degree tilted Azimuthal transverse, sagittal and coronal")
-    p.add_argument("--capture_component_limit", default=3, type=int, metavar="N",
+    p.add_argument("--capture_component_limit", default=3, type=_bounded_number(int, minimum=1), metavar="N",
                    help="Maximum component replay captures (one per selected view, 4 GiB total); default 3")
 
     return p

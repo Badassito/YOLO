@@ -10,8 +10,8 @@ from collections.abc import Iterator, Sequence
 from .unification.context import activate_unified_launch
 
 
-SCRIPT_VERSION = "21.1.0"
-SCRIPT_BASENAME = "GPT-6-Astra-Ultra_v21.1.0_SLURM.py"
+SCRIPT_VERSION = "21.1.1"
+SCRIPT_BASENAME = "GPT-6-Astra-Ultra_v21.1.1_SLURM.py"
 MODE_CHOICES = ("tta", "pta", "lta")
 
 

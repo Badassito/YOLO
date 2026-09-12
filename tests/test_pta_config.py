@@ -25,6 +25,16 @@ class PtaConfigTests(unittest.TestCase):
         self.assertIsNone(config.args.device)
         self.assertIsNone(config.device_ids)
 
+    def test_image_size_accepts_native_zero_and_rejects_negative_values(self) -> None:
+        native = parse_pta_args(["--input", "dataset", "--imgsz", "0"])
+        self.assertEqual(native.args.imgsz, 0)
+        resized = parse_pta_args(["--input", "dataset", "--imgsz", "64"])
+        self.assertEqual(resized.args.imgsz, 64)
+        with contextlib.redirect_stderr(io.StringIO()) as error:
+            with self.assertRaises(SystemExit):
+                parse_pta_args(["--input", "dataset", "--imgsz", "-1"])
+        self.assertIn("--imgsz must be >= 0", error.getvalue())
+
     def test_device_selects_logical_cuda_subset_without_a_default(self) -> None:
         self.assertEqual(
             resolve_pta_device_ids(["2,0", "cuda:1", "gpu:2"]),

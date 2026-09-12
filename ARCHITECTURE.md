@@ -3,7 +3,7 @@
 XTA provides test-time augmentation (TTA), pretraining augmentation (PTA), and
 label-time augmentation (LTA) for volumes. The implementation lives in the
 importable `XTA` package. The versioned launcher
-`GPT-6-Astra-Ultra_v21.1.0_SLURM.py`, installed `xta` command, and `python -m XTA`
+`GPT-6-Astra-Ultra_v21.1.1_SLURM.py`, installed `xta` command, and `python -m XTA`
 all enter `XTA.cli.run()`.
 
 This document describes implemented behavior, ownership, and operating controls.
@@ -477,13 +477,13 @@ deferred replay bundles are published as explicit dataset artifacts.
 ## LTA propagation and SAM ownership
 
 Production LTA executes native Transverse, angle-zero, overlapping 1008-pixel
-tiles. Aligned exemplar indexes address decoded target frames. One persistent
-spawned worker owns one model per selected GPU. A physical-view owner retains its
+tiles. Aligned exemplar indexes address decoded target frames. Each persistent
+spawned worker owns its model on a selected GPU. A physical-view owner retains its
 immutable rendered cache and sole backprojection ownership. Idle devices can
 assist unopened sessions using that cache; a live session stays on its original
 device. Results commit in plan order.
 
-Production helpers take the earliest ready windows. Each selected device keeps
+Production helpers take the earliest ready windows. Each worker keeps
 one task slot for a single existing SAM window of at most 30 frames. Verified
 boundary seeds unlock the next window; a center window unlocks backward and
 forward continuations independently. A live tracker session stays on one GPU;
@@ -500,6 +500,40 @@ commit in plan order. Cross-window relay episodes merge at the original chain
 boundary; window seams do not create additional spatial seeds. Complete relay
 generation fan-in remains necessary because seeding merged arrivals and unioning
 separately propagated arrivals are not equivalent operations.
+
+The production relay policy is `same_lineage_directional_coverage/1`. Workers
+publish per-lineage cropped packed masks and directed model-visited ranges in
+verified coverage packets. The coordinator accumulates them in an ephemeral
+SQLite ledger with a bounded page cache. A relay can hand off to existing work
+only when its full, merged, hole-filled seed mask is contained in coverage for
+the exact lineage/grid/tile/frame and the next transition in its propagation
+direction has already been observed. An axis endpoint has no next transition.
+Backward evidence does not establish a forward transition. A newly added pixel,
+an unmatched lineage, or previously unobserved re-entry remains eligible.
+
+Temporal continuation handoffs consult a read-only snapshot of the previous
+settled generation. Current-generation results populate a separate live ledger;
+completion order cannot influence handoff decisions. Partially handed-off seed
+groups retain the other lineages and their canonical object IDs. Observations
+follow actual model-visited ranges, preserving gaps and excluding policy-zero
+tails. The original authoritative tracks and positives remain independent.
+
+At a generation barrier, overlap episodes coalesce across chains of the same
+lineage and source/destination tile pair. Every original endpoint candidate is
+retained at its original frame until admission, including novel endpoints inside
+a larger episode. Only exact direction/frame candidates combine masks. This
+avoids dropping complementary interior support or moving masks through time.
+All same-event arrivals are merged and hole-filled before checking coverage.
+This handoff policy replaces exhaustive reinjection of already covered seed
+geometry; it does not infer biological identity between different annotation
+lineages. Cross-anchor identity matching remains a separate integration.
+
+The ledger and one prior-generation snapshot use data-dependent scratch space;
+their in-memory SQLite page caches are bounded. Generation summaries record
+raw/coalesced endpoint counts, coverage size, and spatial/temporal handoffs.
+The finite relay-generation guard is fail-closed, not an estimated runtime bound.
+Dependency registration checks only actual parent IDs, avoiding a complete
+history scan for each new node.
 
 Input discovery reports its active scan, probe, and exemplar identity stages.
 Video frame counts use declared metadata when available; FFV1 inputs without a
@@ -521,6 +555,26 @@ are scoped to one thread while explicit LTA CPU parallelism uses the effective
 allocation. Original parent settings are restored on exit. An explicitly empty
 `--temp` value is rejected so an unset scratch variable cannot select output
 storage unintentionally.
+
+`--lta_workers_per_gpu` admits one to four independent persistent processes per
+selected GPU, defaulting to one. Two workers can overlap one session's CPU
+preparation or finalization with another session's GPU work. Each process owns
+its predictor and mutable tracker state. Claims, ready events, results and
+failures identify both the physical execution device and a zero-based worker
+index; projection ownership and relay generation barriers remain physical-view
+contracts. The coordinator never leases two tasks to one worker slot. CPU
+budgets and bounded scratch reservations scale with the total process count.
+Runtime identity, dispatch records and the final worker registry report the
+configured concurrency. Legacy `worker_pids` lists worker zero on each GPU;
+`worker_slots` records every process.
+
+Extra workers duplicate model and session allocations, so concurrency is an
+explicit VRAM/throughput tradeoff. Separate CUDA contexts can fill CPU gaps;
+simultaneous kernels across processes require a compatible NVIDIA MPS setup.
+The runtime inherits an existing MPS environment. Session initialization,
+cleanup and CUDA context scheduling are included in measured throughput;
+host-phase overlap alone does not prove concurrent CUDA kernels.
+
 The unique `lta_<run-id>` scratch directory is created after discovery, planning,
 and capacity preflight; its creation and resolved path are printed immediately.
 

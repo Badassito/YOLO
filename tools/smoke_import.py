@@ -209,6 +209,7 @@ def main() -> None:
         "tta_terminal",
         "pipeline",
         "lta_config",
+        "lta_coverage",
         "lta_cpu",
         "lta_execution",
         "lta_experimental",

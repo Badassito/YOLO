@@ -11727,5 +11727,101 @@
     "preserved_radial_definition_updates": [],
     "preserved_radial_module_updates": [],
     "complete_modules": []
+  },
+  "v21_1_1_review": {
+    "release": "21.1.1",
+    "previous_review_sha256": "534ad7dabb3bccbbf95883fa7cad678081e85f4efa1b5e851781b173da017f37",
+    "definitions": [
+      {
+        "module": "lta_config",
+        "name": "build_lta_argparser",
+        "previous_sha256": "c732b6f3386a50c69814b7abbd4f07b43da9970229efb3d21d6eccd67c80b976",
+        "sha256": "a0f106099dd61e038e286c841a8037379c560f00f47e5d837cd7a5c72da44594",
+        "reason": "Expose bounded per-GPU LTA worker concurrency while retaining one worker by default."
+      },
+      {
+        "module": "lta_config",
+        "name": "resolve_lta_config",
+        "previous_sha256": "00c1d012e263eb8c4ebb3d50411ea72146b67a2a79c5f2b6cfefa041b55c1384",
+        "sha256": "7d7fdb602033d5b8f98014b7584104abcda831bdde20429ca923e1e554fd06f7",
+        "reason": "Validate the per-GPU worker count before starting discovery or GPU execution."
+      },
+      {
+        "module": "lta_runtime",
+        "name": "build_lta_run_plan",
+        "previous_sha256": "1bc47f542fad172e91a19a21405a0827ffa8cf1dd30004b4aa9f4756646bbb88",
+        "sha256": "062fd2eefe9ee3e1ba39d9934727315e8249e49950385d92f2c080b188bff569",
+        "reason": "Carry explicit LTA per-GPU worker concurrency into the immutable execution plan."
+      },
+      {
+        "module": "config",
+        "name": "_bounded_number",
+        "previous_sha256": null,
+        "sha256": "aeb8a6c2b6a89d9887b9b05b48048e74f85b21c3e08b967b629689b9bf996bf3",
+        "reason": "Enforce finite numeric values and explicit scalar domains during CLI parsing."
+      },
+      {
+        "module": "config",
+        "name": "build_argparser",
+        "previous_sha256": "ac512c393e0d2735f88e03afbef57f0847363f5023a4c8f6cd34db14823d0395",
+        "sha256": "9bf56bf36f65dec19d3579126ab2238d0b54c253be53352dfb563a7db3a47da6",
+        "reason": "Validate inference and processing parameters before runtime setup."
+      },
+      {
+        "module": "pta_config",
+        "name": "resolve_pta_config",
+        "previous_sha256": "71a5162b1dd22d49ae3ba1a7df161e6260dc39d5e87d75413de77053bb748925",
+        "sha256": "893f2bc8b37aa78d24e3ccfaaa6b1614ea8dadea88fde7fa797a425cb9303136",
+        "reason": "Validate codec scalar ranges consistently for supported output formats."
+      },
+      {
+        "module": "pipeline",
+        "name": "_main_impl",
+        "previous_sha256": "505dc4eded234caa7588ca015d7ba4e2df6fa0c6cb876b14ac29b7500f0dfa05",
+        "sha256": "78697f072a548326fbddfd0724ab873c5f02f0ed9c88fd43fe039cb15aaa7d07",
+        "reason": "Streamline backend startup output."
+      }
+    ],
+    "statements": [
+      {
+        "module": "__init__",
+        "label": "Assign:7",
+        "previous_sha256": "167b89be9283bae80a83ce63513d38a2a7e1341a653e98cad2569ac531904c84",
+        "sha256": "76922e86c08298733c9ec6aca37d29fa7135056f47040e3d6b6d04ed153a4caa",
+        "reason": "Align launcher, runtime and compact identifiers with the v21.1.1 overlap development snapshot."
+      },
+      {
+        "module": "cli",
+        "label": "Assign:13",
+        "previous_sha256": "1ebf99fca86110c093618350b1a4ccb0ffad27d2f49ed774298af1ba810b6632",
+        "sha256": "edab490d024df2e5d636ba966316b772a14dbcb055a9c4f7c53e67ab72595cf5",
+        "reason": "Align launcher, runtime and compact identifiers with the v21.1.1 overlap development snapshot."
+      },
+      {
+        "module": "cli",
+        "label": "Assign:14",
+        "previous_sha256": "09032c9a55caf906ab5901004d6e0ac2727392897d80fd5a1be78af11070afd8",
+        "sha256": "2794044ed4919e1c5f6d48be64217a22e1405f000c6fb9ac72109eca2518f615",
+        "reason": "Align launcher, runtime and compact identifiers with the v21.1.1 overlap development snapshot."
+      },
+      {
+        "module": "config",
+        "label": "Assign:22",
+        "previous_sha256": "1ebf99fca86110c093618350b1a4ccb0ffad27d2f49ed774298af1ba810b6632",
+        "sha256": "edab490d024df2e5d636ba966316b772a14dbcb055a9c4f7c53e67ab72595cf5",
+        "reason": "Align launcher, runtime and compact identifiers with the v21.1.1 overlap development snapshot."
+      },
+      {
+        "module": "config",
+        "label": "Assign:24",
+        "previous_sha256": "3592ee891eba7742f9a99c1fe588607e2846e3006506bfbc34bb74bb023d716e",
+        "sha256": "8c5c456e647c1202a2215177a8b4515ffc4bea857a4a940de812f7ef134f753d",
+        "reason": "Align launcher, runtime and compact identifiers with the v21.1.1 overlap development snapshot."
+      }
+    ],
+    "local_import_seam_updates": [],
+    "preserved_radial_definition_updates": [],
+    "preserved_radial_module_updates": [],
+    "complete_modules": []
   }
 }

@@ -40,6 +40,85 @@ def _work(
 
 
 class LtaViewAffinitySchedulerTests(unittest.TestCase):
+    def test_new_dependency_registration_uses_parent_lookups_without_scanning_history(self):
+        class LookupOnlyCompleted(dict):
+            def __iter__(self):
+                raise AssertionError("registration scanned completed history")
+
+            def keys(self):
+                raise AssertionError("registration scanned completed history")
+
+        parent = _work("parent", "transverse", 0)
+        independent = _work("independent", "transverse", 1)
+        scheduler = LtaViewAffinityScheduler((parent, independent), (0,))
+        scheduler._completed = LookupOnlyCompleted({"parent": None})
+        child = replace(_work("child", "transverse", 2),
+                        dependency_work_ids=("parent", "independent"))
+        scheduler._register_dependency_state((child,))
+        self.assertEqual(scheduler._waiting_dependencies["child"], {"independent"})
+        scheduler._activate_dependents("independent")
+        self.assertNotIn("child", scheduler._waiting_dependencies)
+        self.assertEqual(scheduler._queues[0][-1], child)
+
+    def test_two_workers_share_a_gpu_without_sharing_claims_or_backprojection(self):
+        work = tuple(_work(str(i), "transverse", i) for i in range(3))
+        scheduler = LtaViewAffinityScheduler(work, (5,), workers_per_device=2)
+        view = work[0].view
+        scheduler.mark_projection_ready(view, device_id=5)
+        first = scheduler.claim(5, worker_index=0)
+        second = scheduler.claim(5, worker_index=1)
+        self.assertEqual((first.execution_device_id, second.execution_device_id), (5, 5))
+        self.assertEqual((first.worker_index, second.worker_index), (0, 1))
+        self.assertEqual(scheduler.queue_counts()["active"], 2)
+        with self.assertRaisesRegex(RuntimeError, "already owns an active"):
+            scheduler.claim(5, worker_index=1)
+        with self.assertRaisesRegex(ValueError, "active lease"):
+            scheduler.complete(replace(first, worker_index=1), "wrong slot")
+        scheduler.complete(first, "first")
+        with self.assertRaisesRegex(RuntimeError, "while a SAM session is active"):
+            scheduler.claim_backprojection(5)
+        scheduler.fail(second, retry=True)
+        replacement = scheduler.claim(5, worker_index=1)
+        with self.assertRaisesRegex(ValueError, "active lease"):
+            scheduler.complete(second, "old attempt")
+        scheduler.complete(replacement, "second")
+        third = scheduler.claim(5)
+        scheduler.complete(third, "third")
+        self.assertEqual([value for _, value in scheduler.drain_committable()], ["first", "second", "third"])
+        scheduler.seal_view(view)
+        projection = scheduler.claim_backprojection(5)
+        scheduler.complete_backprojection(projection)
+        self.assertTrue(scheduler.done)
+
+    def test_overlapping_slots_do_not_release_dependencies_or_relay_generations_early(self):
+        parent = _work("parent", "transverse", 0)
+        independent = _work("independent", "transverse", 1)
+        child = replace(_work("child", "transverse", 2), dependency_work_ids=("parent",))
+        relay = _work("relay", "transverse", 3, relay_generation=1)
+        scheduler = LtaViewAffinityScheduler((parent, independent, child, relay), (0,), workers_per_device=2)
+        scheduler.mark_projection_ready(parent.view, device_id=0)
+        a, b = scheduler.claim(0), scheduler.claim(0, worker_index=1)
+        self.assertEqual((a.work.work_id, b.work.work_id), ("parent", "independent"))
+        scheduler.complete(b, None)
+        self.assertIsNone(scheduler.claim(0, worker_index=1))
+        scheduler.complete(a, None)
+        c = scheduler.claim(0, worker_index=1)
+        self.assertEqual(c.work.work_id, "child")
+        self.assertIsNone(scheduler.claim(0))
+        scheduler.complete(c, None)
+        self.assertIsNone(scheduler.claim(0))
+        scheduler.drain_committable()
+        self.assertEqual(scheduler.claim(0).work.work_id, "relay")
+
+    def test_worker_slot_bounds_are_explicit(self):
+        for count in (0, 5, True, 1.5):
+            with self.subTest(count=count), self.assertRaises((ValueError, TypeError)):
+                LtaViewAffinityScheduler((), (0,), workers_per_device=count)
+        scheduler = LtaViewAffinityScheduler((), (0,), workers_per_device=2)
+        for index in (-1, 2, True, .5):
+            with self.subTest(index=index), self.assertRaises((ValueError, TypeError)):
+                scheduler.claim(0, worker_index=index)
+
     def test_dependencies_unlock_on_completion_before_the_ordered_commit_frontier(self) -> None:
         work = (
             _work("slow-root", "alpha", 0),

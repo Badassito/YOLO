@@ -140,6 +140,7 @@ class LtaRuntimePlanningTests(unittest.TestCase):
             checkpoint = root / "sam3.1_multiplex.pt"
             checkpoint.write_bytes(b"checkpoint")
             config = self._config(root, checkpoint)
+            config.args.lta_workers_per_gpu = 2
             discovery = self._discovery(root)
 
             plan = build_lta_run_plan(
@@ -161,6 +162,9 @@ class LtaRuntimePlanningTests(unittest.TestCase):
             "preflight_geometry_and_device_plan",
         )
         self.assertEqual(plan.run_id, "run-a")
+        self.assertEqual(plan.workers_per_gpu, 2)
+        self.assertEqual(plan.manifest_record()["workers_per_gpu"], 2)
+        self.assertEqual(build_lta_scheduler(plan).workers_per_device, 2)
         self.assertEqual(plan.temp_root.name, "lta_run-a")
         self.assertTrue(views[0].sessions[0].sequence_id.startswith("input:sample::"))
         self.assertEqual(views[0].encoded_frame_indices, tuple(range(65)))

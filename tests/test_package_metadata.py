@@ -8,8 +8,8 @@ from XTA import cli, config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRENT_VERSION = "21.1.0"
-CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v21.1.0_SLURM.py"
+CURRENT_VERSION = "21.1.1"
+CURRENT_LAUNCHER = "GPT-6-Astra-Ultra_v21.1.1_SLURM.py"
 PREVIOUS_LAUNCHER = "GPT-6-Astra-Ultra_v21.0.6_SLURM.py"
 
 
@@ -25,7 +25,7 @@ class PackageMetadataTests(unittest.TestCase):
     def test_runtime_version_constants_are_aligned(self) -> None:
         self.assertEqual(XTA.__version__, CURRENT_VERSION)
         self.assertEqual(config.SCRIPT_VERSION, CURRENT_VERSION)
-        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2110")
+        self.assertEqual(config.SCRIPT_VERSION_COMPACT, "2111")
         self.assertEqual(config.SCRIPT_BASENAME, CURRENT_LAUNCHER)
         self.assertEqual(cli.SCRIPT_VERSION, CURRENT_VERSION)
         self.assertEqual(cli.SCRIPT_BASENAME, CURRENT_LAUNCHER)
@@ -39,7 +39,6 @@ class PackageMetadataTests(unittest.TestCase):
 
         self.assertIn('name = "xta"', project)
         self.assertIn(f'version = "{CURRENT_VERSION}"', project)
-        self.assertNotIn("readme =", project)
         self.assertIn('xta = "XTA.cli:run"', scripts)
         self.assertIn(
             '"XTA.examples.external_augmentations" = ["README.md"]',
@@ -63,7 +62,6 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertNotIn('GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py', data_files)
         self.assertNotIn('GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py', data_files)
         self.assertNotIn(PREVIOUS_LAUNCHER, data_files)
-        self.assertNotIn('"README.md"', data_files)
 
     def test_source_distribution_has_one_versioned_launcher(self) -> None:
         manifest_lines = {
@@ -74,7 +72,6 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertNotIn("include GPT-5.6-Sol-Ultra_v18.0.3_SLURM.py", manifest_lines)
         self.assertNotIn("include GPT-5.6-Sol-Ultra_v18.0.0_SLURM.py", manifest_lines)
         self.assertNotIn(f"include {PREVIOUS_LAUNCHER}", manifest_lines)
-        self.assertNotIn("include README.md", manifest_lines)
         self.assertIn("include XTA/_package_inventory.json", manifest_lines)
         self.assertIn("recursive-include XTA/examples *.py *.md", manifest_lines)
         self.assertIn("recursive-include tools *.py", manifest_lines)

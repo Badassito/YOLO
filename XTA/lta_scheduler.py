@@ -170,6 +170,7 @@ class LtaWorkClaim:
     owner_device_id: int
     execution_device_id: int
     tail_assist: bool
+    worker_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -267,6 +268,7 @@ class LtaViewAffinityScheduler:
         allow_tail_assist: bool = True,
         helper_queue_order: str = "tail",
         max_relay_generation: int = DEFAULT_MAX_RELAY_GENERATION,
+        workers_per_device: int = 1,
     ) -> None:
         self.device_ids = tuple(
             _nonnegative_index(value, name="device_id") for value in device_ids
@@ -275,6 +277,9 @@ class LtaViewAffinityScheduler:
             raise ValueError("device_ids must contain CUDA indexes")
         if len(self.device_ids) != len(set(self.device_ids)):
             raise ValueError("device_ids must be unique")
+        self.workers_per_device = _nonnegative_index(workers_per_device, name="workers_per_device")
+        if not 1 <= self.workers_per_device <= 4:
+            raise ValueError("workers_per_device must be in [1,4]")
         self.helper_queue_order = str(helper_queue_order).strip().lower()
         if self.helper_queue_order not in {"head", "tail"}:
             raise ValueError("helper_queue_order must be 'head' or 'tail'")
@@ -341,7 +346,7 @@ class LtaViewAffinityScheduler:
         }
         self._allow_tail_assist = bool(allow_tail_assist)
         self._projection_ready: set[LtaViewKey] = set()
-        self._active_by_device: dict[int, LtaWorkClaim] = {}
+        self._active_by_slot: dict[tuple[int, int], LtaWorkClaim] = {}
         self._active_ids: set[str] = set()
         self._completed: dict[str, object] = {}
         self._dependency_children: dict[str, list[LtaSessionWork]] = {}
@@ -385,7 +390,10 @@ class LtaViewAffinityScheduler:
         for item in items:
             key = item.view, item.relay_generation
             self._generation_uncommitted[key] = self._generation_uncommitted.get(key, 0) + 1
-            remaining = set(item.dependency_work_ids) - self._completed.keys()
+            # Difference against a dict_keys view scans the full completed
+            # history for every new window. Each window has only a few parents.
+            remaining = {dependency for dependency in item.dependency_work_ids
+                         if dependency not in self._completed}
             if remaining:
                 self._waiting_dependencies[item.work_id] = remaining
                 for dependency in remaining:
@@ -643,18 +651,22 @@ class LtaViewAffinityScheduler:
         del queue[position]
         return owner, item
 
-    def claim(self, device_id: int) -> LtaWorkClaim | None:
+    def claim(self, device_id: int, *, worker_index: int = 0) -> LtaWorkClaim | None:
         """Claim owner work first, then one unopened item in the helper order."""
 
         device = _nonnegative_index(device_id, name="device_id")
         if device not in self._queues:
             raise ValueError(f"unknown LTA device {device}")
+        worker = _nonnegative_index(worker_index, name="worker_index")
+        if worker >= self.workers_per_device:
+            raise ValueError(f"unknown LTA worker index {worker} for device {device}")
+        slot = (device, worker)
         if device in self._backprojection_by_device:
             raise RuntimeError(
                 f"device {device} already owns an active LTA backprojection"
             )
-        if device in self._active_by_device:
-            raise RuntimeError(f"device {device} already owns an active LTA session")
+        if slot in self._active_by_slot:
+            raise RuntimeError(f"device {device} worker {worker} already owns an active LTA session")
         item = self._pop_owner_work(device)
         owner = device
         if item is None:
@@ -669,21 +681,23 @@ class LtaViewAffinityScheduler:
             owner_device_id=owner,
             execution_device_id=device,
             tail_assist=owner != device,
+            worker_index=worker,
         )
-        self._active_by_device[device] = claim
+        self._active_by_slot[slot] = claim
         self._active_ids.add(item.work_id)
         return claim
 
     def complete(self, claim: LtaWorkClaim, result: object) -> None:
         """Settle one complete session; partial/live-session migration is unsupported."""
 
-        active = self._active_by_device.get(int(claim.execution_device_id))
+        slot = (int(claim.execution_device_id), int(claim.worker_index))
+        active = self._active_by_slot.get(slot)
         # Claim values can repeat after a retry.  Identity distinguishes the
         # current lease from a structurally equal late completion (the ABA
         # case) from the failed attempt.
         if active is not claim:
             raise ValueError("claim is not the active lease for its execution device")
-        self._active_by_device.pop(int(claim.execution_device_id))
+        self._active_by_slot.pop(slot)
         self._active_ids.remove(claim.work.work_id)
         self._completed[claim.work.work_id] = result
         self._activate_dependents(claim.work.work_id)
@@ -691,10 +705,11 @@ class LtaViewAffinityScheduler:
     def fail(self, claim: LtaWorkClaim, *, retry: bool = False) -> None:
         """Release a failed atomic session and optionally put it back on its owner queue."""
 
-        active = self._active_by_device.get(int(claim.execution_device_id))
+        slot = (int(claim.execution_device_id), int(claim.worker_index))
+        active = self._active_by_slot.get(slot)
         if active is not claim:
             raise ValueError("claim is not the active lease for its execution device")
-        self._active_by_device.pop(int(claim.execution_device_id))
+        self._active_by_slot.pop(slot)
         self._active_ids.remove(claim.work.work_id)
         if retry:
             self._queues[claim.owner_device_id].appendleft(claim.work)
@@ -766,7 +781,7 @@ class LtaViewAffinityScheduler:
         device = _nonnegative_index(device_id, name="device_id")
         if device not in self.device_ids:
             raise ValueError(f"unknown LTA device {device}")
-        if device in self._active_by_device:
+        if any(slot[0] == device for slot in self._active_by_slot):
             raise RuntimeError(
                 f"device {device} cannot backproject while a SAM session is active"
             )
@@ -816,7 +831,7 @@ class LtaViewAffinityScheduler:
             len(self._completed) == len(self.work)
             and len(self._committed_ids) == len(self.work)
             and self._active_commit_claim is None
-            and not self._active_by_device
+            and not self._active_by_slot
             and not self._backprojection_by_device
             and len(self._sealed_views) == len(self._owner_by_view)
             and len(self._backprojected) == len(self._owner_by_view)
@@ -845,7 +860,7 @@ class LtaViewAffinityScheduler:
             assignments=self.assignments,
             pending_work_ids=tuple(sorted(pending)),
             active_claims=tuple(
-                self._active_by_device[key] for key in sorted(self._active_by_device)
+                self._active_by_slot[key] for key in sorted(self._active_by_slot)
             ),
             active_backprojection_claims=tuple(
                 self._backprojection_by_device[key]

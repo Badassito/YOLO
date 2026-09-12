@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 import hashlib
 import importlib
 import json
@@ -19,9 +20,12 @@ from XTA.lta_workers import (
     LtaWorkerDiedError,
     LtaWorkerExecutionError,
     LtaWorkerInit,
+    LtaWorkerError,
     LtaWorkerPool,
+    LtaWorkerPoolError,
     LtaWorkerResult,
     LtaWorkerShutdownError,
+    LtaWorkerStartupError,
     LtaWorkerTask,
     StaleLtaWorkerResult,
     validate_result_for_attempt,
@@ -38,6 +42,7 @@ from pathlib import Path
 # the worker narrowed visibility before it imported the adapter.
 IMPORTED_VISIBLE_DEVICE = os.environ.get("CUDA_VISIBLE_DEVICES")
 IMPORTED_OMP_THREADS = os.environ.get("OMP_NUM_THREADS")
+IMPORTED_WORKER_INDEX = os.environ.get("LTA_WORKER_INDEX")
 
 
 def _append_log(path, value):
@@ -64,8 +69,11 @@ def build_predictor(config):
             "current_visible": os.environ.get("CUDA_VISIBLE_DEVICES"),
             "import_omp_threads": IMPORTED_OMP_THREADS,
             "current_mkl_threads": os.environ.get("MKL_NUM_THREADS"),
+            "worker_index": IMPORTED_WORKER_INDEX,
         },
     )
+    if config.get("startup_failure_index") == int(IMPORTED_WORKER_INDEX):
+        raise RuntimeError("controlled replica startup failure")
     return state
 
 
@@ -79,6 +87,7 @@ def execute_task(predictor, kind, payload):
             "kind": kind,
             "calls": predictor["calls"],
             "visible": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "worker_index": IMPORTED_WORKER_INDEX,
         },
     )
     if kind == "crash":
@@ -87,6 +96,13 @@ def execute_task(predictor, kind, payload):
         raise RuntimeError(str(payload.get("message", "fake adapter error")))
     if kind == "hang":
         time.sleep(float(payload.get("seconds", 30.0)))
+    if kind == "barrier":
+        Path(payload["started_path"]).write_text("started")
+        deadline = time.monotonic() + 5.0
+        while not Path(payload["peer_path"]).exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("peer worker did not overlap this task")
+            time.sleep(0.005)
 
     artifact = Path(payload["artifact_path"])
     artifact.parent.mkdir(parents=True, exist_ok=True)
@@ -99,6 +115,7 @@ def execute_task(predictor, kind, payload):
                 "payload_value": payload.get("value"),
                 "pid": os.getpid(),
                 "visible": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                "worker_index": IMPORTED_WORKER_INDEX,
             },
             sort_keys=True,
         ),
@@ -150,10 +167,13 @@ def _init(
     log_path: Path,
     *,
     shutdown_error: str | None = None,
+    startup_failure_index: int | None = None,
 ) -> LtaWorkerInit:
     config = {"log_path": str(log_path), "nested": {"values": [1, 2, 3]}}
     if shutdown_error is not None:
         config["shutdown_error"] = shutdown_error
+    if startup_failure_index is not None:
+        config["startup_failure_index"] = startup_failure_index
     return LtaWorkerInit(
         adapter_module=module_name,
         adapter_factory="build_predictor",
@@ -183,6 +203,138 @@ def _read_log(path: Path) -> list[dict[str, object]]:
 
 
 class LtaWorkerContractTests(unittest.TestCase):
+    def test_two_slots_share_physical_gpu_but_overlap_in_distinct_persistent_processes(self) -> None:
+        with _fake_adapter() as (module_name, root, log_path), mock.patch.dict(os.environ, {
+            "CUDA_VISIBLE_DEVICES": "GPU-unused,GPU-shared",
+            "SLURM_CPUS_PER_TASK": "4", "OMP_NUM_THREADS": "64", "MKL_NUM_THREADS": "64",
+        }):
+            before = dict(os.environ)
+            pool = LtaWorkerPool((1,), _init(module_name, log_path), startup_timeout=10, workers_per_device=2)
+            try:
+                self.assertEqual(dict(os.environ), before)
+                self.assertEqual(pool.device_ids, (1,))
+                self.assertEqual(pool.worker_slots, ((1, 0), (1, 1)))
+                self.assertEqual(pool.cpu_budget["worker_count"], 2)
+                self.assertEqual(pool.cpu_budget["threads_per_worker"], 1)
+                self.assertEqual(len(set(pool.pids_by_slot.values())), 2)
+                self.assertEqual(pool.pids, {1: pool.pids_by_slot[1, 0]})
+                self.assertEqual(
+                    [(item.execution_device_id, item.worker_index, item.visible_device) for item in pool.ready_events],
+                    [(1, 0, "GPU-shared"), (1, 1, "GPU-shared")],
+                )
+                for index in (0, 1):
+                    pool.submit(_task(
+                        f"overlap-{index}", f"attempt-{index}", root / f"result-{index}.json",
+                        kind="barrier", started_path=str(root / f"started-{index}"),
+                        peer_path=str(root / f"started-{1 - index}"),
+                    ), execution_device_id=1, worker_index=index)
+                results = [pool.wait_result(timeout=10) for _ in range(2)]
+                self.assertEqual({item.worker_index for item in results}, {0, 1})
+                for item in results:
+                    self.assertEqual(item.execution_device_id, 1)
+                    self.assertEqual(item.worker_pid, pool.pids_by_slot[1, item.worker_index])
+                    self.assertTrue(pool.is_alive(1, item.worker_index))
+                pool.submit(_task("again", "again-1", root / "again.json"), execution_device_id=1, worker_index=1)
+                again = pool.wait_result(timeout=10)
+                self.assertEqual(again.worker_index, 1)
+                self.assertEqual(again.worker_pid, pool.pids_by_slot[1, 1])
+                self.assertEqual(again.metrics["calls"], 2)
+            finally:
+                self.assertEqual(pool.shutdown(timeout=5), ())
+            records = _read_log(log_path)
+            factories = [item for item in records if item["event"] == "factory"]
+            self.assertEqual(len(factories), 2)
+            self.assertEqual({item["worker_index"] for item in factories}, {"0", "1"})
+            self.assertTrue(all(item["import_visible"] == "GPU-shared" for item in factories))
+            self.assertEqual(len([item for item in records if item["event"] == "shutdown"]), 2)
+
+    def test_replica_result_route_pid_and_kind_cannot_complete_another_slot_attempt(self) -> None:
+        with _fake_adapter() as (module_name, root, log_path), mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            with LtaWorkerPool((2,), _init(module_name, log_path), startup_timeout=10, workers_per_device=2) as pool:
+                pool.submit(_task("work", "lease", root / "result.json"), execution_device_id=2, worker_index=0)
+                genuine = pool.wait_event(timeout=10)
+                self.assertIsInstance(genuine, LtaWorkerResult)
+                for wrong in (
+                    replace(genuine, worker_index=1, worker_pid=pool.pids_by_slot[2, 1]),
+                    replace(genuine, worker_pid=genuine.worker_pid + 100000),
+                    replace(genuine, worker_index=2),
+                    replace(genuine, kind="foreign-kind"),
+                ):
+                    with self.subTest(wrong=wrong):
+                        pool._event_queue.put(wrong)
+                        with self.assertRaises(LtaWorkerPoolError):
+                            pool.wait_result(timeout=10)
+                        self.assertEqual(pool._expected_attempts["work"], "lease")
+                pool._event_queue.put(genuine)
+                self.assertEqual(pool.wait_result(timeout=10), genuine)
+
+    def test_replica_errors_keep_slot_identity_and_retired_errors_do_not_poison_new_work(self) -> None:
+        with _fake_adapter() as (module_name, root, log_path), mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            with LtaWorkerPool((0,), _init(module_name, log_path), startup_timeout=10, workers_per_device=2) as pool:
+                pool.submit(_task("same", "old", root / "unused.json", kind="error"), execution_device_id=0, worker_index=1)
+                old_error = pool.wait_event(timeout=10)
+                self.assertIsInstance(old_error, LtaWorkerError)
+                self.assertEqual(old_error.worker_index, 1)
+                pool.submit(_task("same", "new", root / "new.json"), execution_device_id=0, worker_index=0)
+                current = pool.wait_result(timeout=10)
+                self.assertEqual(current.worker_index, 0)
+                pool._event_queue.put(old_error)
+                pool.submit(_task("followup", "followup", root / "followup.json"), execution_device_id=0, worker_index=1)
+                self.assertEqual(pool.wait_result(timeout=10).work_id, "followup")
+                pool.submit(_task("bad", "bad", root / "unused2.json", kind="error"), execution_device_id=0, worker_index=1)
+                with self.assertRaises(LtaWorkerExecutionError) as caught:
+                    pool.wait_result(timeout=10)
+                self.assertEqual(caught.exception.event.worker_index, 1)
+                self.assertEqual(caught.exception.event.worker_pid, pool.pids_by_slot[0, 1])
+                self.assertTrue(pool.is_alive(0, 1))
+
+    def test_failed_replica_startup_stops_every_started_sibling(self) -> None:
+        import multiprocessing
+        context = multiprocessing.get_context("spawn")
+        original_process = context.Process
+        processes = []
+
+        def make_process(*args, **kwargs):
+            process = original_process(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with _fake_adapter() as (module_name, _root, log_path), mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            with mock.patch.object(context, "Process", side_effect=make_process):
+                with self.assertRaises(LtaWorkerStartupError) as caught:
+                    LtaWorkerPool((0,), _init(module_name, log_path, startup_failure_index=1), startup_timeout=10, workers_per_device=2)
+            self.assertEqual(caught.exception.event.worker_index, 1)
+            self.assertEqual(len(processes), 2)
+            self.assertTrue(all(not process.is_alive() for process in processes))
+
+    def test_forced_replica_shutdown_returns_physical_device_once(self) -> None:
+        with _fake_adapter() as (module_name, root, log_path), mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            pool = LtaWorkerPool((3,), _init(module_name, log_path), startup_timeout=10, workers_per_device=2)
+            try:
+                for index in (0, 1):
+                    pool.submit(_task(f"hang-{index}", f"hang-{index}", root / f"hang-{index}.json", kind="hang", seconds=30), execution_device_id=3, worker_index=index)
+                deadline = time.monotonic() + 10
+                while len([item for item in _read_log(log_path) if item.get("kind") == "hang"]) < 2:
+                    if time.monotonic() >= deadline:
+                        self.fail("both replica tasks did not start")
+                    time.sleep(0.01)
+                self.assertEqual(pool.shutdown(timeout=0.05, force=True), (3,))
+                self.assertTrue(pool.closed)
+                self.assertTrue(all(not process.is_alive() for process in pool._processes.values()))
+                self.assertEqual(pool.shutdown(), ())
+            finally:
+                pool.shutdown(timeout=0.1, force=True)
+
+    def test_replica_count_is_bounded_before_spawning(self) -> None:
+        init = LtaWorkerInit("unused", "factory", "execute")
+        for invalid in (0, 5, -1, True, 1.5):
+            with self.subTest(value=invalid), self.assertRaises((TypeError, ValueError)):
+                LtaWorkerPool((0,), init, workers_per_device=invalid)
+
     def test_cpu_budget_is_bound_before_import_without_modifying_parent_environment(self) -> None:
         with _fake_adapter() as (module_name, root, log_path):
             with mock.patch.dict(os.environ, {

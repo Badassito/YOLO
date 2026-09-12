@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -25,9 +26,11 @@ from XTA.lta_workers import LtaWorkerResult
 class CpuWorkerPool:
     """Exercise the actual window worker protocol with independently ordered completions."""
 
-    def __init__(self, order, devices, *, corrupt_dogfood=False):
+    def __init__(self, order, devices, *, corrupt_dogfood=False, workers_per_device=1):
         self.order = order
         self.pids = {device: 1000 + device for device in devices}
+        self.workers_per_device = workers_per_device
+        self.submitted_slots = set()
         self.pending = []
         self.finished = set()
         self.submitted = []
@@ -36,24 +39,25 @@ class CpuWorkerPool:
         self.corrupt_dogfood = corrupt_dogfood
         self.context = SimpleNamespace(predictor=object(), profile={"name": "cpu_protocol_test"}, sam_runtime={"distribution_version": "fake"}, constrained_batches=None)
 
-    def submit(self, task, *, execution_device_id):
+    def submit(self, task, *, execution_device_id, worker_index=0):
         predecessor = task.payload.get("predecessor_work_id")
         if predecessor and predecessor not in self.finished:
             raise AssertionError("dependent window dispatched before predecessor completion")
-        self.pending.append((task, execution_device_id))
+        self.pending.append((task, execution_device_id, worker_index))
+        self.submitted_slots.add((execution_device_id, worker_index))
         self.submitted.append(task)
         self.maximum_active = max(self.maximum_active, len(self.pending))
         branches = {}
-        for queued, _device in self.pending:
+        for queued, _device, _worker in self.pending:
             branches.setdefault(queued.payload.get("chain_work_id"), set()).add(queued.payload["windows"][0]["branch"])
         self.parallel_directions |= any({"backward", "forward"} <= values for values in branches.values())
 
     def wait_result(self, timeout=None):
         if self.order == "roots_first":
-            index = next((index for index, (task, _device) in enumerate(self.pending) if task.payload.get("window_index", 0) == 0), 0)
+            index = next((index for index, (task, _device, _worker) in enumerate(self.pending) if task.payload.get("window_index", 0) == 0), 0)
         else:
             index = -1
-        task, device = self.pending.pop(index)
+        task, device, worker = self.pending.pop(index)
         output = execute_worker_task(self.context, task.kind, task.payload)
         artifact = Path(output["artifact_path"])
         manifest = json.loads(artifact.read_text())
@@ -65,6 +69,7 @@ class CpuWorkerPool:
         return LtaWorkerResult(
             work_id=task.work_id, attempt_token=task.attempt_token, kind=task.kind,
             execution_device_id=device, worker_pid=self.pids[device],
+            worker_index=worker,
             artifact_path=str(artifact), artifact_sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
             artifact_size_bytes=artifact.stat().st_size,
         )
@@ -74,7 +79,8 @@ class CpuWorkerPool:
 
 
 class LtaWindowDagTests(unittest.TestCase):
-    def run_driver(self, root, *, windowed, order="roots_first", empty_backward=False, corrupt_dogfood=False):
+    def run_driver(self, root, *, windowed, order="roots_first", empty_backward=False, corrupt_dogfood=False,
+                   devices=(0, 1, 2, 3), workers_per_device=1):
         root.mkdir(parents=True)
         count = 120 if empty_backward else 59
         anchors = (50,) if empty_backward else (19, 37)
@@ -94,10 +100,12 @@ class LtaWindowDagTests(unittest.TestCase):
         with mock.patch("XTA.lta_execution._seeds_for_tile", side_effect=lambda *_args, **_kwargs: by_frame if _args[4] == 0 else {}), mock.patch("XTA.lta_execution.PRODUCTION_LTA_RELAY_MIN_PIXELS", 1):
             chains, inventory = _plan_initial_chains(SimpleNamespace(volume_id="volume"), (), view, cache, temp_root=root, conf=0.15, empty_frame_limit=30)
         tasks = _plan_window_tasks(chains) if windowed else chains
-        scheduler = LtaViewAffinityScheduler((task.work for task in tasks), (0, 1, 2, 3), helper_queue_order="head", max_relay_generation=20)
+        scheduler = LtaViewAffinityScheduler((task.work for task in tasks), devices, helper_queue_order="head", max_relay_generation=20,
+                                              workers_per_device=workers_per_device)
         revisions = {}
         _prime_authoritative_relay_destinations(scheduler, tasks[0].work.view, inventory, revisions)
-        pool = CpuWorkerPool(order, scheduler.device_ids, corrupt_dogfood=corrupt_dogfood)
+        pool = CpuWorkerPool(order, scheduler.device_ids, corrupt_dogfood=corrupt_dogfood,
+                             workers_per_device=workers_per_device)
         self.last_pool = pool
         union = np.zeros((count, 4, 6), dtype=np.uint8)
 
@@ -148,6 +156,41 @@ class LtaWindowDagTests(unittest.TestCase):
             self.assertEqual(scheduler.queue_counts(), {"ready": 0, "blocked": 0, "active": 0, "completed_awaiting_commit": 0})
             self.assertEqual(result[3]["chain_count"], baseline_result[3]["chain_count"])
             self.assertGreater(result[3]["task_count"], baseline_result[3]["task_count"])
+            admission = result[3]["relay_admission"]
+            self.assertGreater(admission["spatial_seed_handoffs"], 0)
+            self.assertGreater(admission["temporal_seed_handoffs"], 0)
+            self.assertEqual(admission["coverage"]["lineages"], 2)
+            for field in ("spatial_seed_handoffs", "temporal_seed_handoffs", "temporal_window_handoffs"):
+                self.assertEqual(admission[field], reverse_result[3]["relay_admission"][field])
+            self.assertTrue(any(item["coalesced_endpoint_count"] < item["raw_endpoint_count"]
+                                for item in admission["coalesced_generations"]))
+
+    def test_two_slots_per_gpu_preserve_union_relays_and_dependency_order(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            baseline, baseline_result, _, _ = self.run_driver(root / "serial", windowed=True, devices=(0, 1))
+            candidate, result, pool, scheduler = self.run_driver(
+                root / "overlap", windowed=True, devices=(0, 1), workers_per_device=2, order="roots_first",
+            )
+            np.testing.assert_array_equal(candidate, baseline)
+            self.assertEqual(result[0], baseline_result[0])
+            self.assertEqual(result[3]["chain_count"], baseline_result[3]["chain_count"])
+            self.assertEqual(result[3]["tracker_session_count"], baseline_result[3]["tracker_session_count"])
+            self.assertEqual(pool.maximum_active, 4)
+            self.assertEqual(pool.submitted_slots, {(0, 0), (0, 1), (1, 0), (1, 1)})
+            self.assertEqual(scheduler.queue_counts(), {"ready": 0, "blocked": 0, "active": 0, "completed_awaiting_commit": 0})
+            self.assertEqual({(r["execution_device_id"], r["worker_index"]) for r in result[2]}, pool.submitted_slots)
+
+    def test_result_from_wrong_worker_slot_is_rejected_before_reduction(self):
+        original = CpuWorkerPool.wait_result
+
+        def misrouted(pool, timeout=None):
+            result = original(pool, timeout)
+            return replace(result, worker_index=1 - result.worker_index)
+
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(CpuWorkerPool, "wait_result", misrouted):
+            with self.assertRaisesRegex(RuntimeError, "claimed GPU and worker slot"):
+                self.run_driver(Path(folder) / "wrong-slot", windowed=True, devices=(0,), workers_per_device=2)
 
     def test_empty_boundary_cancels_only_its_direction_and_settles_generation(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -165,6 +208,21 @@ class LtaWindowDagTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             with self.assertRaisesRegex(RuntimeError, "digest changed"):
                 self.run_driver(Path(folder) / "corrupt", windowed=True, corrupt_dogfood=True)
+            self.assertTrue(all(task.payload["window_index"] == 0 for task in self.last_pool.submitted))
+
+    def test_corrupt_lineage_coverage_never_unlocks_children(self):
+        original = CpuWorkerPool.wait_result
+
+        def corrupt(pool, timeout=None):
+            result = original(pool, timeout)
+            manifest = json.loads(Path(result.artifact_path).read_text())
+            with Path(manifest["lineage_coverage"]["path"]).open("ab") as handle:
+                handle.write(b"corrupt coverage")
+            return result
+
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(CpuWorkerPool, "wait_result", corrupt):
+            with self.assertRaisesRegex((ValueError, RuntimeError), "coverage.*(size|digest)"):
+                self.run_driver(Path(folder) / "corrupt-coverage", windowed=True)
             self.assertTrue(all(task.payload["window_index"] == 0 for task in self.last_pool.submitted))
 
     def test_unsettled_graph_without_ready_or_active_work_fails_instead_of_spinning(self):

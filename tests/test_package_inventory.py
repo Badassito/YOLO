@@ -31,6 +31,15 @@ def inspect_seams(source: str):
 
 
 class PackageInventoryTests(unittest.TestCase):
+    def test_overlap_release_authenticates_the_explicit_concurrency_option(self):
+        manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
+        manifest['v21_1_1_review']['definitions'][0]['sha256'] = '0' * 64
+        with self.assertRaisesRegex(RuntimeError, 'v21.1.1 review digest mismatch'):
+            inventory.reviewed_v21_1_1_contract(
+                manifest, manifest['v21_review'],
+                *(manifest[f'v21_0_{i}_review'] for i in range(1, 7)), manifest['v21_1_review'],
+            )
+
     def test_lta_release_authenticates_runtime_version_bindings(self) -> None:
         manifest = json.loads(MANIFEST.read_text(encoding='utf-8'))
         manifest['v21_1_review']['statements'][0]['sha256'] = '0' * 64

@@ -468,10 +468,7 @@ def resolve_pta_config(args: argparse.Namespace) -> PtaConfig:
     effective_output_format = (
         "tif" if str(channel_format.kind) == "custom" else requested_output_format
     )
-    if (
-        effective_output_format == "png"
-        and not 0 <= int(args.png_compression) <= 9
-    ):
+    if not 0 <= int(args.png_compression) <= 9:
         raise ValueError("--png_compression must be between 0 and 9")
     return PtaConfig(
         args=args,

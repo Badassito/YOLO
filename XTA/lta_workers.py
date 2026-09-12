@@ -59,6 +59,14 @@ def _device_id(value: object) -> int:
     return int(value)
 
 
+def _worker_index(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("worker_index must be an integer")
+    if value < 0:
+        raise ValueError("worker_index must be non-negative")
+    return int(value)
+
+
 def _resolve_visible_device_tokens(
     device_ids: Sequence[int],
     *,
@@ -191,8 +199,10 @@ class LtaWorkerReady:
     worker_pid: int
     visible_device: str
     metadata: Mapping[str, object] = field(default_factory=dict)
+    worker_index: int = 0
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "worker_index", _worker_index(self.worker_index))
         object.__setattr__(
             self,
             "execution_device_id",
@@ -225,8 +235,10 @@ class LtaWorkerResult:
     artifact_size_bytes: int
     metrics: Mapping[str, object] = field(default_factory=dict)
     metadata: Mapping[str, object] = field(default_factory=dict)
+    worker_index: int = 0
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "worker_index", _worker_index(self.worker_index))
         for name in ("work_id", "attempt_token", "kind", "artifact_path"):
             object.__setattr__(
                 self, name, _nonempty_text(getattr(self, name), name=name)
@@ -264,6 +276,10 @@ class LtaWorkerError:
     work_id: Optional[str] = None
     attempt_token: Optional[str] = None
     kind: Optional[str] = None
+    worker_index: int = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "worker_index", _worker_index(self.worker_index))
 
 
 LtaWorkerEvent = Union[LtaWorkerReady, LtaWorkerResult, LtaWorkerError]
@@ -277,7 +293,7 @@ class LtaWorkerStartupError(LtaWorkerPoolError):
     def __init__(self, event: LtaWorkerError):
         self.event = event
         super().__init__(
-            f"LTA worker cuda:{event.execution_device_id} failed during startup: "
+            f"LTA worker cuda:{event.execution_device_id} slot:{event.worker_index} failed during startup: "
             f"{event.error_type}: {event.message}"
         )
 
@@ -287,18 +303,19 @@ class LtaWorkerExecutionError(LtaWorkerPoolError):
         self.event = event
         work = f" work {event.work_id!r}" if event.work_id is not None else ""
         super().__init__(
-            f"LTA worker cuda:{event.execution_device_id}{work} failed: "
+            f"LTA worker cuda:{event.execution_device_id} slot:{event.worker_index}{work} failed: "
             f"{event.error_type}: {event.message}"
         )
 
 
 class LtaWorkerDiedError(LtaWorkerPoolError):
-    def __init__(self, device_id: int, pid: Optional[int], exitcode: Optional[int]):
+    def __init__(self, device_id: int, pid: Optional[int], exitcode: Optional[int], *, worker_index: int = 0):
         self.device_id = int(device_id)
+        self.worker_index = _worker_index(worker_index)
         self.pid = pid
         self.exitcode = exitcode
         super().__init__(
-            f"LTA worker cuda:{device_id} (pid={pid}) exited unexpectedly "
+            f"LTA worker cuda:{device_id} slot:{worker_index} (pid={pid}) exited unexpectedly "
             f"with code {exitcode}"
         )
 
@@ -437,6 +454,7 @@ def _error_event(
     exc: BaseException,
     fatal: bool,
     task: Optional[LtaWorkerTask] = None,
+    worker_index: int = 0,
 ) -> LtaWorkerError:
     rendered_traceback = "".join(
         traceback_module.format_exception(type(exc), exc, exc.__traceback__)
@@ -454,6 +472,7 @@ def _error_event(
         work_id=None if task is None else task.work_id,
         attempt_token=None if task is None else task.attempt_token,
         kind=None if task is None else task.kind,
+        worker_index=worker_index,
     )
 
 
@@ -464,20 +483,23 @@ def _worker_main(
     task_queue: object,
     event_queue: object,
     cpu_budget: Optional[Mapping[str, object]] = None,
+    worker_index: int = 0,
 ) -> None:
     """Child entry point; keep imports above dependency-free and CUDA-neutral."""
 
     resolved_device = _device_id(device_id)
+    resolved_index = _worker_index(worker_index)
     # Physical device N is intentionally exposed as the worker's sole logical
     # cuda:0.  This must precede adapter import because SAM imports Torch.
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = str(visible_device_token)
     os.environ["LTA_EXECUTION_DEVICE_ID"] = str(resolved_device)
+    os.environ["LTA_WORKER_INDEX"] = str(resolved_index)
     budget = dict(cpu_budget or resolve_worker_cpu_budget(1))
     bind_worker_cpu_environment(budget)
-    trace = LtaExecutionTrace(init.adapter_config.get("trace_dir"), f"worker_{resolved_device}")
+    trace = LtaExecutionTrace(init.adapter_config.get("trace_dir"), f"worker_{resolved_device}_slot{resolved_index}")
     trace.event("process_start", device_id=resolved_device, visible_device=visible_device_token,
-                cpu_budget=budget)
+                worker_index=resolved_index, cpu_budget=budget)
 
     predictor: object = _UNSET
     shutdown: Optional[Callable[..., object]] = None
@@ -498,15 +520,16 @@ def _worker_main(
                 "CUDA-sensitive modules were imported before the LTA worker "
                 f"bound CUDA_VISIBLE_DEVICES: {examples}"
             )
-        with trace.phase("adapter_startup", device_id=resolved_device):
+        with trace.phase("adapter_startup", device_id=resolved_device, worker_index=resolved_index):
             predictor, execute, shutdown = _load_adapter_once(init)
-        trace.event("process_ready", device_id=resolved_device,
+        trace.event("process_ready", device_id=resolved_device, worker_index=resolved_index,
                     cpu_runtime=getattr(predictor, "cpu_budget", {}))
         event_queue.put(
             LtaWorkerReady(
                 execution_device_id=resolved_device,
                 worker_pid=os.getpid(),
                 visible_device=os.environ["CUDA_VISIBLE_DEVICES"],
+                worker_index=resolved_index,
                 metadata={
                     "profile": getattr(predictor, "profile", {}),
                     "sam_runtime": getattr(predictor, "sam_runtime", {}),
@@ -524,7 +547,7 @@ def _worker_main(
         trace.event("process_failed", phase="startup", error_type=type(exc).__name__, message=str(exc))
         event_queue.put(
             _error_event(
-                resolved_device, phase="startup", exc=exc, fatal=True
+                resolved_device, phase="startup", exc=exc, fatal=True, worker_index=resolved_index,
             )
         )
         trace.close()
@@ -532,7 +555,7 @@ def _worker_main(
 
     try:
         while True:
-            with trace.phase("queue_wait", device_id=resolved_device):
+            with trace.phase("queue_wait", device_id=resolved_device, worker_index=resolved_index):
                 message = task_queue.get()
             if isinstance(message, _StopWorker):
                 break
@@ -542,13 +565,13 @@ def _worker_main(
                 )
                 event_queue.put(
                     _error_event(
-                        resolved_device, phase="execute", exc=exc, fatal=False
+                        resolved_device, phase="execute", exc=exc, fatal=False, worker_index=resolved_index,
                     )
                 )
                 continue
             try:
                 with trace.phase("execute", device_id=resolved_device, work_id=message.work_id,
-                                 task_kind=message.kind):
+                                 task_kind=message.kind, worker_index=resolved_index):
                     output = execute(predictor, message.kind, dict(message.payload))
                 path_text, metrics, metadata = _normalize_adapter_output(output)
                 artifact = Path(path_text).expanduser().resolve()
@@ -571,6 +594,7 @@ def _worker_main(
                         artifact_size_bytes=size,
                         metrics=metrics,
                         metadata=metadata,
+                        worker_index=resolved_index,
                     )
                 )
             except Exception as exc:
@@ -583,6 +607,7 @@ def _worker_main(
                         exc=exc,
                         fatal=False,
                         task=message,
+                        worker_index=resolved_index,
                     )
                 )
     finally:
@@ -597,14 +622,15 @@ def _worker_main(
                         phase="shutdown",
                         exc=exc,
                         fatal=True,
+                        worker_index=resolved_index,
                     )
                 )
-        trace.event("process_stopped", device_id=resolved_device, trace_write_errors=trace.write_errors)
+        trace.event("process_stopped", device_id=resolved_device, worker_index=resolved_index, trace_write_errors=trace.write_errors)
         trace.close()
 
 
 class LtaWorkerPool:
-    """One persistent spawned process for each selected physical CUDA device.
+    """Bounded persistent process slots on each selected physical CUDA device.
 
     The coordinator API is intentionally single-threaded, matching
     :class:`XTA.lta_scheduler.LtaViewAffinityScheduler` ownership.  Retries may
@@ -618,6 +644,7 @@ class LtaWorkerPool:
         init: LtaWorkerInit,
         *,
         startup_timeout: Optional[float] = 120.0,
+        workers_per_device: int = 1,
     ) -> None:
         if not isinstance(init, LtaWorkerInit):
             raise TypeError("init must be an LtaWorkerInit")
@@ -626,8 +653,13 @@ class LtaWorkerPool:
             raise ValueError("device_ids must contain at least one CUDA device")
         if len(devices) != len(set(devices)):
             raise ValueError("device_ids must be unique")
+        count = _worker_index(workers_per_device)
+        if not 1 <= count <= 4:
+            raise ValueError("workers_per_device must be between one and four")
         self.device_ids = devices
-        self.cpu_budget = resolve_worker_cpu_budget(len(devices))
+        self.workers_per_device = count
+        self.worker_slots = tuple((device, index) for device in devices for index in range(count))
+        self.cpu_budget = resolve_worker_cpu_budget(len(self.worker_slots))
         self.visible_device_tokens = _resolve_visible_device_tokens(devices)
         # Detach the exposed mapping again at the actual spawn boundary in
         # case a caller mutated the (necessarily pickleable) dataclass mapping
@@ -644,7 +676,7 @@ class LtaWorkerPool:
         if safe_init.adapter_config.get("trace_dir"):
             print(
                 "LTA worker CPU allocation: "
-                f"devices={list(devices)} allocated_cpus={self.cpu_budget['effective_cpu_count']} "
+                f"devices={list(devices)} workers_per_device={count} allocated_cpus={self.cpu_budget['effective_cpu_count']} "
                 f"native_threads_per_worker={self.cpu_budget['threads_per_worker']}",
                 flush=True,
             )
@@ -652,35 +684,37 @@ class LtaWorkerPool:
         self._context = multiprocessing.get_context(self.start_method)
         self._event_queue = self._context.Queue()
         self._task_queues = {
-            device: self._context.Queue() for device in self.device_ids
+            slot: self._context.Queue() for slot in self.worker_slots
         }
         self._processes = {}
         self._expected_attempts: dict[str, str] = {}
         self._seen_attempts: set[tuple[str, str]] = set()
+        self._attempt_routes: dict[tuple[str, str], tuple[tuple[int, int], str]] = {}
         self._closed = False
         self._closing = False
         self._atexit_registered = False
         self.ready_events: tuple[LtaWorkerReady, ...] = ()
         try:
-            for device in self.device_ids:
+            for device, index in self.worker_slots:
                 process = self._context.Process(
                     target=_worker_main,
                     args=(
                         device,
                         self.visible_device_tokens[device],
                         safe_init,
-                        self._task_queues[device],
+                        self._task_queues[(device, index)],
                         self._event_queue,
                         self.cpu_budget,
+                        index,
                     ),
-                    name=f"lta-gpu-{device}",
+                    name=f"lta-gpu-{device}-slot-{index}",
                     # SAM adapters remain free to create their own decoder or
                     # loader subprocesses.  The pool's atexit hook and explicit
                     # forced cleanup own termination instead of daemon rules.
                     daemon=False,
                 )
                 process.start()
-                self._processes[device] = process
+                self._processes[(device, index)] = process
             self.ready_events = self._await_ready(startup_timeout)
             atexit.register(self._atexit_shutdown)
             self._atexit_registered = True
@@ -690,9 +724,17 @@ class LtaWorkerPool:
 
     @property
     def pids(self) -> Mapping[int, int]:
+        """Legacy replica-zero PID mapping; use pids_by_slot for every process."""
         return {
             device: int(process.pid)
-            for device, process in self._processes.items()
+            for (device, index), process in self._processes.items()
+            if index == 0 and process.pid is not None
+        }
+
+    @property
+    def pids_by_slot(self) -> Mapping[tuple[int, int], int]:
+        return {
+            slot: int(process.pid) for slot, process in self._processes.items()
             if process.pid is not None
         }
 
@@ -704,23 +746,42 @@ class LtaWorkerPool:
         if self._closed or self._closing:
             raise RuntimeError("LTA worker pool is closed")
 
-    def is_alive(self, execution_device_id: int) -> bool:
-        device = _device_id(execution_device_id)
-        if device not in self._processes:
-            raise ValueError(f"unknown LTA execution device {device}")
-        return bool(self._processes[device].is_alive())
+    def is_alive(self, execution_device_id: int, worker_index: int = 0) -> bool:
+        slot = _device_id(execution_device_id), _worker_index(worker_index)
+        if slot not in self._processes:
+            raise ValueError(f"unknown LTA worker slot {slot}")
+        return bool(self._processes[slot].is_alive())
 
     def check_liveness(self) -> None:
         """Raise immediately when any worker has left the running pool."""
 
         self._ensure_open()
-        for device in self.device_ids:
-            process = self._processes[device]
+        for device, index in self.worker_slots:
+            process = self._processes[(device, index)]
             if not process.is_alive():
                 # Refresh exitcode on platforms where is_alive joins a just-
                 # exited child lazily.
                 process.join(timeout=0)
-                raise LtaWorkerDiedError(device, process.pid, process.exitcode)
+                raise LtaWorkerDiedError(device, process.pid, process.exitcode, worker_index=index)
+
+    def _validate_event_worker(self, event: LtaWorkerEvent) -> None:
+        slot = event.execution_device_id, event.worker_index
+        process = self._processes.get(slot)
+        if process is None:
+            raise LtaWorkerPoolError(f"event names unknown LTA worker slot {slot}")
+        if event.worker_pid != process.pid:
+            raise LtaWorkerPoolError(
+                f"LTA worker slot {slot} event PID {event.worker_pid} differs from {process.pid}"
+            )
+
+    def _validate_attempt_route(self, event: LtaWorkerResult | LtaWorkerError) -> None:
+        identity = event.work_id, event.attempt_token
+        route = self._attempt_routes.get(identity)
+        actual = (event.execution_device_id, event.worker_index), event.kind
+        if route is None or actual != route:
+            raise LtaWorkerPoolError(
+                f"LTA work attempt {identity} arrived through route {actual}; expected {route}"
+            )
 
     def _get_event(self, timeout: Optional[float]) -> LtaWorkerEvent:
         deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
@@ -742,6 +803,7 @@ class LtaWorkerPool:
                             "received unsupported LTA worker event "
                             f"{type(event).__name__}"
                         )
+                    self._validate_event_worker(event)
                     return event
                 slice_timeout = min(_EVENT_POLL_SECONDS, remaining)
             try:
@@ -753,12 +815,13 @@ class LtaWorkerPool:
                 raise LtaWorkerPoolError(
                     f"received unsupported LTA worker event {type(event).__name__}"
                 )
+            self._validate_event_worker(event)
             return event
 
     def _await_ready(self, timeout: Optional[float]) -> tuple[LtaWorkerReady, ...]:
         deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
-        ready: dict[int, LtaWorkerReady] = {}
-        while len(ready) < len(self.device_ids):
+        ready: dict[tuple[int, int], LtaWorkerReady] = {}
+        while len(ready) < len(self.worker_slots):
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             try:
                 event = self._get_event(remaining)
@@ -772,6 +835,7 @@ class LtaWorkerPool:
                         message=str(exc),
                         traceback="",
                         fatal=True,
+                        worker_index=exc.worker_index,
                     )
                 ) from exc
             if isinstance(event, LtaWorkerError):
@@ -786,15 +850,17 @@ class LtaWorkerPool:
                         message="worker returned a result before becoming ready",
                         traceback="",
                         fatal=True,
+                        worker_index=event.worker_index,
                     )
                 )
-            if event.execution_device_id not in self.device_ids:
+            slot = event.execution_device_id, event.worker_index
+            if slot not in self.worker_slots:
                 raise LtaWorkerPoolError(
                     f"unknown worker cuda:{event.execution_device_id} became ready"
                 )
-            if event.execution_device_id in ready:
+            if slot in ready:
                 raise LtaWorkerPoolError(
-                    f"worker cuda:{event.execution_device_id} became ready twice"
+                    f"worker cuda:{event.execution_device_id} slot:{event.worker_index} became ready twice"
                 )
             expected_visible = self.visible_device_tokens[event.execution_device_id]
             if event.visible_device != expected_visible:
@@ -802,23 +868,25 @@ class LtaWorkerPool:
                     f"worker cuda:{event.execution_device_id} exposed CUDA_VISIBLE_DEVICES="
                     f"{event.visible_device!r}; expected {expected_visible!r}"
                 )
-            ready[event.execution_device_id] = event
-        return tuple(ready[device] for device in self.device_ids)
+            ready[slot] = event
+        return tuple(ready[slot] for slot in self.worker_slots)
 
     def submit(
         self,
         task: LtaWorkerTask,
         *,
         execution_device_id: int,
+        worker_index: int = 0,
     ) -> None:
-        """Queue ``task`` on the scheduler-selected physical execution device."""
+        """Queue ``task`` on one isolated slot of the selected physical device."""
 
         self._ensure_open()
         if not isinstance(task, LtaWorkerTask):
             raise TypeError("task must be an LtaWorkerTask")
         device = _device_id(execution_device_id)
-        if device not in self._task_queues:
-            raise ValueError(f"unknown LTA execution device {device}")
+        slot = device, _worker_index(worker_index)
+        if slot not in self._task_queues:
+            raise ValueError(f"unknown LTA worker slot {slot}")
         self.check_liveness()
         # Detach mutable caller dictionaries once more at the actual queue
         # boundary.  This also provides a final pickle-safety assertion.
@@ -836,7 +904,8 @@ class LtaWorkerPool:
             )
         self._seen_attempts.add(attempt_identity)
         self._expected_attempts[queued.work_id] = queued.attempt_token
-        self._task_queues[device].put(queued)
+        self._attempt_routes[attempt_identity] = slot, queued.kind
+        self._task_queues[slot].put(queued)
 
     def wait_event(self, timeout: Optional[float] = None) -> LtaWorkerEvent:
         """Return the next raw event; primarily useful for diagnostics."""
@@ -854,12 +923,13 @@ class LtaWorkerPool:
             event = self._get_event(remaining)
             if isinstance(event, LtaWorkerReady):
                 raise LtaWorkerPoolError(
-                    f"worker cuda:{event.execution_device_id} emitted a duplicate ready event"
+                    f"worker cuda:{event.execution_device_id} slot:{event.worker_index} emitted a duplicate ready event"
                 )
             if isinstance(event, LtaWorkerError):
                 if event.work_id is not None:
+                    self._validate_attempt_route(event)
                     expected = self._expected_attempts.get(event.work_id)
-                    if expected is not None and event.attempt_token != expected:
+                    if event.attempt_token != expected:
                         # A failed old lease must not fail its replacement.
                         continue
                     if expected == event.attempt_token:
@@ -867,23 +937,24 @@ class LtaWorkerPool:
                 raise LtaWorkerExecutionError(event)
             expected = self._expected_attempts.get(event.work_id)
             validate_result_for_attempt(event, expected)
+            self._validate_attempt_route(event)
             self._expected_attempts.pop(event.work_id, None)
             return event
 
     def shutdown(self, *, timeout: float = 10.0, force: bool = True) -> tuple[int, ...]:
         """Request orderly adapter shutdown, then terminate lingering children.
 
-        Returns the execution-device ids that required forced termination.
+        Returns unique physical execution-device ids that required forced termination.
         Calling this method more than once is harmless.
         """
 
         if self._closed:
             return ()
         self._closing = True
-        for device, process in self._processes.items():
+        for slot, process in self._processes.items():
             if process.is_alive():
                 try:
-                    self._task_queues[device].put(_StopWorker())
+                    self._task_queues[slot].put(_StopWorker())
                 except Exception:
                     pass
 
@@ -893,14 +964,14 @@ class LtaWorkerPool:
             process.join(timeout=remaining)
 
         forced = []
-        for device, process in self._processes.items():
+        for slot, process in self._processes.items():
             if process.is_alive():
-                forced.append(device)
+                forced.append(slot)
                 if force:
                     process.terminate()
         if forced and force:
-            for device in forced:
-                process = self._processes[device]
+            for slot in forced:
+                process = self._processes[slot]
                 process.join(timeout=2.0)
                 if process.is_alive():
                     kill = getattr(process, "kill", None)
@@ -909,8 +980,8 @@ class LtaWorkerPool:
                         process.join(timeout=2.0)
 
         lingering = [
-            device
-            for device, process in self._processes.items()
+            slot
+            for slot, process in self._processes.items()
             if process.is_alive()
         ]
         shutdown_errors: list[LtaWorkerError] = []
@@ -943,15 +1014,15 @@ class LtaWorkerPool:
         if lingering or (forced and not force):
             unresolved = lingering if lingering else forced
             raise LtaWorkerShutdownError(
-                f"LTA workers did not exit cleanly: devices={unresolved}"
+                f"LTA workers did not exit cleanly: slots={unresolved}"
             )
         if shutdown_errors:
             detail = "; ".join(
-                f"cuda:{event.execution_device_id} {event.error_type}: {event.message}"
+                f"cuda:{event.execution_device_id} slot:{event.worker_index} {event.error_type}: {event.message}"
                 for event in shutdown_errors
             )
             raise LtaWorkerShutdownError(f"LTA worker adapter shutdown failed: {detail}")
-        return tuple(forced)
+        return tuple(device for device in self.device_ids if any(slot[0] == device for slot in forced))
 
     def close(self) -> None:
         self.shutdown()

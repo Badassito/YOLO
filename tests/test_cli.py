@@ -16,7 +16,7 @@ from XTA.unification.context import current_unified_launch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LAUNCHER = ROOT / "GPT-6-Astra-Ultra_v21.1.0_SLURM.py"
+LAUNCHER = ROOT / "GPT-6-Astra-Ultra_v21.1.1_SLURM.py"
 
 
 class CliTests(unittest.TestCase):
@@ -40,7 +40,7 @@ class CliTests(unittest.TestCase):
 
         completed = self.run_python(str(LAUNCHER), "--version")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertIn("21.1.0", completed.stdout)
+        self.assertIn("21.1.1", completed.stdout)
 
         for mode in ("tta", "pta", "lta"):
             with self.subTest(mode_version=mode):
@@ -48,7 +48,7 @@ class CliTests(unittest.TestCase):
                     str(LAUNCHER), "--mode", mode, "--version"
                 )
                 self.assertEqual(completed.returncode, 0, completed.stdout)
-                self.assertIn("21.1.0", completed.stdout)
+                self.assertIn("21.1.1", completed.stdout)
 
         program = (
             "import sys; import XTA.cli; "
@@ -123,6 +123,20 @@ class CliTests(unittest.TestCase):
                 )
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("unrecognized arguments: --pta-only-flag", stderr.getvalue())
+
+    def test_tta_invalid_numbers_fail_before_runtime_dispatch(self) -> None:
+        runtime = types.ModuleType("XTA.tta_mode")
+        runtime.run = mock.Mock(side_effect=AssertionError("runtime must not start"))
+        required = ["--mode", "tta", "--input", "input.mkv", "--model", "gpu:model.engine"]
+        with mock.patch.dict(sys.modules, {"XTA.tta_mode": runtime}):
+            for option in ("--conf=nan", "--conf=2", "--imgsz=0", "--min_radius=inf"):
+                with self.subTest(option=option):
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+                        cli.run([*required, option])
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertIn(option.split("=")[0], stderr.getvalue())
+        runtime.run.assert_not_called()
 
     def test_tta_rejects_repeated_channel_format(self) -> None:
         stderr = io.StringIO()

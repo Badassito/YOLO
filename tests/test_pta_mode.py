@@ -107,18 +107,25 @@ class PtaModeBoundaryTests(unittest.TestCase):
                 self.assertEqual(config.args.output_format, canonical)
                 self.assertEqual(options.output_format, canonical)
 
-    def test_png_compression_is_accepted_for_effective_non_png_formats(self) -> None:
+    def test_png_compression_bounds_apply_to_every_output_format(self) -> None:
         cases = (
+            (["--output_format", "png"], "png"),
             (["--output_format", "jpeg"], "jpg"),
             (["--output_format", ".TIFF"], "tif"),
             (["--output_format", "png", "--channel_format", "C3S1"], "tif"),
         )
         for format_arguments, effective_format in cases:
-            with self.subTest(arguments=format_arguments):
-                config = self.pta_mode.parse_pta_args(["--input", "dataset", *format_arguments, "--png_compression", "99"])
-                options = pta_runtime.build_runtime_options(config)
-                self.assertEqual(options.output_format, effective_format)
-                self.assertEqual(options.png_compression, 99)
+            for value in (0, 9):
+                with self.subTest(arguments=format_arguments, value=value):
+                    config = self.pta_mode.parse_pta_args(["--input", "dataset", *format_arguments, "--png_compression", str(value)])
+                    options = pta_runtime.build_runtime_options(config)
+                    self.assertEqual(options.output_format, effective_format)
+                    self.assertEqual(options.png_compression, value)
+            for value in (-1, 10, 99):
+                with self.subTest(arguments=format_arguments, value=value), contextlib.redirect_stderr(io.StringIO()) as error:
+                    with self.assertRaises(SystemExit):
+                        self.pta_mode.parse_pta_args(["--input", "dataset", *format_arguments, "--png_compression", str(value)])
+                    self.assertIn("--png_compression must be between 0 and 9", error.getvalue())
 
     def test_absent_preprocessing_tiles_and_save_tokens_disable_outputs(self) -> None:
         options = pta_runtime.build_runtime_options(self.pta_mode.parse_pta_args(["--input", "dataset"]))

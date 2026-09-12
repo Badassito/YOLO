@@ -156,6 +156,7 @@ class LtaRunPlan:
     exemplar_index_origin: int = 1
     session_work: Tuple[LtaSessionWork, ...] = ()
     view_assignments: Tuple[LtaViewAssignment, ...] = ()
+    workers_per_gpu: int = 1
 
     def manifest_record(self) -> dict[str, object]:
         input_records = []
@@ -237,6 +238,7 @@ class LtaRunPlan:
                 ],
             },
             "sam_execution": self.sam_execution,
+            "workers_per_gpu": self.workers_per_gpu,
             "conf": float(self.conf),
             "channel_policy": LTA_CHANNEL_POLICY,
             "object_multiplex": {
@@ -549,6 +551,7 @@ def build_lta_run_plan(
         exemplar_index_origin=int(config.args.exemplar_index_origin),
         session_work=tuple(session_work),
         view_assignments=view_assignments,
+        workers_per_gpu=int(getattr(config.args, "lta_workers_per_gpu", 1)),
     )
 
 
@@ -557,7 +560,9 @@ def build_lta_scheduler(plan: LtaRunPlan) -> LtaViewAffinityScheduler:
 
     if not isinstance(plan, LtaRunPlan):
         raise TypeError("plan must be an LtaRunPlan")
-    scheduler = LtaViewAffinityScheduler(plan.session_work, plan.device_ids)
+    scheduler = LtaViewAffinityScheduler(
+        plan.session_work, plan.device_ids, workers_per_device=plan.workers_per_gpu,
+    )
     if scheduler.assignments != plan.view_assignments:
         raise RuntimeError("run-plan view ownership is not reproducible")
     return scheduler

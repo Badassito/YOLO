@@ -828,13 +828,6 @@ def _main_impl() -> None:
         print(f'GPU model supplied but no GPU backend selected; it will not be loaded: {gpu_model_path}')
     if cpu_model_path is not None and not cpu_inference_enabled:
         print(f'CPU model supplied but cpu was not selected in --device; it will not be loaded: {cpu_model_path}')
-    if gpu_inference_enabled and cpu_inference_enabled:
-        print(
-            'Warning: hybrid inference does not verify that the supplied GPU and CPU artifacts '
-            'were exported from identical weights. Their predictions are treated as one logical '
-            f'segmentation model. GPU={gpu_model_path}; CPU={cpu_model_path}'
-        )
-
     inference_devices = list(backend_devices.gpu_devices)
     if cpu_inference_enabled:
         inference_devices.append('cpu')

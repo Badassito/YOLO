@@ -20,6 +20,13 @@ class LtaConfigTests(unittest.TestCase):
         "--enable_cartesian", "transverse",
     ]
 
+    def test_per_gpu_worker_count_is_bounded_and_opt_in(self):
+        self.assertEqual(parse_lta_args(self.REQUIRED).args.lta_workers_per_gpu, 1)
+        self.assertEqual(parse_lta_args(self.REQUIRED + ["--lta_workers_per_gpu", "2"]).args.lta_workers_per_gpu, 2)
+        for value in ("0", "5", "1.5"):
+            with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                parse_lta_args(self.REQUIRED + ["--lta_workers_per_gpu", value])
+
     def test_help_describes_always_saved_union_and_filter_checkpoints(self) -> None:
         help_text = " ".join(build_lta_argparser().format_help().split())
         self.assertIn("a complete NRRD checkpoint after each requested filter", help_text)

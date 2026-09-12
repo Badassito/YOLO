@@ -18,6 +18,79 @@ from XTA.config import (
 
 
 class ConfigTests(unittest.TestCase):
+    REQUIRED = ["--input", "input.mkv", "--model", "gpu:model.engine"]
+
+    def test_numeric_options_reject_nonfinite_values(self) -> None:
+        parser = build_argparser()
+        for option in (
+            "--conf", "--min_conf", "--min_radius", "--interpolation_min_radius",
+            "--interpolation_search_angle", "--centerline_radius_factor",
+            "--centerline_timeout",
+        ):
+            for value in ("nan", "inf", "-inf", "1e309", "-1e309"):
+                with self.subTest(option=option, value=value):
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+                        parser.parse_args([*self.REQUIRED, f"{option}={value}"])
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertIn(option, stderr.getvalue())
+                    self.assertIn("must be finite", stderr.getvalue())
+
+    def test_numeric_options_reject_out_of_range_values(self) -> None:
+        parser = build_argparser()
+        cases = {
+            "--conf": ("-0.01", "1.01", "2"),
+            "--min_conf": ("-0.01", "1.01"),
+            "--imgsz": ("-1", "0", "1.5"),
+            "--min_radius": ("-0.01",),
+            "--centerline_filter_passes": ("-1",),
+            "--centerline_radius_factor": ("0", "1"),
+            "--centerline_temporal_context": ("-1",),
+            "--centerline_surface_max_dim": ("0", "63"),
+            "--centerline_surface_points": ("0", "999"),
+            "--centerline_timeout": ("0", "-0.01"),
+            "--interpolation_distance": ("-1",),
+            "--interpolation_walk_back": ("-1",),
+            "--interpolation_candidates": ("-1", "0"),
+            "--interpolation_passes": ("-1", "0"),
+            "--interpolation_min_radius": ("-0.01",),
+            "--interpolation_search_angle": ("-90", "90", "91"),
+            "--capture_component_limit": ("-1", "0"),
+        }
+        for option, values in cases.items():
+            for value in values:
+                with self.subTest(option=option, value=value):
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+                        parser.parse_args([*self.REQUIRED, f"{option}={value}"])
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertIn(option, stderr.getvalue())
+
+    def test_numeric_boundaries_preserve_disabled_and_minimum_settings(self) -> None:
+        parser = build_argparser()
+        values = {
+            "imgsz": "1", "min_radius": "0", "min_conf": "0",
+            "centerline_filter_passes": "0", "centerline_radius_factor": "1.01",
+            "centerline_temporal_context": "0", "centerline_surface_max_dim": "64",
+            "centerline_surface_points": "1000", "centerline_timeout": "0.01",
+            "interpolation_distance": "0", "interpolation_walk_back": "0",
+            "interpolation_candidates": "1", "interpolation_passes": "1",
+            "interpolation_min_radius": "0", "capture_component_limit": "1",
+        }
+        for confidence in ("0", "1"):
+            for angle in ("-89.99", "0", "89.99"):
+                with self.subTest(confidence=confidence, angle=angle):
+                    args = parser.parse_args([
+                        *self.REQUIRED, f"--conf={confidence}",
+                        f"--interpolation_search_angle={angle}",
+                        *(f"--{name}={value}" for name, value in values.items()),
+                    ])
+                    for name, value in values.items():
+                        self.assertEqual(getattr(args, name), float(value))
+                    self.assertEqual(args.conf, float(confidence))
+                    self.assertEqual(args.interpolation_search_angle, float(angle))
+        self.assertEqual(parser.parse_args([*self.REQUIRED, "--min_conf=1"]).min_conf, 1)
+
     def test_v17_1_inference_and_interpolation_defaults(self) -> None:
         args = build_argparser().parse_args([
             '--input', 'input.mkv', '--model', 'gpu:model.engine',
